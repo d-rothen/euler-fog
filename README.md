@@ -218,10 +218,10 @@ Each image is assigned a fog model via the `selection` block:
 "selection": {
   "mode": "weighted",
   "weights": {
-    "uniform": 1.0,
-    "heterogeneous_k": 0.0,
-    "heterogeneous_ls": 0.0,
-    "heterogeneous_k_ls": 0.0
+    "uniform": 0.25,
+    "heterogeneous_k": 0.35,
+    "heterogeneous_ls": 0.25,
+    "heterogeneous_k_ls": 0.15
   }
 }
 ```
@@ -295,9 +295,12 @@ variants:
       "scattering_coefficient": 0.15,
       "atmospheric_light": [1.0, 1.0, 1.0],
       "k_hetero": {
-        "scales": "auto",
-        "min_factor": 0.5,
-        "max_factor": 1.5,
+        "scales": "smooth_auto",
+        "correlation_length_fraction": 0.25,
+        "octaves": 3,
+        "min_factor": 0.65,
+        "max_factor": 1.45,
+        "contrast": 0.65,
         "normalize_to_mean": true
       }
     }
@@ -313,26 +316,42 @@ MOR/beta descriptors when available. euler-loading exposes these as
 
 ### Heterogeneous Noise Fields
 
-Both `k_hetero` and `ls_hetero` use Perlin FBM (fractional Brownian motion) to generate spatially-varying factor fields:
+Both `k_hetero` and `ls_hetero` use Perlin FBM (fractional Brownian
+motion) to generate spatially-varying factor fields. For realistic fog,
+prefer the smooth mode: it keeps Perlin wavelengths tied to the image size,
+then optionally reduces noise contrast and applies a final blur before mapping
+the noise to physical factors.
 
 ```json
 "k_hetero": {
-  "scales": "auto",
-  "min_scale": 2,
+  "scales": "smooth_auto",
+  "correlation_length_fraction": 0.25,
+  "octaves": 3,
   "max_scale": null,
-  "min_factor": 0.0,
-  "max_factor": 1.0,
+  "min_factor": 0.65,
+  "max_factor": 1.45,
+  "contrast": 0.65,
+  "smooth_sigma_fraction": 0.0,
   "normalize_to_mean": true
 }
 ```
 
-The noise field (values in [0, 1]) is mapped to a factor field: `factor(x) = min_factor + (max_factor - min_factor) * noise(x)`. When `normalize_to_mean` is `true`, the factor field is rescaled so its spatial mean equals 1.0, preserving the overall fog density while introducing spatial variation.
+The noise field (values in [0, 1]) is mapped to a factor field:
+`factor(x) = min_factor + (max_factor - min_factor) * noise(x)`.
+`contrast < 1` compresses the noise around 0.5 before this mapping, avoiding
+extreme local fog density. When `normalize_to_mean` is `true`, the factor field
+is rescaled so its spatial mean equals 1.0, preserving the overall fog density
+while introducing spatial variation.
 
 | Parameter | Effect |
 |---|---|
 | `min_factor` / `max_factor` | Range of the multiplicative factor. |
 | `normalize_to_mean` | Rescale factors so the image-wide mean equals the base value. Recommended for `k_hetero`. |
-| `scales` / `min_scale` / `max_scale` | Control spatial frequency content. |
+| `scales: "smooth_auto"` | Build low-frequency Perlin scales from the image size. |
+| `correlation_length_fraction` | Approximate smallest fog feature size as a fraction of the shorter image side. Larger values create smoother gradients. |
+| `octaves` / `lacunarity` / `max_scale` | Control how many increasingly broad Perlin components are mixed. |
+| `contrast` | Compress or expand the Perlin range before mapping to factors. Values below 1 are recommended. |
+| `smooth_sigma` / `smooth_sigma_fraction` | Optional final Gaussian blur in pixels or as a fraction of the shorter image side. |
 
 ### Fog Output
 

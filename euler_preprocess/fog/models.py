@@ -28,11 +28,13 @@ DEFAULT_MODEL_CONFIGS = {
         "visibility_m": {"dist": "constant", "value": 80.0},
         "atmospheric_light": "from_sky",
         "k_hetero": {
-            "scales": "auto",
-            "min_scale": 2,
+            "scales": "smooth_auto",
+            "correlation_length_fraction": 0.25,
+            "octaves": 3,
             "max_scale": None,
-            "min_factor": 0.0,
-            "max_factor": 1.0,
+            "min_factor": 0.65,
+            "max_factor": 1.45,
+            "contrast": 0.65,
             "normalize_to_mean": True,
         },
     },
@@ -40,11 +42,13 @@ DEFAULT_MODEL_CONFIGS = {
         "visibility_m": {"dist": "constant", "value": 80.0},
         "atmospheric_light": "from_sky",
         "ls_hetero": {
-            "scales": "auto",
-            "min_scale": 2,
+            "scales": "smooth_auto",
+            "correlation_length_fraction": 0.35,
+            "octaves": 3,
             "max_scale": None,
-            "min_factor": 0.0,
-            "max_factor": 1.0,
+            "min_factor": 0.85,
+            "max_factor": 1.08,
+            "contrast": 0.55,
             "normalize_to_mean": False,
         },
     },
@@ -52,19 +56,23 @@ DEFAULT_MODEL_CONFIGS = {
         "visibility_m": {"dist": "constant", "value": 80.0},
         "atmospheric_light": "from_sky",
         "k_hetero": {
-            "scales": "auto",
-            "min_scale": 2,
+            "scales": "smooth_auto",
+            "correlation_length_fraction": 0.25,
+            "octaves": 3,
             "max_scale": None,
-            "min_factor": 0.0,
-            "max_factor": 1.0,
+            "min_factor": 0.65,
+            "max_factor": 1.45,
+            "contrast": 0.65,
             "normalize_to_mean": True,
         },
         "ls_hetero": {
-            "scales": "auto",
-            "min_scale": 2,
+            "scales": "smooth_auto",
+            "correlation_length_fraction": 0.35,
+            "octaves": 3,
             "max_scale": None,
-            "min_factor": 0.0,
-            "max_factor": 1.0,
+            "min_factor": 0.85,
+            "max_factor": 1.08,
+            "contrast": 0.55,
             "normalize_to_mean": False,
         },
     },
@@ -166,6 +174,8 @@ def resolve_scales(
     scales_spec = hetero_cfg.get("scales", "auto")
     scales_spec = sample_value(scales_spec, rng)
     if isinstance(scales_spec, str):
+        if scales_spec == "smooth_auto":
+            return _resolve_smooth_auto_scales(hetero_cfg, height, width, rng)
         if scales_spec != "auto":
             raise ValueError(f"Unsupported scales value: {scales_spec}")
         min_scale = int(sample_value(hetero_cfg.get("min_scale", 2), rng))
@@ -184,6 +194,255 @@ def resolve_scales(
     if isinstance(scales_spec, list):
         return [int(s) for s in scales_spec if int(s) > 0]
     raise ValueError(f"Unsupported scales spec: {scales_spec}")
+
+
+def _resolve_smooth_auto_scales(
+    hetero_cfg: dict,
+    height: int,
+    width: int,
+    rng: np.random.Generator,
+) -> list[int]:
+    """Resolve low-frequency Perlin scales for realistic fog gradients."""
+    min_dimension = max(1, min(height, width))
+    max_dimension = max(1, max(height, width))
+
+    base_scale = _resolve_scale_alias(
+        hetero_cfg,
+        rng,
+        absolute_keys=("correlation_length", "base_scale", "min_scale"),
+        fraction_keys=(
+            "correlation_length_fraction",
+            "base_scale_fraction",
+            "min_scale_fraction",
+        ),
+        fraction_basis=min_dimension,
+        default=max(4, int(round(min_dimension * 0.25))),
+    )
+    max_scale = _resolve_scale_alias(
+        hetero_cfg,
+        rng,
+        absolute_keys=("max_scale",),
+        fraction_keys=("max_scale_fraction",),
+        fraction_basis=max_dimension,
+        default=max_dimension,
+        allow_none=True,
+    )
+    max_scale = max(base_scale, max_scale)
+
+    octaves = max(
+        1,
+        int(round(_sample_float(hetero_cfg.get("octaves", 3), rng, "octaves"))),
+    )
+    lacunarity = _sample_float(hetero_cfg.get("lacunarity", 2.0), rng, "lacunarity")
+    if lacunarity <= 1.0:
+        raise ValueError(f"lacunarity must be > 1.0, got {lacunarity}")
+
+    scales: list[int] = []
+    scale = float(base_scale)
+    for _ in range(octaves):
+        scales.append(max(1, int(round(scale))))
+        if scale >= max_scale:
+            break
+        scale = min(scale * lacunarity, float(max_scale))
+    return _unique_positive_scales(scales)
+
+
+def _resolve_scale_alias(
+    hetero_cfg: dict,
+    rng: np.random.Generator,
+    *,
+    absolute_keys: tuple[str, ...],
+    fraction_keys: tuple[str, ...],
+    fraction_basis: int,
+    default: int,
+    allow_none: bool = False,
+) -> int:
+    for key in absolute_keys:
+        if key not in hetero_cfg:
+            continue
+        raw_value = hetero_cfg[key]
+        if raw_value is None and allow_none:
+            break
+        return _scale_pixels(raw_value, rng, key)
+    for key in fraction_keys:
+        if key not in hetero_cfg:
+            continue
+        fraction = _sample_float(hetero_cfg[key], rng, key)
+        if fraction <= 0:
+            raise ValueError(f"{key} must be > 0, got {fraction}")
+        return max(1, int(round(float(fraction_basis) * fraction)))
+    return max(1, int(default))
+
+
+def _scale_pixels(value, rng: np.random.Generator, name: str) -> int:
+    scale = _sample_float(value, rng, name)
+    if scale <= 0:
+        raise ValueError(f"{name} must be > 0, got {scale}")
+    return max(1, int(round(scale)))
+
+
+def _sample_float(value, rng: np.random.Generator, name: str) -> float:
+    sampled = sample_value(value, rng)
+    try:
+        return float(sampled)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must resolve to a number, got {sampled!r}") from exc
+
+
+def _unique_positive_scales(scales: list[int]) -> list[int]:
+    unique: list[int] = []
+    seen: set[int] = set()
+    for scale in scales:
+        scale = int(scale)
+        if scale <= 0 or scale in seen:
+            continue
+        seen.add(scale)
+        unique.append(scale)
+    return unique or [1]
+
+
+def prepare_noise_field(
+    noise: np.ndarray,
+    hetero_cfg: dict,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    """Apply optional smoothing and contrast control to a Perlin noise field."""
+    noise = np.asarray(noise, dtype=np.float32)
+    sigma = resolve_smoothing_sigma(hetero_cfg, noise.shape[0], noise.shape[1], rng)
+    if sigma > 0.0:
+        noise = _gaussian_blur_np(noise, sigma)
+    noise = _normalize_noise_np(noise)
+    contrast = resolve_noise_contrast(hetero_cfg, rng)
+    if contrast != 1.0:
+        noise = 0.5 + (noise - 0.5) * contrast
+    return np.clip(noise, 0.0, 1.0).astype(np.float32, copy=False)
+
+
+def prepare_noise_field_torch(
+    noise: "torch.Tensor",
+    hetero_cfg: dict,
+    rng: np.random.Generator,
+) -> "torch.Tensor":
+    """Torch equivalent of :func:`prepare_noise_field`."""
+    height = int(noise.shape[-2])
+    width = int(noise.shape[-1])
+    sigma = resolve_smoothing_sigma(hetero_cfg, height, width, rng)
+    if sigma > 0.0:
+        noise = _gaussian_blur_torch(noise, sigma)
+    noise = _normalize_noise_torch(noise)
+    contrast = resolve_noise_contrast(hetero_cfg, rng)
+    if contrast != 1.0:
+        noise = 0.5 + (noise - 0.5) * contrast
+    return torch.clamp(noise, 0.0, 1.0)
+
+
+def resolve_smoothing_sigma(
+    hetero_cfg: dict,
+    height: int,
+    width: int,
+    rng: np.random.Generator,
+) -> float:
+    for key in ("smooth_sigma", "smoothing_sigma", "blur_sigma"):
+        if key in hetero_cfg:
+            sigma = _sample_float(hetero_cfg[key], rng, key)
+            if sigma < 0:
+                raise ValueError(f"{key} must be >= 0, got {sigma}")
+            return sigma
+    for key in (
+        "smooth_sigma_fraction",
+        "smoothing_sigma_fraction",
+        "blur_sigma_fraction",
+    ):
+        if key in hetero_cfg:
+            fraction = _sample_float(hetero_cfg[key], rng, key)
+            if fraction < 0:
+                raise ValueError(f"{key} must be >= 0, got {fraction}")
+            return fraction * float(max(1, min(height, width)))
+    return 0.0
+
+
+def resolve_noise_contrast(hetero_cfg: dict, rng: np.random.Generator) -> float:
+    raw = hetero_cfg.get("contrast", hetero_cfg.get("noise_contrast", 1.0))
+    contrast = _sample_float(raw, rng, "contrast")
+    if contrast < 0:
+        raise ValueError(f"contrast must be >= 0, got {contrast}")
+    return contrast
+
+
+def _normalize_noise_np(noise: np.ndarray) -> np.ndarray:
+    min_val = float(np.min(noise))
+    max_val = float(np.max(noise))
+    denom = max_val - min_val
+    if denom <= 1e-8:
+        return np.full_like(noise, 0.5, dtype=np.float32)
+    return ((noise - min_val) / denom).astype(np.float32, copy=False)
+
+
+def _normalize_noise_torch(noise: "torch.Tensor") -> "torch.Tensor":
+    min_val = noise.amin()
+    max_val = noise.amax()
+    denom = max_val - min_val
+    if float(denom.item()) <= 1e-8:
+        return torch.full_like(noise, 0.5)
+    return (noise - min_val) / denom
+
+
+def _gaussian_kernel_np(sigma: float) -> np.ndarray:
+    radius = max(1, int(math.ceil(3.0 * sigma)))
+    offsets = np.arange(-radius, radius + 1, dtype=np.float32)
+    kernel = np.exp(-0.5 * (offsets / float(sigma)) ** 2)
+    kernel /= float(kernel.sum())
+    return kernel.astype(np.float32)
+
+
+def _convolve_axis_np(
+    values: np.ndarray,
+    kernel: np.ndarray,
+    axis: int,
+) -> np.ndarray:
+    radius = kernel.shape[0] // 2
+    padding = [(0, 0)] * values.ndim
+    padding[axis] = (radius, radius)
+    padded = np.pad(values, padding, mode="edge")
+    result = np.zeros_like(values, dtype=np.float32)
+    for offset, weight in enumerate(kernel):
+        slices = [slice(None)] * values.ndim
+        slices[axis] = slice(offset, offset + values.shape[axis])
+        result += float(weight) * padded[tuple(slices)]
+    return result
+
+
+def _gaussian_blur_np(noise: np.ndarray, sigma: float) -> np.ndarray:
+    if sigma <= 0.0:
+        return noise
+    kernel = _gaussian_kernel_np(sigma)
+    blurred = _convolve_axis_np(noise, kernel, axis=1)
+    return _convolve_axis_np(blurred, kernel, axis=0)
+
+
+def _gaussian_blur_torch(noise: "torch.Tensor", sigma: float) -> "torch.Tensor":
+    if sigma <= 0.0:
+        return noise
+    radius = max(1, int(math.ceil(3.0 * sigma)))
+    offsets = torch.arange(
+        -radius,
+        radius + 1,
+        device=noise.device,
+        dtype=torch.float32,
+    )
+    kernel = torch.exp(-0.5 * (offsets / float(sigma)) ** 2)
+    kernel = kernel / kernel.sum()
+    x = noise.to(dtype=torch.float32).view(
+        1,
+        1,
+        int(noise.shape[-2]),
+        int(noise.shape[-1]),
+    )
+    x = torch.nn.functional.pad(x, (radius, radius, 0, 0), mode="replicate")
+    x = torch.nn.functional.conv2d(x, kernel.view(1, 1, 1, -1))
+    x = torch.nn.functional.pad(x, (0, 0, radius, radius), mode="replicate")
+    x = torch.nn.functional.conv2d(x, kernel.view(1, 1, -1, 1))
+    return x.view(noise.shape)
 
 
 def modulate_with_noise(
@@ -349,6 +608,7 @@ def apply_model(
         k_cfg = model_cfg.get("k_hetero", {})
         k_scales = resolve_scales(k_cfg, height, width, rng)
         k_noise = perlin_fbm(height, width, k_scales, rng)
+        k_noise = prepare_noise_field(k_noise, k_cfg, rng)
         min_factor = float(sample_value(k_cfg.get("min_factor", 1.0), rng))
         max_factor = float(sample_value(k_cfg.get("max_factor", 1.0), rng))
         k_field = modulate_with_noise(
@@ -365,6 +625,7 @@ def apply_model(
         ls_cfg = model_cfg.get("ls_hetero", {})
         ls_scales = resolve_scales(ls_cfg, height, width, rng)
         ls_noise = perlin_fbm(height, width, ls_scales, rng)
+        ls_noise = prepare_noise_field(ls_noise, ls_cfg, rng)
         min_factor = float(sample_value(ls_cfg.get("min_factor", 1.0), rng))
         max_factor = float(sample_value(ls_cfg.get("max_factor", 1.0), rng))
         ls_field = modulate_with_noise(

@@ -9,10 +9,10 @@
   "selection": {
     "mode": "weighted",
     "weights": {
-      "uniform": 1.0,
-      "heterogeneous_k": 0.0,
-      "heterogeneous_ls": 0.0,
-      "heterogeneous_k_ls": 0.0
+      "uniform": 0.25,
+      "heterogeneous_k": 0.35,
+      "heterogeneous_ls": 0.25,
+      "heterogeneous_k_ls": 0.15
     }
   },
   "models": {
@@ -32,11 +32,13 @@
       },
       "atmospheric_light": "from_sky",
       "k_hetero": {
-        "scales": "auto",
-        "min_scale": 2,
+        "scales": "smooth_auto",
+        "correlation_length_fraction": 0.25,
+        "octaves": 3,
         "max_scale": null,
-        "min_factor": 0.0,
-        "max_factor": 1.0,
+        "min_factor": 0.65,
+        "max_factor": 1.45,
+        "contrast": 0.65,
         "normalize_to_mean": true
       }
     },
@@ -47,11 +49,13 @@
       },
       "atmospheric_light": "from_sky",
       "ls_hetero": {
-        "scales": "auto",
-        "min_scale": 2,
+        "scales": "smooth_auto",
+        "correlation_length_fraction": 0.35,
+        "octaves": 3,
         "max_scale": null,
-        "min_factor": 0.0,
-        "max_factor": 1.0,
+        "min_factor": 0.85,
+        "max_factor": 1.08,
+        "contrast": 0.55,
         "normalize_to_mean": false
       }
     },
@@ -62,19 +66,23 @@
       },
       "atmospheric_light": "from_sky",
       "k_hetero": {
-        "scales": "auto",
-        "min_scale": 2,
+        "scales": "smooth_auto",
+        "correlation_length_fraction": 0.25,
+        "octaves": 3,
         "max_scale": null,
-        "min_factor": 0.0,
-        "max_factor": 1.0,
+        "min_factor": 0.65,
+        "max_factor": 1.45,
+        "contrast": 0.65,
         "normalize_to_mean": true
       },
       "ls_hetero": {
-        "scales": "auto",
-        "min_scale": 2,
+        "scales": "smooth_auto",
+        "correlation_length_fraction": 0.35,
+        "octaves": 3,
         "max_scale": null,
-        "min_factor": 0.0,
-        "max_factor": 1.0,
+        "min_factor": 0.85,
+        "max_factor": 1.08,
+        "contrast": 0.55,
         "normalize_to_mean": false
       }
     }

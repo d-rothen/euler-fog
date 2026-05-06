@@ -40,6 +40,7 @@ from euler_preprocess.fog.models import (
     estimate_airlight_torch,
     modulate_with_noise_torch,
     normalize_atmospheric_light_torch,
+    prepare_noise_field_torch,
     resolve_model_config,
     resolve_scattering_coefficient,
     resolve_scales,
@@ -711,6 +712,7 @@ class FogTransform(Transform):
                 torch_gen,
                 self.torch_device,
             )
+            k_noise = prepare_noise_field_torch(k_noise, k_cfg, rng)
             min_factor = float(sample_value(k_cfg.get("min_factor", 1.0), rng))
             max_factor = float(sample_value(k_cfg.get("max_factor", 1.0), rng))
             k_field = modulate_with_noise_torch(
@@ -733,6 +735,7 @@ class FogTransform(Transform):
                 torch_gen,
                 self.torch_device,
             )
+            ls_noise = prepare_noise_field_torch(ls_noise, ls_cfg, rng)
             min_factor = float(sample_value(ls_cfg.get("min_factor", 1.0), rng))
             max_factor = float(sample_value(ls_cfg.get("max_factor", 1.0), rng))
             ls_field = modulate_with_noise_torch(

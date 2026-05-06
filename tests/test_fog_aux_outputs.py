@@ -561,6 +561,60 @@ def test_apply_model_returns_spatial_fields_for_heterogeneous() -> None:
     assert float(k_map.std()) > 0.0
 
 
+def test_smooth_auto_scales_are_image_relative_low_frequency() -> None:
+    """smooth_auto should avoid the pixel-scale octaves that make fog speckly."""
+    from euler_preprocess.fog.models import resolve_scales
+
+    rng = np.random.default_rng(0)
+    cfg = {
+        "scales": "smooth_auto",
+        "correlation_length_fraction": 0.25,
+        "octaves": 4,
+        "max_scale_fraction": 1.0,
+    }
+
+    assert resolve_scales(cfg, height=100, width=200, rng=rng) == [25, 50, 100, 200]
+
+
+def test_smooth_noise_contrast_keeps_heterogeneous_beta_near_mean() -> None:
+    """Low noise contrast keeps spatial fog gradients subtle around the base beta."""
+    from euler_preprocess.fog.models import apply_model
+
+    rng = np.random.default_rng(123)
+    rgb = np.full((80, 120, 3), 0.5, dtype=np.float32)
+    depth = np.full((80, 120), 50.0, dtype=np.float32)
+    estimated = np.array([0.8, 0.8, 0.9], dtype=np.float32)
+    cfg = {
+        "visibility_m": {"dist": "constant", "value": 80.0},
+        "atmospheric_light": "from_sky",
+        "k_hetero": {
+            "scales": "smooth_auto",
+            "correlation_length_fraction": 0.25,
+            "octaves": 3,
+            "min_factor": 0.5,
+            "max_factor": 1.5,
+            "contrast": 0.2,
+            "normalize_to_mean": True,
+        },
+    }
+
+    _, k_mean, _, k_map, _ = apply_model(
+        rgb,
+        depth,
+        "heterogeneous_k",
+        cfg,
+        rng,
+        contrast_threshold_default=0.05,
+        estimated_airlight=estimated,
+    )
+
+    factors = k_map / k_mean
+    assert float(factors.std()) > 0.0
+    assert float(factors.min()) >= 0.75
+    assert float(factors.max()) <= 1.25
+    np.testing.assert_allclose(float(factors.mean()), 1.0, rtol=1e-6)
+
+
 def test_apply_model_accepts_direct_scattering_coefficient() -> None:
     """Stepped configs may specify beta directly instead of MOR/visibility."""
     from euler_preprocess.fog.models import apply_model
