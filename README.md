@@ -356,12 +356,14 @@ while introducing spatial variation.
 ### Fog Output
 
 CLI runs write a source-backed RGB dataset. The output keeps the source RGB
-dataset's relative paths, basenames, extensions, and `output.json` metadata so
-the result stays loadable by `euler-loading`:
+dataset's relative paths, basenames, extensions, and ds-crawler metadata so the
+result stays loadable by `euler-loading`:
 
 ```
 <output_path>/
-  .ds_crawler/output.json
+  .ds_crawler/dataset-head.json
+  .ds_crawler/ds-crawler.json
+  .ds_crawler/index.json
   Scene01/
     Camera_0/
       00000.png
@@ -376,7 +378,9 @@ the source file id instead:
 
 ```
 <output_path>/
-  .ds_crawler/output.json
+  .ds_crawler/dataset-head.json
+  .ds_crawler/ds-crawler.json
+  .ds_crawler/index.json
   Scene01/
     Camera_0/
       00000/
@@ -432,6 +436,6 @@ No special parameters are required. The transform reads intrinsics from the `int
 ### Radial Output
 
 CLI runs write a source-backed depth dataset mirroring the input depth
-modality's layout and writer metadata. The emitted `output.json` also flips
+modality's layout and writer metadata. The emitted `index.json` also flips
 `meta.radial_depth` to `true`. Standalone/direct `RadialTransform(...)` usage
 keeps the legacy `.npy` output behavior.

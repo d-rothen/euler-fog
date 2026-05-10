@@ -311,7 +311,7 @@ def test_stepped_augmentations_write_file_id_layout_and_attributes(
     np.testing.assert_allclose(k_map, expected_k, atol=1e-6)
 
     output_index = json.loads(
-        (pipeline_root / "foggy_rgb" / ".ds_crawler" / "output.json").read_text()
+        (pipeline_root / "foggy_rgb" / ".ds_crawler" / "index.json").read_text()
     )
     node = output_index["dataset"]["children"]["Scene01"]["children"]["Camera_0"]
     file_id_node = node["children"]["file_id:00001"]
@@ -409,7 +409,7 @@ def test_aux_outputs_carry_correct_index_metadata(tmp_path: Path) -> None:
     transform.run(dataset)
 
     scattering_index = json.loads(
-        (pipeline_root / "scattering" / ".ds_crawler" / "output.json").read_text()
+        (pipeline_root / "scattering" / ".ds_crawler" / "index.json").read_text()
     )
     assert scattering_index["name"] == "scattering_coefficient"
     assert scattering_index["type"] == "map_2d"
@@ -418,7 +418,7 @@ def test_aux_outputs_carry_correct_index_metadata(tmp_path: Path) -> None:
     assert scattering_index["euler_train"]["used_as"] == "target"
 
     airlight_index = json.loads(
-        (pipeline_root / "airlight" / ".ds_crawler" / "output.json").read_text()
+        (pipeline_root / "airlight" / ".ds_crawler" / "index.json").read_text()
     )
     assert airlight_index["name"] == "atmospheric_light"
     assert airlight_index["type"] == "map_3d"

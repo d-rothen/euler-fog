@@ -177,11 +177,18 @@ def test_fog_uses_source_backed_writer_metadata(tmp_path: Path) -> None:
     assert saved_paths[0].exists()
 
     output_index = json.loads(
-        (tmp_path / "foggy" / ".ds_crawler" / "output.json").read_text()
+        (tmp_path / "foggy" / ".ds_crawler" / "index.json").read_text()
     )
     assert output_index["euler_train"]["modality_type"] == "rgb"
     assert output_index["euler_loading"]["function"] == "rgb"
     assert output_index["meta"]["range"] == [0, 255]
+
+    reloaded = MultiModalDataset(
+        modalities={
+            "rgb": Modality(str(tmp_path / "foggy"), loader=load_rgb),
+        },
+    )
+    assert len(reloaded) == 1
 
 
 def test_pipeline_target_controls_root_and_manifest(tmp_path: Path) -> None:
@@ -288,8 +295,8 @@ def test_fog_source_backed_output_can_write_zip(tmp_path: Path) -> None:
     with zipfile.ZipFile(tmp_path / "foggy_rgb.zip", "r") as zf:
         names = set(zf.namelist())
         assert "Scene01/Camera_0/00001.png" in names
-        assert ".ds_crawler/output.json" in names
-        output_index = json.loads(zf.read(".ds_crawler/output.json"))
+        assert ".ds_crawler/index.json" in names
+        output_index = json.loads(zf.read(".ds_crawler/index.json"))
 
     assert output_index["euler_train"]["modality_type"] == "rgb"
     assert output_index["euler_loading"]["function"] == "rgb"
@@ -314,7 +321,7 @@ def test_radial_source_backed_output_sets_radial_depth_metadata(
     assert result.shape == (4, 6)
 
     output_index = json.loads(
-        (tmp_path / "radial" / ".ds_crawler" / "output.json").read_text()
+        (tmp_path / "radial" / ".ds_crawler" / "index.json").read_text()
     )
     assert output_index["euler_loading"]["function"] == "depth"
     assert output_index["meta"]["radial_depth"] is True

@@ -9,6 +9,11 @@ from pathlib import Path
 from typing import Any
 
 from ds_crawler import DatasetWriter, ZipDatasetWriter
+from ds_crawler.zip_utils import (
+    METADATA_DIR,
+    OUTPUT_FILENAME as DS_CRAWLER_INDEX_FILENAME,
+    get_metadata_entry_name,
+)
 from euler_loading import MultiModalDataset
 from euler_loading.dataset import create_dataset_writer_from_index
 from euler_loading.loaders._writer_utils import supports_stream_target
@@ -216,12 +221,18 @@ def _merge_top_level_mapping(target: dict[str, Any], overlay: dict[str, Any]) ->
 def _patch_output_index(
     dataset_writer: DatasetWriter | ZipDatasetWriter,
     overrides: dict[str, Any],
+    *,
+    filename: str = DS_CRAWLER_INDEX_FILENAME,
 ) -> None:
     if not overrides:
         return
 
+    metadata_scope = getattr(dataset_writer, "_metadata_scope", None)
     if isinstance(dataset_writer, ZipDatasetWriter):
-        entry_name = ".ds_crawler/output.json"
+        entry_name = get_metadata_entry_name(
+            filename,
+            metadata_scope=metadata_scope,
+        )
         archive_path = Path(dataset_writer.root)
         replacement_name = archive_path.with_suffix(archive_path.suffix + ".tmp")
         with zipfile.ZipFile(archive_path, "r") as source_zip:
@@ -238,7 +249,10 @@ def _patch_output_index(
         replacement_name.replace(archive_path)
         return
 
-    output_path = Path(dataset_writer.root) / ".ds_crawler" / "output.json"
+    output_path = Path(dataset_writer.root) / METADATA_DIR
+    if metadata_scope is not None:
+        output_path = output_path / metadata_scope
+    output_path = output_path / filename
     payload = json.loads(output_path.read_text(encoding="utf-8"))
     _merge_top_level_mapping(payload, overrides)
     output_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
@@ -508,8 +522,12 @@ class SourceBackedOutputBackend:
         )
 
     def finalize(self) -> None:
-        self.dataset_writer.save_index()
-        _patch_output_index(self.dataset_writer, self.index_overrides)
+        self.dataset_writer.save_index(filename=DS_CRAWLER_INDEX_FILENAME)
+        _patch_output_index(
+            self.dataset_writer,
+            self.index_overrides,
+            filename=DS_CRAWLER_INDEX_FILENAME,
+        )
         if self.pipeline_manifest_path and self.pipeline_manifest_targets:
             _write_pipeline_outputs_manifest(
                 self.pipeline_manifest_path,
