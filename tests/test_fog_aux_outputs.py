@@ -615,6 +615,53 @@ def test_smooth_noise_contrast_keeps_heterogeneous_beta_near_mean() -> None:
     np.testing.assert_allclose(float(factors.mean()), 1.0, rtol=1e-6)
 
 
+def test_heterogeneous_k_normal_mor_sample_anchors_mean_beta() -> None:
+    """A sampled MOR value is converted once, then used as the β-field mean."""
+    from euler_preprocess.common.sampling import sample_value
+    from euler_preprocess.fog.models import apply_model, visibility_to_k
+
+    seed = 987
+    visibility_spec = {
+        "dist": "normal",
+        "mean": 180.0,
+        "std": 30.0,
+        "min": 80.0,
+    }
+    expected_visibility = sample_value(visibility_spec, np.random.default_rng(seed))
+    expected_beta = visibility_to_k(expected_visibility, 0.05)
+
+    rgb = np.full((64, 64, 3), 0.5, dtype=np.float32)
+    depth = np.full((64, 64), 50.0, dtype=np.float32)
+    estimated = np.array([0.8, 0.8, 0.9], dtype=np.float32)
+    cfg = {
+        "visibility_m": visibility_spec,
+        "atmospheric_light": "from_sky",
+        "k_hetero": {
+            "scales": "smooth_auto",
+            "correlation_length_fraction": 0.25,
+            "octaves": 3,
+            "min_factor": 0.65,
+            "max_factor": 1.45,
+            "contrast": 0.65,
+            "normalize_to_mean": True,
+        },
+    }
+
+    _, k_mean, _, k_map, _ = apply_model(
+        rgb,
+        depth,
+        "heterogeneous_k",
+        cfg,
+        np.random.default_rng(seed),
+        contrast_threshold_default=0.05,
+        estimated_airlight=estimated,
+    )
+
+    assert float(k_map.std()) > 0.0
+    np.testing.assert_allclose(k_mean, expected_beta, rtol=1e-7)
+    np.testing.assert_allclose(float(k_map.mean()), expected_beta, rtol=1e-6)
+
+
 def test_apply_model_accepts_direct_scattering_coefficient() -> None:
     """Stepped configs may specify beta directly instead of MOR/visibility."""
     from euler_preprocess.fog.models import apply_model

@@ -250,7 +250,10 @@ Each model specifies a `visibility_m` distribution from which a visibility dista
 | `lognormal` | `mean`, `sigma`, optional `min`/`max` | Log-normal. |
 | `choice` | `values`, optional `weights` | Discrete weighted choice. |
 
-The sampled visibility *V* is converted to the attenuation coefficient: **k = -ln(C_t) / V**.
+The sampled visibility *V* is converted to the attenuation coefficient:
+**k = -ln(C_t) / V**. This happens once per output image. For
+`heterogeneous_k` and `heterogeneous_k_ls`, that sampled value is the base
+coefficient that is then spatially modulated by the noise field.
 
 ### Stepped Augmentations
 
@@ -341,7 +344,12 @@ The noise field (values in [0, 1]) is mapped to a factor field:
 `contrast < 1` compresses the noise around 0.5 before this mapping, avoiding
 extreme local fog density. When `normalize_to_mean` is `true`, the factor field
 is rescaled so its spatial mean equals 1.0, preserving the overall fog density
-while introducing spatial variation.
+while introducing spatial variation. In other words, with heterogeneous `k`:
+`k(x) = k_sampled * factor(x)`. If `visibility_m` / MOR was sampled from a
+distribution, `k_sampled` is the coefficient derived from that one sampled MOR.
+With `normalize_to_mean: true`, the arithmetic mean of the per-pixel `k` map
+equals `k_sampled`; the median is not forced to match. With
+`normalize_to_mean: false`, the map mean shifts by the mean of the factor field.
 
 | Parameter | Effect |
 |---|---|

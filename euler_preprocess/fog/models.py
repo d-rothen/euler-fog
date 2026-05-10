@@ -96,6 +96,10 @@ def resolve_scattering_coefficient(
     (MOR) and converts it to beta.  Stepped augmentation configs may provide
     beta directly via ``scattering_coefficient`` or its alias ``beta``.
 
+    For heterogeneous-k models this resolves the scalar base beta before the
+    spatial factor field is generated.  If ``k_hetero.normalize_to_mean`` is
+    enabled, the resulting beta map has this value as its arithmetic mean.
+
     Returns ``(beta, visibility_m, contrast_threshold)``.  ``visibility_m`` is
     ``None`` when beta was configured directly.
     """
@@ -575,7 +579,8 @@ def apply_model(
         Tuple ``(foggy, k_mean, ls_base, k_map, ls_map)``:
 
         * ``foggy``: ``(H, W, 3)`` foggy RGB image.
-        * ``k_mean``: scalar mean scattering coefficient (for filenames/logs).
+        * ``k_mean``: scalar base scattering coefficient (the map mean when
+          heterogeneous-k normalization is enabled; for filenames/logs).
         * ``ls_base``: ``(3,)`` base atmospheric light (for filenames/logs).
         * ``k_map``: ``(H, W)`` β-field actually used (broadcast for uniform).
         * ``ls_map``: ``(H, W, 3)`` L_s-field actually used (broadcast for uniform).
