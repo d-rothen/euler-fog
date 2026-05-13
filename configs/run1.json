@@ -6,6 +6,9 @@
   "contrast_threshold": 0.05,
   "device": "mps",
   "gpu_batch_size": 4,
+  "capture": {
+    "preset": "camera"
+  },
   "selection": {
     "mode": "weighted",
     "weights": {

@@ -508,11 +508,67 @@ def test_capture_pipeline_empty_config_is_noop() -> None:
     assert result is image
 
 
-def test_capture_pipeline_rejects_unimplemented_stages() -> None:
-    with pytest.raises(NotImplementedError, match="exposure"):
+def test_capture_pipeline_rejects_unknown_stages() -> None:
+    with pytest.raises(ValueError, match="not_a_stage"):
         CaptureArtifactPipeline.from_config(
-            {"capture": {"stages": [{"type": "exposure"}]}}
+            {"capture": {"stages": [{"type": "not_a_stage"}]}}
         )
+
+
+def test_capture_camera_preset_is_deterministic_and_changes_image() -> None:
+    pipeline = CaptureArtifactPipeline.from_config({"capture": {"preset": "camera"}})
+    x = np.linspace(0.1, 0.95, 40, dtype=np.float32)
+    y = np.linspace(0.2, 0.9, 32, dtype=np.float32)
+    image = np.dstack(
+        [
+            np.broadcast_to(x, (32, 40)),
+            np.broadcast_to(y[:, None], (32, 40)),
+            np.full((32, 40), 0.65, dtype=np.float32),
+        ]
+    )
+
+    first = pipeline.apply_np(
+        image,
+        context=CaptureContext(rng=np.random.default_rng(123)),
+    )
+    second = pipeline.apply_np(
+        image,
+        context=CaptureContext(rng=np.random.default_rng(123)),
+    )
+
+    assert first.shape == image.shape
+    assert first.dtype == np.float32
+    assert 0.0 <= float(first.min()) <= float(first.max()) <= 1.0
+    np.testing.assert_allclose(first, second)
+    assert not np.allclose(first, image)
+
+
+def test_capture_custom_stage_chain_can_resize_and_quantize() -> None:
+    pipeline = CaptureArtifactPipeline.from_config(
+        {
+            "capture": {
+                "stages": [
+                    {"type": "exposure", "gain": 0.5},
+                    {
+                        "type": "transport",
+                        "resize": [8, 6],
+                        "bit_depth": 4,
+                        "jpeg": {"enabled": False},
+                    },
+                ]
+            }
+        }
+    )
+    image = np.full((12, 16, 3), 0.8, dtype=np.float32)
+
+    result = pipeline.apply_np(
+        image,
+        context=CaptureContext(rng=np.random.default_rng(7)),
+    )
+
+    assert result.shape == (6, 8, 3)
+    assert result.dtype == np.float32
+    np.testing.assert_allclose(result, np.round(result * 15.0) / 15.0)
 
 
 def test_apply_model_returns_full_size_maps_for_uniform() -> None:

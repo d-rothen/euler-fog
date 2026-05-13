@@ -136,7 +136,7 @@ Controls the fog simulation.
   "contrast_threshold": 0.05,
   "device": "cpu",
   "gpu_batch_size": 4,
-  "capture": { "stages": [] },
+  "capture": { "preset": "camera" },
   "augmentations": { ... },
   "selection": { ... },
   "models": { ... }
@@ -152,7 +152,7 @@ Controls the fog simulation.
 | `contrast_threshold` | Threshold *C_t* used in the visibility-to-attenuation conversion (default `0.05`). |
 | `device` | `"cpu"`, `"cuda"`, `"mps"`, or `"gpu"` (alias for cuda). |
 | `gpu_batch_size` | Batch size when running on GPU. Uniform-model samples are batched; heterogeneous samples are processed individually. |
-| `capture` / `capture_artifacts` | Optional post-fog camera artifact pipeline. Currently only an empty/no-op stage list is supported; exposure, vignetting, and noise stages are reserved for future additions. |
+| `capture` / `capture_artifacts` | Optional post-fog camera artifact pipeline. Omit it or set `{"stages": []}` for the legacy no-op path. Set `true`, `{"preset": "camera"}`, or a custom `stages` list to enable optics, raw sensor, ISP, and compression artifacts. |
 | `augmentations` | Optional stepped augmentation set. When present, every input sample produces every configured augmentation and uses the file-id hierarchy output layout described below. |
 
 ### Processing Pipeline
@@ -162,11 +162,74 @@ Fog generation is split into two phases:
 1. Ideal scene rendering: physics-based fog and auxiliary `scattering_coefficient`
    / `atmospheric_light` maps are computed.
 2. Capture artifacts: camera-specific effects are applied to the rendered RGB
-   only. This stage is currently a no-op, but it is the intended location for
-   exposure reduction, vignetting, sensor noise, and similar capture effects.
+   only. Physical fog maps stay stable while the RGB output can receive
+   exposure shifts, lens blur, vignetting, raw sensor noise, Bayer/demosaicing
+   artifacts, ISP tone/gamma/sharpening, and JPEG/resize/quantization effects.
 
 This keeps physical fog maps stable while making the RGB output extensible for
 real-camera simulation.
+
+### Capture Artifact Stack
+
+Enable the recommended camera stack with:
+
+```json
+"capture": { "preset": "camera" }
+```
+
+or equivalently:
+
+```json
+"capture": true
+```
+
+For tighter control, provide explicit stages in camera order:
+
+```json
+"capture": {
+  "stages": [
+    {
+      "type": "optics",
+      "blur_sigma": {"dist": "uniform", "min": 0.2, "max": 0.8},
+      "vignetting_strength": 0.15,
+      "windshield_haze": {"enabled": true, "probability": 0.4},
+      "droplets": {"enabled": false}
+    },
+    {
+      "type": "sensor",
+      "input_space": "srgb",
+      "exposure_gain": {"dist": "uniform", "min": 0.85, "max": 1.2},
+      "shot_noise_electrons": {"dist": "uniform", "min": 400, "max": 1600},
+      "read_noise_sigma": {"dist": "uniform", "min": 0.001, "max": 0.006},
+      "row_noise_sigma": 0.003,
+      "bayer_pattern": "RGGB"
+    },
+    {
+      "type": "isp",
+      "tone_map": "reinhard",
+      "gamma": "srgb",
+      "denoise_sigma": 0.2,
+      "sharpen_amount": 0.2,
+      "saturation": 0.9
+    },
+    {
+      "type": "transport",
+      "jpeg": {"enabled": true, "quality": {"dist": "uniform", "min": 65, "max": 92}},
+      "bit_depth": 8
+    }
+  ]
+}
+```
+
+Supported stage types:
+
+| Stage | Main effects |
+|---|---|
+| `optics` | Defocus/MTF blur, motion blur, bloom, veiling glare, vignetting, chromatic aberration, lens distortion, windshield haze, optional droplets. |
+| `sensor` | Exposure, white balance, camera matrix, Bayer mosaic, shot/read noise, fixed-pattern noise, row/column banding, hot/dead pixels, bilinear demosaic. |
+| `isp` | Denoising, color correction, tone mapping, sRGB/gamma, local contrast, sharpening halos, saturation shifts. |
+| `transport` | Crop/resize, bit-depth quantization, JPEG round-trip compression. |
+| `exposure` | Lightweight standalone exposure and white-balance stage for simple custom chains. |
 
 ### Fog Model
 
