@@ -136,6 +136,7 @@ Controls the fog simulation.
   "contrast_threshold": 0.05,
   "device": "cpu",
   "gpu_batch_size": 4,
+  "capture": { "stages": [] },
   "augmentations": { ... },
   "selection": { ... },
   "models": { ... }
@@ -151,7 +152,21 @@ Controls the fog simulation.
 | `contrast_threshold` | Threshold *C_t* used in the visibility-to-attenuation conversion (default `0.05`). |
 | `device` | `"cpu"`, `"cuda"`, `"mps"`, or `"gpu"` (alias for cuda). |
 | `gpu_batch_size` | Batch size when running on GPU. Uniform-model samples are batched; heterogeneous samples are processed individually. |
+| `capture` / `capture_artifacts` | Optional post-fog camera artifact pipeline. Currently only an empty/no-op stage list is supported; exposure, vignetting, and noise stages are reserved for future additions. |
 | `augmentations` | Optional stepped augmentation set. When present, every input sample produces every configured augmentation and uses the file-id hierarchy output layout described below. |
+
+### Processing Pipeline
+
+Fog generation is split into two phases:
+
+1. Ideal scene rendering: physics-based fog and auxiliary `scattering_coefficient`
+   / `atmospheric_light` maps are computed.
+2. Capture artifacts: camera-specific effects are applied to the rendered RGB
+   only. This stage is currently a no-op, but it is the intended location for
+   exposure reduction, vignetting, sensor noise, and similar capture effects.
+
+This keeps physical fog maps stable while making the RGB output extensible for
+real-camera simulation.
 
 ### Fog Model
 

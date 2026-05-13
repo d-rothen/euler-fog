@@ -28,18 +28,22 @@ from euler_preprocess.fog.augmentations import (
     FogAugmentationSpec,
     parse_fog_augmentations,
 )
+from euler_preprocess.fog.capture import CaptureContext
 from euler_preprocess.fog.logging import log_config
 from euler_preprocess.fog.models import (
     AIRLIGHT_METHODS,
     DEFAULT_CONTRAST_THRESHOLD,
     DEFAULT_MODEL_CONFIGS,
     apply_fog_torch,
-    apply_model,
     modulate_with_noise_torch,
     prepare_noise_field_torch,
     resolve_model_config,
     resolve_scales,
     select_model,
+)
+from euler_preprocess.fog.pipeline import (
+    FogPipelineResult,
+    FogProcessingPipeline,
 )
 from euler_loading.loaders.cpu.generic import (
     write_map_2d as _write_map_2d,
@@ -234,6 +238,11 @@ class FogTransform(Transform):
         self.dcp_heuristic_kwargs = self.atmospheric_light.dcp_heuristic_kwargs
         self.airlight_estimator = self.atmospheric_light.estimator
         self.airlight_estimator_torch = self.atmospheric_light.estimator_torch
+        self.pipeline = FogProcessingPipeline.from_config(
+            self.config,
+            atmospheric_light=self.atmospheric_light,
+            contrast_threshold_default=self.contrast_threshold_default,
+        )
 
     def run(self, samples: Iterable[dict]) -> list[Path]:
         """Run the fog transform. Alias for :meth:`generate_fog`."""
@@ -493,29 +502,24 @@ class FogTransform(Transform):
                         model_name, model_cfg = self._resolve_augmented_model(
                             augmentation
                         )
-                        estimated_airlight = self._estimate_airlight_np(
-                            rgb,
-                            sky_mask,
+                        result = self.pipeline.process_np(
+                            rgb=rgb,
+                            depth_m=depth,
+                            sky_mask=sky_mask,
+                            model_name=model_name,
+                            model_cfg=model_cfg,
+                            rng=rng,
                             sample_id=sample.get("id"),
-                            method=augmentation.airlight_method,
-                        )
-                        foggy, beta, airlight, k_map, ls_map = apply_model(
-                            rgb,
-                            depth,
-                            model_name,
-                            model_cfg,
-                            rng,
-                            self.contrast_threshold_default,
-                            estimated_airlight,
+                            airlight_method=augmentation.airlight_method,
                         )
                         saved_paths.append(
                             self._write_primary_output(
                                 sample,
-                                foggy,
+                                result.rgb,
                                 sample_id=sample["id"],
                                 model_name=model_name,
-                                beta=beta,
-                                airlight=airlight,
+                                beta=result.beta,
+                                airlight=result.airlight,
                                 full_id=sample.get("full_id"),
                                 augmentation=augmentation,
                             )
@@ -528,39 +532,36 @@ class FogTransform(Transform):
                             )
                         self._write_auxiliary(
                             sample,
-                            k_map=k_map,
-                            ls_map=ls_map,
+                            k_map=result.k_map,
+                            ls_map=result.ls_map,
                             sample_id=sample["id"],
                             model_name=model_name,
                             full_id=sample.get("full_id"),
-                            beta=beta,
-                            airlight=airlight,
+                            beta=result.beta,
+                            airlight=result.airlight,
                             augmentation=augmentation,
                         )
                 else:
-                    estimated_airlight = self._estimate_airlight_np(
-                        rgb, sky_mask, sample_id=sample.get("id")
-                    )
                     rng = self._rng_for(index)
                     model_name = select_model(self.config, rng)
                     model_cfg = resolve_model_config(model_name, self.models_cfg)
-                    foggy, beta, airlight, k_map, ls_map = apply_model(
-                        rgb,
-                        depth,
-                        model_name,
-                        model_cfg,
-                        rng,
-                        self.contrast_threshold_default,
-                        estimated_airlight,
+                    result = self.pipeline.process_np(
+                        rgb=rgb,
+                        depth_m=depth,
+                        sky_mask=sky_mask,
+                        model_name=model_name,
+                        model_cfg=model_cfg,
+                        rng=rng,
+                        sample_id=sample.get("id"),
                     )
                     saved_paths.append(
                         self._write_primary_output(
                             sample,
-                            foggy,
+                            result.rgb,
                             sample_id=sample["id"],
                             model_name=model_name,
-                            beta=beta,
-                            airlight=airlight,
+                            beta=result.beta,
+                            airlight=result.airlight,
                             full_id=sample.get("full_id"),
                         )
                     )
@@ -568,8 +569,8 @@ class FogTransform(Transform):
                         self._write_model_config(model_name, model_cfg, saved_paths)
                     self._write_auxiliary(
                         sample,
-                        k_map=k_map,
-                        ls_map=ls_map,
+                        k_map=result.k_map,
+                        ls_map=result.ls_map,
                         sample_id=sample["id"],
                         model_name=model_name,
                         full_id=sample.get("full_id"),
@@ -589,6 +590,7 @@ class FogTransform(Transform):
         rng: np.random.Generator,
         estimated_airlight_t: "torch.Tensor",
         torch_gen: "torch.Generator",
+        sample_id: str | None = None,
     ) -> tuple[
         "torch.Tensor", float, "torch.Tensor", "torch.Tensor", "torch.Tensor"
     ]:
@@ -609,7 +611,15 @@ class FogTransform(Transform):
             foggy = apply_fog_torch(rgb_t, depth_t, k_mean, ls_field)
             k_map = self._broadcast_k_map_torch(k_mean, height, width)
             ls_map = self._broadcast_ls_map_torch(ls_base, height, width)
-            return foggy, k_mean, ls_base, k_map, ls_map
+            return self._finalize_torch_pipeline_result(
+                foggy,
+                k_mean,
+                ls_base,
+                k_map,
+                ls_map,
+                rng=rng,
+                sample_id=sample_id,
+            )
 
         if model_name in ("heterogeneous_k", "heterogeneous_k_ls"):
             k_cfg = model_cfg.get("k_hetero", {})
@@ -661,7 +671,45 @@ class FogTransform(Transform):
         foggy = apply_fog_torch(rgb_t, depth_t, k_field, ls_field)
         k_map = self._broadcast_k_map_torch(k_field, height, width)
         ls_map = self._broadcast_ls_map_torch(ls_field, height, width)
-        return foggy, k_mean, ls_base, k_map, ls_map
+        return self._finalize_torch_pipeline_result(
+            foggy,
+            k_mean,
+            ls_base,
+            k_map,
+            ls_map,
+            rng=rng,
+            sample_id=sample_id,
+        )
+
+    def _finalize_torch_pipeline_result(
+        self,
+        foggy: "torch.Tensor",
+        beta: float,
+        airlight: "torch.Tensor",
+        k_map: "torch.Tensor",
+        ls_map: "torch.Tensor",
+        *,
+        rng: np.random.Generator,
+        sample_id: str | None,
+    ) -> tuple[
+        "torch.Tensor", float, "torch.Tensor", "torch.Tensor", "torch.Tensor"
+    ]:
+        result = FogPipelineResult(
+            rgb=foggy,
+            beta=beta,
+            airlight=airlight,
+            k_map=k_map,
+            ls_map=ls_map,
+        )
+        result = self.pipeline.apply_capture_torch(
+            result,
+            context=CaptureContext(
+                sample_id=sample_id,
+                rng=rng,
+                device=self.torch_device,
+            ),
+        )
+        return result.rgb, result.beta, result.airlight, result.k_map, result.ls_map
 
     def _broadcast_k_map_torch(
         self, k_field, height: int, width: int
@@ -803,6 +851,17 @@ class FogTransform(Transform):
                         foggy = rgb_batch * t[..., None] + ls_base[
                             :, None, None, :
                         ] * (1.0 - t[..., None])
+                        foggy = self.pipeline.apply_capture_torch_batch(
+                            foggy,
+                            contexts=tuple(
+                                CaptureContext(
+                                    sample_id=item["sample_id"],
+                                    rng=item["rng"],
+                                    device=device,
+                                )
+                                for item in uniform_items
+                            ),
+                        )
 
                         height = int(rgb_batch.shape[1])
                         width = int(rgb_batch.shape[2])
@@ -891,6 +950,7 @@ class FogTransform(Transform):
                                 item["rng"],
                                 estimated_airlight,
                                 torch_gen,
+                                sample_id=item["sample_id"],
                             )
                         )
                         foggy_img = torch.clamp(foggy_t, 0.0, 1.0).cpu().numpy()
@@ -1009,6 +1069,7 @@ class FogTransform(Transform):
                             rng,
                             estimated_airlight,
                             torch_gen,
+                            sample_id=sample.get("id"),
                         )
                     )
                     foggy_img = torch.clamp(foggy_t, 0.0, 1.0).cpu().numpy()

@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from ds_crawler import DatasetWriter
 from euler_loading import Modality, MultiModalDataset
@@ -24,6 +25,7 @@ from euler_loading.loaders.cpu.generic import (
 )
 
 from euler_preprocess.common.output import prepare_output_backends
+from euler_preprocess.fog.capture import CaptureArtifactPipeline, CaptureContext
 from euler_preprocess.fog.models import visibility_to_k
 from euler_preprocess.fog.transform import (
     ATMOSPHERIC_LIGHT_SLOT,
@@ -495,6 +497,22 @@ def test_primary_slot_auto_selected_when_aliased(tmp_path: Path) -> None:
     manifest = json.loads(manifest_path.read_text())
     slots = [target["slot"] for target in manifest["outputs"]]
     assert slots == ["fog", SCATTERING_COEFFICIENT_SLOT, ATMOSPHERIC_LIGHT_SLOT]
+
+
+def test_capture_pipeline_empty_config_is_noop() -> None:
+    pipeline = CaptureArtifactPipeline.from_config({"capture": {"stages": []}})
+    image = np.full((2, 3, 3), 0.5, dtype=np.float32)
+
+    result = pipeline.apply_np(image, context=CaptureContext(sample_id="sample"))
+
+    assert result is image
+
+
+def test_capture_pipeline_rejects_unimplemented_stages() -> None:
+    with pytest.raises(NotImplementedError, match="exposure"):
+        CaptureArtifactPipeline.from_config(
+            {"capture": {"stages": [{"type": "exposure"}]}}
+        )
 
 
 def test_apply_model_returns_full_size_maps_for_uniform() -> None:
