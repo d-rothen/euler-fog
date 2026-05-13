@@ -84,7 +84,7 @@ starting at index 10 with stride 5.
 
 | Transform | `modalities` | `hierarchical_modalities` |
 |---|---|---|
-| `fog` | `rgb`, `depth`, `semantic_segmentation` | `intrinsics` optional, used for radial depth and camera-profile optics when present |
+| `fog` | `rgb`, `depth`, `semantic_segmentation` | `intrinsics` when available; used for radial depth conversion and camera-profile optics |
 | `sky-depth` | `depth`, `semantic_segmentation` | — |
 | `radial` | `depth` | `intrinsics` |
 
@@ -262,6 +262,20 @@ Supported stage types:
 | `isp` | Denoising, color correction, tone mapping, sRGB/gamma, local contrast, sharpening halos, saturation shifts. |
 | `transport` | Crop/resize, bit-depth quantization, JPEG round-trip compression. |
 | `exposure` | Lightweight standalone exposure and white-balance stage for simple custom chains. |
+
+Any stage can define `condition_profiles` to sample coherent per-image settings
+before the stage runs. This is useful for exposure states where ISO, exposure
+gain, read noise, banding, and dark/fog noise modulation should move together:
+
+```json
+{
+  "type": "sensor",
+  "condition_profiles": [
+    {"name": "clean_daylight", "weight": 0.25, "exposure_gain": 1.0, "iso": 100},
+    {"name": "underexposed_noisy", "weight": 0.25, "exposure_gain": 0.65, "iso": 1600}
+  ]
+}
+```
 
 ### Fog Model
 

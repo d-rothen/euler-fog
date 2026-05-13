@@ -77,22 +77,28 @@ class ConfiguredCaptureStage(CaptureArtifactStage):
 
     def apply_np(self, image, context: CaptureContext):
         rng = _rng(context)
-        if not self._should_apply(rng):
+        config = _conditioned_stage_config(self.config, rng)
+        if not self._should_apply(rng, config):
             return image
-        return self._apply_np(_as_float_rgb(image), context, rng)
+        return self._apply_np(_as_float_rgb(image), context, rng, config)
 
     def _apply_np(
         self,
         image: np.ndarray,
         context: CaptureContext,
         rng: np.random.Generator,
+        config: Mapping[str, Any],
     ) -> np.ndarray:
         return image
 
-    def _should_apply(self, rng: np.random.Generator) -> bool:
-        if not _bool_value(self.config.get("enabled", True)):
+    def _should_apply(
+        self,
+        rng: np.random.Generator,
+        config: Mapping[str, Any],
+    ) -> bool:
+        if not _bool_value(config.get("enabled", True)):
             return False
-        probability = _sample_float(self.config, "probability", 1.0, rng)
+        probability = _sample_float(config, "probability", 1.0, rng)
         if probability <= 0.0:
             return False
         if probability >= 1.0:
@@ -156,17 +162,18 @@ class OpticsStage(ConfiguredCaptureStage):
         image: np.ndarray,
         context: CaptureContext,
         rng: np.random.Generator,
+        config: Mapping[str, Any],
     ) -> np.ndarray:
         img = image
         intrinsics = _context_intrinsics(context)
 
-        distortion = _sample_float(self.config, "lens_distortion", 0.0, rng)
+        distortion = _sample_float(config, "lens_distortion", 0.0, rng)
         if abs(distortion) > 1e-5:
-            k2 = _sample_float(self.config, "lens_distortion_k2", 0.0, rng)
+            k2 = _sample_float(config, "lens_distortion_k2", 0.0, rng)
             img = _lens_distort_np(img, distortion, k2, intrinsics)
 
         aberration_px = _sample_float(
-            self.config,
+            config,
             "chromatic_aberration_px",
             0.0,
             rng,
@@ -174,7 +181,7 @@ class OpticsStage(ConfiguredCaptureStage):
         if aberration_px > 1e-4:
             img = _chromatic_aberration_np(img, aberration_px, intrinsics)
 
-        fringing_cfg = _config_block(self.config, "depth_chromatic_fringing")
+        fringing_cfg = _config_block(config, "depth_chromatic_fringing")
         if _block_enabled(fringing_cfg, rng):
             img = _apply_depth_chromatic_fringing_np(
                 img,
@@ -184,29 +191,29 @@ class OpticsStage(ConfiguredCaptureStage):
                 rng,
             )
 
-        blur_sigma = _sample_float(self.config, "blur_sigma", 0.0, rng)
+        blur_sigma = _sample_float(config, "blur_sigma", 0.0, rng)
         if blur_sigma > 1e-4:
             img = _gaussian_blur_np(img, blur_sigma)
 
-        motion_cfg = _config_block(self.config, "motion_blur")
+        motion_cfg = _config_block(config, "motion_blur")
         if _block_enabled(motion_cfg, rng):
             length = _sample_float(motion_cfg, "length_px", 0.0, rng)
             angle = _sample_float(motion_cfg, "angle_deg", 0.0, rng)
             if length >= 2.0:
                 img = _motion_blur_np(img, length, angle)
 
-        bloom_cfg = _config_block(self.config, "bloom")
+        bloom_cfg = _config_block(config, "bloom")
         if _bool_value(bloom_cfg.get("enabled", True)):
             img = _apply_bloom_np(img, bloom_cfg, rng)
 
-        glare = _sample_float(self.config, "veiling_glare_strength", 0.0, rng)
+        glare = _sample_float(config, "veiling_glare_strength", 0.0, rng)
         if glare > 1e-5:
             veil = _low_frequency_field(img.shape[0], img.shape[1], rng)
             img = img * (1.0 - glare) + glare * veil[..., None]
 
-        vignette = _sample_float(self.config, "vignetting_strength", 0.0, rng)
+        vignette = _sample_float(config, "vignetting_strength", 0.0, rng)
         if vignette > 1e-5:
-            radius = _sample_float(self.config, "vignetting_radius", 1.15, rng)
+            radius = _sample_float(config, "vignetting_radius", 1.15, rng)
             mask = _vignette_mask(
                 img.shape[0],
                 img.shape[1],
@@ -216,11 +223,11 @@ class OpticsStage(ConfiguredCaptureStage):
             )
             img = img * mask[..., None]
 
-        windshield_cfg = _config_block(self.config, "windshield_haze")
+        windshield_cfg = _config_block(config, "windshield_haze")
         if _block_enabled(windshield_cfg, rng):
             img = _apply_windshield_haze_np(img, windshield_cfg, rng)
 
-        droplets_cfg = _config_block(self.config, "droplets")
+        droplets_cfg = _config_block(config, "droplets")
         if _block_enabled(droplets_cfg, rng):
             img = _apply_droplets_np(img, droplets_cfg, rng)
 
@@ -244,15 +251,20 @@ class ExposureStage(ConfiguredCaptureStage):
         image: np.ndarray,
         context: CaptureContext,
         rng: np.random.Generator,
+        config: Mapping[str, Any],
     ) -> np.ndarray:
-        gain_key = "exposure_gain" if self.config.get("exposure_gain") is not None else "gain"
-        gain = _sample_float(self.config, gain_key, 1.0, rng)
-        wb = _sample_triplet(self.config.get("white_balance", [1.0, 1.0, 1.0]), rng)
-        jitter = _sample_float(self.config, "white_balance_jitter", 0.0, rng)
+        gain_key = (
+            "exposure_gain"
+            if config.get("exposure_gain") is not None
+            else "gain"
+        )
+        gain = _sample_float(config, gain_key, 1.0, rng)
+        wb = _sample_triplet(config.get("white_balance", [1.0, 1.0, 1.0]), rng)
+        jitter = _sample_float(config, "white_balance_jitter", 0.0, rng)
         if jitter > 0.0:
             wb = wb * rng.lognormal(mean=0.0, sigma=jitter, size=3).astype(np.float32)
         out = image * gain * wb.reshape(1, 1, 3)
-        if _bool_value(self.config.get("clip", True)):
+        if _bool_value(config.get("clip", True)):
             out = _clip01(out)
         return out.astype(np.float32, copy=False)
 
@@ -314,46 +326,47 @@ class SensorStage(ConfiguredCaptureStage):
         image: np.ndarray,
         context: CaptureContext,
         rng: np.random.Generator,
+        config: Mapping[str, Any],
     ) -> np.ndarray:
         img = image
-        if str(self.config.get("input_space", "linear")).lower() == "srgb":
+        if str(config.get("input_space", "linear")).lower() == "srgb":
             img = _srgb_to_linear(img)
 
-        matrix = _sample_matrix(self.config.get("camera_matrix"), rng)
+        matrix = _sample_matrix(config.get("camera_matrix"), rng)
         img = _apply_color_matrix(img, matrix)
 
-        exposure = _sample_float(self.config, "exposure_gain", 1.0, rng)
-        wb = _sample_triplet(self.config.get("white_balance", [1.0, 1.0, 1.0]), rng)
-        wb_jitter = _sample_float(self.config, "white_balance_jitter", 0.0, rng)
+        exposure = _sample_float(config, "exposure_gain", 1.0, rng)
+        wb = _sample_triplet(config.get("white_balance", [1.0, 1.0, 1.0]), rng)
+        wb_jitter = _sample_float(config, "white_balance_jitter", 0.0, rng)
         if wb_jitter > 0.0:
             wb = wb * rng.lognormal(mean=0.0, sigma=wb_jitter, size=3).astype(
                 np.float32
             )
-        gain_sigma = _sample_float(self.config, "channel_gain_sigma", 0.0, rng)
+        gain_sigma = _sample_float(config, "channel_gain_sigma", 0.0, rng)
         if gain_sigma > 0.0:
             wb = wb * rng.lognormal(mean=0.0, sigma=gain_sigma, size=3).astype(
                 np.float32
             )
         img = img * exposure * wb.reshape(1, 1, 3)
 
-        white_clip = _sample_float(self.config, "clip", 1.0, rng)
+        white_clip = _sample_float(config, "clip", 1.0, rng)
         img = np.clip(img, 0.0, max(white_clip, 1e-6)) / max(white_clip, 1e-6)
 
-        pattern = str(_sample_any(self.config.get("bayer_pattern", "RGGB"), rng)).upper()
+        pattern = str(_sample_any(config.get("bayer_pattern", "RGGB"), rng)).upper()
         raw_signal = _clip01(_bayer_mosaic_np(img, pattern))
 
-        black_levels = _sample_sensor_levels(self.config, "black_level", rng)
+        black_levels = _sample_sensor_levels(config, "black_level", rng)
         black_levels += rng.normal(
             0.0,
-            _sample_float(self.config, "black_level_jitter", 0.0, rng),
+            _sample_float(config, "black_level_jitter", 0.0, rng),
             size=3,
         ).astype(np.float32)
         black_levels = np.clip(black_levels, 0.0, 0.95)
 
-        white_levels = _sample_sensor_levels(self.config, "white_level", rng)
+        white_levels = _sample_sensor_levels(config, "white_level", rng)
         white_levels += rng.normal(
             0.0,
-            _sample_float(self.config, "white_level_jitter", 0.0, rng),
+            _sample_float(config, "white_level_jitter", 0.0, rng),
             size=3,
         ).astype(np.float32)
         white_levels = np.clip(white_levels, 0.05, 1.0)
@@ -366,7 +379,7 @@ class SensorStage(ConfiguredCaptureStage):
         electron_capacity = _resolve_electron_capacity(
             raw_signal.shape,
             pattern,
-            self.config,
+            config,
             rng,
         )
         noisy_signal = raw_signal
@@ -377,16 +390,16 @@ class SensorStage(ConfiguredCaptureStage):
         noise_modulation = _sensor_noise_modulation(
             raw_signal,
             context,
-            self.config,
+            config,
             rng,
         )
 
-        read_sigma_cfg = self.config.get("read_noise_sigma")
+        read_sigma_cfg = config.get("read_noise_sigma")
         if read_sigma_cfg is not None:
-            read_sigma = _sample_float(self.config, "read_noise_sigma", 0.0, rng)
+            read_sigma = _sample_float(config, "read_noise_sigma", 0.0, rng)
         else:
             read_electrons = _sample_float(
-                self.config,
+                config,
                 "read_noise_electrons",
                 0.0,
                 rng,
@@ -405,7 +418,7 @@ class SensorStage(ConfiguredCaptureStage):
 
         raw = black_map + noisy_signal * raw_range
 
-        fixed_sigma = _sample_float(self.config, "fixed_pattern_sigma", 0.0, rng)
+        fixed_sigma = _sample_float(config, "fixed_pattern_sigma", 0.0, rng)
         if fixed_sigma > 0.0:
             raw = raw + (
                 rng.normal(0.0, fixed_sigma, raw.shape).astype(np.float32)
@@ -413,13 +426,13 @@ class SensorStage(ConfiguredCaptureStage):
             )
 
         banding_modulation = float(
-            np.clip(_sample_float(self.config, "banding_modulation", 0.35, rng), 0, 1)
+            np.clip(_sample_float(config, "banding_modulation", 0.35, rng), 0, 1)
         )
         banding_gain = 1.0 + banding_modulation * (noise_modulation - 1.0)
-        row_sigma = _sample_float(self.config, "row_noise_sigma", 0.0, rng)
+        row_sigma = _sample_float(config, "row_noise_sigma", 0.0, rng)
         if row_sigma > 0.0:
             row_corr = _sample_float(
-                self.config,
+                config,
                 "row_banding_correlation_px",
                 48.0,
                 rng,
@@ -427,10 +440,10 @@ class SensorStage(ConfiguredCaptureStage):
             row_bias = _smooth_random_bias(raw.shape[0], row_sigma, row_corr, rng)
             raw = raw + row_bias[:, None] * banding_gain
 
-        column_sigma = _sample_float(self.config, "column_noise_sigma", 0.0, rng)
+        column_sigma = _sample_float(config, "column_noise_sigma", 0.0, rng)
         if column_sigma > 0.0:
             column_corr = _sample_float(
-                self.config,
+                config,
                 "column_banding_correlation_px",
                 48.0,
                 rng,
@@ -445,7 +458,7 @@ class SensorStage(ConfiguredCaptureStage):
 
         raw = _apply_bad_pixels_np(
             raw,
-            self.config,
+            config,
             rng,
             hot_value=white_map,
             dead_value=black_map,
@@ -454,22 +467,22 @@ class SensorStage(ConfiguredCaptureStage):
 
         bit_depth_key = (
             "raw_bit_depth"
-            if self.config.get("raw_bit_depth") is not None
+            if config.get("raw_bit_depth") is not None
             else "adc_bit_depth"
         )
-        adc_bit_depth = int(round(_sample_float(self.config, bit_depth_key, 12.0, rng)))
+        adc_bit_depth = int(round(_sample_float(config, bit_depth_key, 12.0, rng)))
         if adc_bit_depth > 0:
             raw = _quantize_np(raw, adc_bit_depth)
 
         raw = (raw - black_map) / raw_range
         raw = _clip01(raw)
 
-        if _bool_value(self.config.get("demosaic", True)):
+        if _bool_value(config.get("demosaic", True)):
             demosaiced = _clip01(_demosaic_bilinear_np(raw, pattern))
             post_bits = int(
                 round(
                     _sample_float(
-                        self.config,
+                        config,
                         "post_demosaic_bit_depth",
                         0.0,
                         rng,
@@ -506,42 +519,43 @@ class ISPStage(ConfiguredCaptureStage):
         image: np.ndarray,
         context: CaptureContext,
         rng: np.random.Generator,
+        config: Mapping[str, Any],
     ) -> np.ndarray:
         img = image
 
-        denoise_sigma = _sample_float(self.config, "denoise_sigma", 0.0, rng)
+        denoise_sigma = _sample_float(config, "denoise_sigma", 0.0, rng)
         if denoise_sigma > 1e-4:
             img = _gaussian_blur_np(img, denoise_sigma)
 
-        matrix = _sample_matrix(self.config.get("color_matrix"), rng)
+        matrix = _sample_matrix(config.get("color_matrix"), rng)
         img = _apply_color_matrix(img, matrix)
 
-        tone_map = str(self.config.get("tone_map", "reinhard")).lower()
-        strength = _sample_float(self.config, "tone_map_strength", 1.0, rng)
+        tone_map = str(config.get("tone_map", "reinhard")).lower()
+        strength = _sample_float(config, "tone_map_strength", 1.0, rng)
         if tone_map not in {"none", "false", "off"}:
             img = _apply_tone_map_np(img, tone_map, strength)
 
-        gamma = self.config.get("gamma", "srgb")
+        gamma = config.get("gamma", "srgb")
         img = _apply_gamma_np(img, gamma, rng)
 
         local_strength = _sample_float(
-            self.config,
+            config,
             "local_contrast_strength",
             0.0,
             rng,
         )
         if local_strength > 1e-5:
-            sigma = _sample_float(self.config, "local_contrast_sigma", 12.0, rng)
+            sigma = _sample_float(config, "local_contrast_sigma", 12.0, rng)
             base = _gaussian_blur_np(img, sigma)
             img = img + local_strength * (img - base)
 
-        sharpen = _sample_float(self.config, "sharpen_amount", 0.0, rng)
+        sharpen = _sample_float(config, "sharpen_amount", 0.0, rng)
         if sharpen > 1e-5:
-            sigma = _sample_float(self.config, "sharpen_sigma", 0.8, rng)
+            sigma = _sample_float(config, "sharpen_sigma", 0.8, rng)
             blurred = _gaussian_blur_np(img, sigma)
             img = img + sharpen * (img - blurred)
 
-        saturation = _sample_float(self.config, "saturation", 1.0, rng)
+        saturation = _sample_float(config, "saturation", 1.0, rng)
         if abs(saturation - 1.0) > 1e-5:
             luma_weights = np.array([0.2126, 0.7152, 0.0722], dtype=np.float32)
             luma = np.sum(img * luma_weights, axis=-1, keepdims=True)
@@ -573,23 +587,24 @@ class TransportStage(ConfiguredCaptureStage):
         image: np.ndarray,
         context: CaptureContext,
         rng: np.random.Generator,
+        config: Mapping[str, Any],
     ) -> np.ndarray:
         img = image
 
-        crop = self.config.get("crop")
+        crop = config.get("crop")
         if crop is not None:
             img = _crop_np(img, crop, rng)
 
-        target_size = _resolve_resize(self.config, img.shape, rng)
+        target_size = _resolve_resize(config, img.shape, rng)
         if target_size is not None:
-            img = _resize_np(img, target_size, str(self.config.get("resample", "bilinear")))
+            img = _resize_np(img, target_size, str(config.get("resample", "bilinear")))
 
-        bit_depth = int(round(_sample_float(self.config, "bit_depth", 8.0, rng)))
+        bit_depth = int(round(_sample_float(config, "bit_depth", 8.0, rng)))
         if bit_depth > 0:
             img = _quantize_np(img, bit_depth)
 
-        jpeg_cfg = _config_block(self.config, "jpeg")
-        jpeg_quality = self.config.get("jpeg_quality")
+        jpeg_cfg = _config_block(config, "jpeg")
+        jpeg_quality = config.get("jpeg_quality")
         if jpeg_quality is not None:
             jpeg_cfg = dict(jpeg_cfg)
             jpeg_cfg["enabled"] = True
@@ -858,6 +873,76 @@ def _rng(context: CaptureContext) -> np.random.Generator:
     if isinstance(context.rng, np.random.Generator):
         return context.rng
     return np.random.default_rng()
+
+
+_CONDITION_PROFILE_KEYS = (
+    "condition_profiles",
+    "profile_choices",
+    "exposure_profiles",
+)
+_CONDITION_PROFILE_METADATA = {
+    "name",
+    "id",
+    "description",
+    "weight",
+    "profile_weight",
+    "profile_probability",
+}
+
+
+def _conditioned_stage_config(
+    config: Mapping[str, Any],
+    rng: np.random.Generator,
+) -> Mapping[str, Any]:
+    profile_key = next(
+        (key for key in _CONDITION_PROFILE_KEYS if config.get(key) is not None),
+        None,
+    )
+    if profile_key is None:
+        return config
+
+    profiles = config.get(profile_key)
+    if not isinstance(profiles, (list, tuple)):
+        raise ValueError(f"{profile_key} must be a list")
+    if not profiles:
+        return config
+
+    base = {
+        key: value
+        for key, value in dict(config).items()
+        if key not in _CONDITION_PROFILE_KEYS
+    }
+    weights: list[float] = []
+    choices: list[dict[str, Any]] = []
+    for index, entry in enumerate(profiles):
+        if not isinstance(entry, dict):
+            raise ValueError(f"{profile_key}[{index}] must be an object")
+        weight = float(
+            entry.get(
+                "weight",
+                entry.get("profile_weight", entry.get("profile_probability", 1.0)),
+            )
+        )
+        if weight < 0.0:
+            raise ValueError(f"{profile_key}[{index}].weight must be non-negative")
+        raw_profile = entry.get("config", entry)
+        if not isinstance(raw_profile, dict):
+            raise ValueError(f"{profile_key}[{index}].config must be an object")
+        profile = {
+            key: value
+            for key, value in raw_profile.items()
+            if key not in _CONDITION_PROFILE_METADATA
+        }
+        weights.append(weight)
+        choices.append(profile)
+
+    weights_arr = np.asarray(weights, dtype=np.float64)
+    total = float(weights_arr.sum())
+    if not np.isfinite(total) or total <= 0.0:
+        raise ValueError(f"{profile_key} must contain at least one positive weight")
+
+    selected = choices[int(rng.choice(len(choices), p=weights_arr / total))]
+    return deep_merge(base, selected)
 
 
 def _context_intrinsics(context: CaptureContext) -> np.ndarray | None:

@@ -571,6 +571,33 @@ def test_capture_custom_stage_chain_can_resize_and_quantize() -> None:
     np.testing.assert_allclose(result, np.round(result * 15.0) / 15.0)
 
 
+def test_capture_stage_condition_profiles_override_stage_config() -> None:
+    pipeline = CaptureArtifactPipeline.from_config(
+        {
+            "capture": {
+                "stages": [
+                    {
+                        "type": "exposure",
+                        "gain": 1.0,
+                        "condition_profiles": [
+                            {"name": "selected", "weight": 1.0, "gain": 0.5},
+                            {"name": "unused", "weight": 0.0, "gain": 2.0},
+                        ],
+                    }
+                ]
+            }
+        }
+    )
+    image = np.full((2, 3, 3), 0.8, dtype=np.float32)
+
+    result = pipeline.apply_np(
+        image,
+        context=CaptureContext(rng=np.random.default_rng(7)),
+    )
+
+    np.testing.assert_allclose(result, 0.4)
+
+
 def test_capture_camera_profile_supplies_stage_defaults() -> None:
     pipeline = CaptureArtifactPipeline.from_config(
         {
