@@ -824,40 +824,42 @@ def _deterministic_sensor_pipeline(
     *,
     auto_exposure: dict,
     exposure_gain: float = 1.0,
+    sensor_overrides: dict | None = None,
 ) -> CaptureArtifactPipeline:
+    sensor = {
+        "type": "sensor",
+        "input_space": "linear",
+        "exposure_gain": exposure_gain,
+        "auto_exposure": auto_exposure,
+        "white_balance": [1.0, 1.0, 1.0],
+        "white_balance_jitter": 0.0,
+        "channel_gain_sigma": 0.0,
+        "camera_matrix": [
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+        ],
+        "bayer_pattern": "RGGB",
+        "shot_noise_electrons": 0.0,
+        "read_noise_electrons": 0.0,
+        "fixed_pattern_sigma": 0.0,
+        "row_noise_sigma": 0.0,
+        "column_noise_sigma": 0.0,
+        "black_level": [0.0, 0.0, 0.0],
+        "black_level_jitter": 0.0,
+        "white_level": [1.0, 1.0, 1.0],
+        "white_level_jitter": 0.0,
+        "adc_bit_depth": 0,
+        "post_demosaic_bit_depth": 0,
+        "hot_pixel_probability": 0.0,
+        "dead_pixel_probability": 0.0,
+    }
+    if sensor_overrides:
+        sensor.update(sensor_overrides)
     return CaptureArtifactPipeline.from_config(
         {
             "capture": {
-                "stages": [
-                    {
-                        "type": "sensor",
-                        "input_space": "linear",
-                        "exposure_gain": exposure_gain,
-                        "auto_exposure": auto_exposure,
-                        "white_balance": [1.0, 1.0, 1.0],
-                        "white_balance_jitter": 0.0,
-                        "channel_gain_sigma": 0.0,
-                        "camera_matrix": [
-                            [1.0, 0.0, 0.0],
-                            [0.0, 1.0, 0.0],
-                            [0.0, 0.0, 1.0],
-                        ],
-                        "bayer_pattern": "RGGB",
-                        "shot_noise_electrons": 0.0,
-                        "read_noise_electrons": 0.0,
-                        "fixed_pattern_sigma": 0.0,
-                        "row_noise_sigma": 0.0,
-                        "column_noise_sigma": 0.0,
-                        "black_level": [0.0, 0.0, 0.0],
-                        "black_level_jitter": 0.0,
-                        "white_level": [1.0, 1.0, 1.0],
-                        "white_level_jitter": 0.0,
-                        "adc_bit_depth": 0,
-                        "post_demosaic_bit_depth": 0,
-                        "hot_pixel_probability": 0.0,
-                        "dead_pixel_probability": 0.0,
-                    }
-                ]
+                "stages": [sensor]
             }
         }
     )
@@ -933,6 +935,35 @@ def test_sensor_auto_exposure_can_protect_highlights() -> None:
 
     assert float(result.max()) <= 0.74
     assert float(result.mean()) < 0.32
+
+
+def test_shadow_recovery_noise_is_local_to_dark_regions() -> None:
+    pipeline = _deterministic_sensor_pipeline(
+        auto_exposure={"enabled": False},
+        sensor_overrides={
+            "shadow_recovery_noise": {
+                "enabled": True,
+                "luminance_threshold": 0.18,
+                "luminance_softness": 0.06,
+                "gamma": 1.2,
+                "luma_sigma": 0.02,
+                "chroma_sigma": 0.025,
+                "blotch_sigma": 0.0,
+                "smooth_sigma": 0.0,
+            },
+        },
+    )
+    image = np.full((48, 64, 3), 0.72, dtype=np.float32)
+    image[:, 32:] = 0.06
+
+    result = pipeline.apply_np(
+        image,
+        CaptureContext(rng=np.random.default_rng(37)),
+    )
+
+    bright_std = float(result[:, :24].std())
+    dark_std = float(result[:, 40:].std())
+    assert dark_std > bright_std + 0.012
 
 
 def test_sensor_noise_modulation_is_stronger_in_dark_foggy_regions() -> None:

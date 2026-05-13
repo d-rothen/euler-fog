@@ -333,6 +333,20 @@ class SensorStage(ConfiguredCaptureStage):
             "max_gain": 3.0,
             "smooth_sigma": 0.0,
         },
+        "shadow_recovery_noise": {
+            "enabled": False,
+            "luminance_threshold": 0.18,
+            "luminance_softness": 0.08,
+            "gamma": 1.4,
+            "strength": 1.0,
+            "luma_sigma": 0.0,
+            "chroma_sigma": 0.0,
+            "blotch_sigma": 0.0,
+            "fog_weight": 0.0,
+            "depth_weight": 0.0,
+            "smooth_sigma": 1.0,
+            "max_weight": 1.0,
+        },
         "black_level": [0.003, 0.003, 0.003],
         "black_level_jitter": {"dist": "uniform", "min": 0.0, "max": 0.002},
         "white_level": [1.0, 1.0, 1.0],
@@ -357,6 +371,7 @@ class SensorStage(ConfiguredCaptureStage):
 
         matrix = _sample_matrix(config.get("camera_matrix"), rng)
         img = _apply_color_matrix(img, matrix)
+        pre_exposure_luminance = _linear_luminance_np(img)
 
         exposure = _sample_float(config, "exposure_gain", 1.0, rng)
         exposure, config = _resolve_auto_exposure_np(
@@ -521,10 +536,22 @@ class SensorStage(ConfiguredCaptureStage):
             )
             if post_bits > 0:
                 demosaiced = _quantize_np(demosaiced, post_bits)
-            return demosaiced
+            return _apply_shadow_recovery_noise_np(
+                demosaiced,
+                pre_exposure_luminance,
+                context,
+                config,
+                rng,
+            )
 
         raw_rgb = np.repeat(raw[..., None], 3, axis=-1).astype(np.float32, copy=False)
-        return raw_rgb
+        return _apply_shadow_recovery_noise_np(
+            raw_rgb,
+            pre_exposure_luminance,
+            context,
+            config,
+            rng,
+        )
 
 
 class ISPStage(ConfiguredCaptureStage):
@@ -1404,6 +1431,77 @@ def _sensor_noise_modulation(
 
     max_gain = max(_sample_float(cfg, "max_gain", 3.0, rng), 1.0)
     return np.clip(modulation, 1.0, max_gain).astype(np.float32, copy=False)
+
+
+def _apply_shadow_recovery_noise_np(
+    image: np.ndarray,
+    pre_exposure_luminance: np.ndarray,
+    context: CaptureContext,
+    config: Mapping[str, Any],
+    rng: np.random.Generator,
+) -> np.ndarray:
+    cfg = _config_block(config, "shadow_recovery_noise")
+    if not _block_enabled(cfg, rng):
+        return image
+
+    weight = _shadow_recovery_weight_np(pre_exposure_luminance, context, cfg, rng)
+    if not np.any(weight > 1e-6):
+        return image
+
+    strength = max(_sample_float(cfg, "strength", 1.0, rng), 0.0)
+    if strength <= 0.0:
+        return image
+
+    out = image.astype(np.float32, copy=True)
+    luma_sigma = max(_sample_float(cfg, "luma_sigma", 0.0, rng), 0.0) * strength
+    if luma_sigma > 0.0:
+        luma_noise = rng.normal(0.0, luma_sigma, image.shape[:2]).astype(np.float32)
+        out += luma_noise[..., None] * weight[..., None]
+
+    chroma_sigma = max(_sample_float(cfg, "chroma_sigma", 0.0, rng), 0.0) * strength
+    if chroma_sigma > 0.0:
+        chroma_noise = rng.normal(0.0, chroma_sigma, image.shape).astype(np.float32)
+        out += chroma_noise * weight[..., None]
+
+    blotch_sigma = max(_sample_float(cfg, "blotch_sigma", 0.0, rng), 0.0) * strength
+    if blotch_sigma > 0.0:
+        blotch = (_low_frequency_field(image.shape[0], image.shape[1], rng) - 0.5)
+        out += blotch[..., None] * (2.0 * blotch_sigma) * weight[..., None]
+
+    return _clip01(out)
+
+
+def _shadow_recovery_weight_np(
+    pre_exposure_luminance: np.ndarray,
+    context: CaptureContext,
+    config: Mapping[str, Any],
+    rng: np.random.Generator,
+) -> np.ndarray:
+    luma = np.clip(pre_exposure_luminance, 0.0, None).astype(np.float32, copy=False)
+    threshold = max(_sample_float(config, "luminance_threshold", 0.18, rng), 1e-6)
+    softness = max(_sample_float(config, "luminance_softness", 0.08, rng), 1e-6)
+    shadow = np.clip((threshold + softness - luma) / softness, 0.0, 1.0)
+    gamma = max(_sample_float(config, "gamma", 1.4, rng), 1e-6)
+    weight = np.power(shadow, gamma).astype(np.float32, copy=False)
+
+    fog_weight = _sample_float(config, "fog_weight", 0.0, rng)
+    if fog_weight != 0.0:
+        opacity = _context_fog_opacity(context, luma.shape)
+        if opacity is not None:
+            weight += fog_weight * np.clip(opacity, 0.0, 1.0)
+
+    depth_weight = _sample_float(config, "depth_weight", 0.0, rng)
+    if depth_weight != 0.0:
+        depth = _context_depth_map(context, luma.shape)
+        if depth is not None:
+            weight += depth_weight * _normalize_context_map(depth)
+
+    smooth_sigma = _sample_float(config, "smooth_sigma", 1.0, rng)
+    if smooth_sigma > 1e-4:
+        weight = _gaussian_blur_np(weight, smooth_sigma)
+
+    max_weight = max(_sample_float(config, "max_weight", 1.0, rng), 0.0)
+    return np.clip(weight, 0.0, max_weight).astype(np.float32, copy=False)
 
 
 def _normalize_context_map(value: np.ndarray) -> np.ndarray:

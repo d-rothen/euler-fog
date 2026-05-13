@@ -211,6 +211,12 @@ For tighter control, provide explicit stages in camera order:
       },
       "full_well_electrons": [14000, 12000, 13000],
       "read_noise_electrons": {"dist": "uniform", "min": 2.0, "max": 6.0},
+      "shadow_recovery_noise": {
+        "enabled": true,
+        "luminance_threshold": {"dist": "uniform", "min": 0.16, "max": 0.24},
+        "luma_sigma": {"dist": "uniform", "min": 0.002, "max": 0.006},
+        "chroma_sigma": {"dist": "uniform", "min": 0.004, "max": 0.012}
+      },
       "black_level": [0.003, 0.0035, 0.003],
       "white_level": [1.0, 0.995, 1.0],
       "adc_bit_depth": 12,
@@ -267,7 +273,7 @@ Supported stage types:
 | Stage | Main effects |
 |---|---|
 | `optics` | Defocus/MTF blur, motion blur, bloom, veiling glare, vignetting, chromatic aberration, lens distortion, windshield haze, optional droplets. |
-| `sensor` | Image-driven or sampled exposure, white balance, camera matrix, Bayer mosaic, shot/read noise, fixed-pattern noise, row/column banding, hot/dead pixels, bilinear demosaic. |
+| `sensor` | Image-driven or sampled exposure, white balance, camera matrix, Bayer mosaic, shot/read noise, fixed-pattern noise, row/column banding, shadow-local recovery noise, hot/dead pixels, bilinear demosaic. |
 | `isp` | Denoising, color correction, tone mapping, sRGB/gamma, local contrast, sharpening halos, saturation shifts. |
 | `transport` | Crop/resize, bit-depth quantization, JPEG round-trip compression. |
 | `exposure` | Lightweight standalone exposure and white-balance stage for simple custom chains. |
@@ -277,6 +283,11 @@ sampling. `target_luminance`, `metering`, `highlight_*`, and gain bounds choose
 the exposure; `resolve_iso` can raise ISO from the metering pressure, dark pixel
 fraction, and fog opacity. When auto exposure is enabled, `exposure_gain` still
 applies as scenario-specific exposure compensation.
+
+Set `sensor.shadow_recovery_noise.enabled` to add extra post-demosaic luma and
+chroma corruption only where the pre-exposure rendered luminance was low. This
+is useful for reducing broad global grain while keeping lifted shadows visibly
+noisy.
 
 Any stage can define `condition_profiles` to sample coherent per-image settings
 before the stage runs. This is useful for exposure states where ISO, exposure
