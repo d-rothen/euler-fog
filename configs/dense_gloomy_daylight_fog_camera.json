@@ -228,7 +228,10 @@
           "fog_gain": 0.32,
           "gamma": 1.55,
           "max_gain": 2.0,
-          "smooth_sigma": 2.2
+          "smooth_sigma": 2.2,
+          "black_noise_floor": 0.5,
+          "black_suppression_luminance": 0.015,
+          "black_suppression_softness": 0.055
         },
         "shadow_recovery_noise": {
           "enabled": true,
@@ -242,23 +245,45 @@
           "strength": 0.78,
           "luma_sigma": {
             "dist": "uniform",
-            "min": 0.0015,
-            "max": 0.0045
+            "min": 0.0002,
+            "max": 0.001
           },
           "chroma_sigma": {
             "dist": "uniform",
-            "min": 0.003,
-            "max": 0.009
+            "min": 0.012,
+            "max": 0.028
           },
+          "chroma_mode": "balanced",
+          "red_chroma_gain": {
+            "dist": "uniform",
+            "min": 0.7,
+            "max": 1.0
+          },
+          "blue_chroma_gain": {
+            "dist": "uniform",
+            "min": 1.7,
+            "max": 2.7
+          },
+          "chroma_axis_correlation": {
+            "dist": "uniform",
+            "min": 0.05,
+            "max": 0.25
+          },
+          "chroma_spatial_sigma": 0.0,
+          "chroma_fine_fraction": 1.0,
+          "chroma_luminance_preservation": 1.0,
           "blotch_sigma": {
             "dist": "uniform",
             "min": 0.0,
-            "max": 0.0025
+            "max": 0.0008
           },
           "fog_weight": 0.16,
           "depth_weight": 0.06,
           "smooth_sigma": 1.2,
-          "max_weight": 1.0
+          "max_weight": 1.0,
+          "black_noise_floor": 0.28,
+          "black_suppression_luminance": 0.025,
+          "black_suppression_softness": 0.07
         },
         "black_level": [
           0.004,
@@ -332,27 +357,49 @@
               "fog_gain": 0.25,
               "gamma": 1.2,
               "max_gain": 1.55,
-              "smooth_sigma": 2.0
+              "smooth_sigma": 2.0,
+              "black_noise_floor": 0.7,
+              "black_suppression_luminance": 0.01,
+              "black_suppression_softness": 0.045
             },
             "shadow_recovery_noise": {
               "strength": 0.45,
               "luma_sigma": {
                 "dist": "uniform",
-                "min": 0.0008,
-                "max": 0.0025
+                "min": 0.0001,
+                "max": 0.0008
               },
               "chroma_sigma": {
                 "dist": "uniform",
-                "min": 0.0015,
-                "max": 0.005
+                "min": 0.003,
+                "max": 0.009
               },
+              "red_chroma_gain": {
+                "dist": "uniform",
+                "min": 0.85,
+                "max": 1.1
+              },
+              "blue_chroma_gain": {
+                "dist": "uniform",
+                "min": 1.2,
+                "max": 1.8
+              },
+              "chroma_axis_correlation": {
+                "dist": "uniform",
+                "min": 0.0,
+                "max": 0.15
+              },
+              "chroma_luminance_preservation": 1.0,
               "blotch_sigma": {
                 "dist": "uniform",
                 "min": 0.0,
-                "max": 0.0015
+                "max": 0.0005
               },
               "fog_weight": 0.12,
-              "depth_weight": 0.04
+              "depth_weight": 0.04,
+              "black_noise_floor": 0.45,
+              "black_suppression_luminance": 0.018,
+              "black_suppression_softness": 0.055
             },
             "hot_pixel_probability": 0.000001,
             "dead_pixel_probability": 0.0000005
@@ -406,27 +453,49 @@
               "fog_gain": 0.35,
               "gamma": 1.55,
               "max_gain": 2.0,
-              "smooth_sigma": 2.2
+              "smooth_sigma": 2.2,
+              "black_noise_floor": 0.45,
+              "black_suppression_luminance": 0.018,
+              "black_suppression_softness": 0.06
             },
             "shadow_recovery_noise": {
               "strength": 0.85,
               "luma_sigma": {
                 "dist": "uniform",
-                "min": 0.002,
-                "max": 0.0055
+                "min": 0.0002,
+                "max": 0.0012
               },
               "chroma_sigma": {
                 "dist": "uniform",
-                "min": 0.004,
-                "max": 0.011
+                "min": 0.012,
+                "max": 0.032
               },
+              "red_chroma_gain": {
+                "dist": "uniform",
+                "min": 0.7,
+                "max": 1.0
+              },
+              "blue_chroma_gain": {
+                "dist": "uniform",
+                "min": 1.8,
+                "max": 2.8
+              },
+              "chroma_axis_correlation": {
+                "dist": "uniform",
+                "min": 0.05,
+                "max": 0.25
+              },
+              "chroma_luminance_preservation": 1.0,
               "blotch_sigma": {
                 "dist": "uniform",
-                "min": 0.0005,
-                "max": 0.003
+                "min": 0.0,
+                "max": 0.0008
               },
               "fog_weight": 0.14,
-              "depth_weight": 0.06
+              "depth_weight": 0.06,
+              "black_noise_floor": 0.24,
+              "black_suppression_luminance": 0.028,
+              "black_suppression_softness": 0.075
             },
             "hot_pixel_probability": 0.000004,
             "dead_pixel_probability": 0.000002
@@ -480,27 +549,49 @@
               "fog_gain": 0.36,
               "gamma": 1.65,
               "max_gain": 2.0,
-              "smooth_sigma": 2.4
+              "smooth_sigma": 2.4,
+              "black_noise_floor": 0.35,
+              "black_suppression_luminance": 0.022,
+              "black_suppression_softness": 0.07
             },
             "shadow_recovery_noise": {
               "strength": 0.95,
               "luma_sigma": {
                 "dist": "uniform",
-                "min": 0.0025,
-                "max": 0.0065
+                "min": 0.0002,
+                "max": 0.0014
               },
               "chroma_sigma": {
                 "dist": "uniform",
-                "min": 0.005,
-                "max": 0.013
+                "min": 0.018,
+                "max": 0.045
               },
+              "red_chroma_gain": {
+                "dist": "uniform",
+                "min": 0.55,
+                "max": 0.9
+              },
+              "blue_chroma_gain": {
+                "dist": "uniform",
+                "min": 2.2,
+                "max": 3.6
+              },
+              "chroma_axis_correlation": {
+                "dist": "uniform",
+                "min": 0.08,
+                "max": 0.32
+              },
+              "chroma_luminance_preservation": 1.0,
               "blotch_sigma": {
                 "dist": "uniform",
-                "min": 0.0005,
-                "max": 0.0035
+                "min": 0.0,
+                "max": 0.001
               },
               "fog_weight": 0.14,
-              "depth_weight": 0.06
+              "depth_weight": 0.06,
+              "black_noise_floor": 0.18,
+              "black_suppression_luminance": 0.035,
+              "black_suppression_softness": 0.085
             },
             "hot_pixel_probability": 0.0000045,
             "dead_pixel_probability": 0.0000025
@@ -510,8 +601,8 @@
       "isp": {
         "denoise_sigma": {
           "dist": "uniform",
-          "min": 0.25,
-          "max": 0.75
+          "min": 0.08,
+          "max": 0.28
         },
         "color_matrix": [
           [
@@ -569,10 +660,10 @@
           "enabled": true,
           "quality": {
             "dist": "uniform",
-            "min": 62.0,
-            "max": 86.0
+            "min": 70.0,
+            "max": 90.0
           },
-          "subsampling": 2
+          "subsampling": 0
         }
       }
     }
@@ -672,14 +763,17 @@
               "max": 0.18
             },
             "fog_weight": 0.08,
-            "depth_weight": 0.02
+            "depth_weight": 0.02,
+            "black_noise_floor": 0.55,
+            "black_suppression_luminance": 0.015,
+            "black_suppression_softness": 0.05
           }
         },
         "isp": {
           "denoise_sigma": {
             "dist": "uniform",
-            "min": 0.04,
-            "max": 0.22
+            "min": 0.03,
+            "max": 0.16
           },
           "sharpen_amount": {
             "dist": "uniform",
@@ -695,9 +789,9 @@
         "transport": {
           "jpeg": {
             "quality": {
-              "dist": "uniform",
-              "min": 78.0,
-              "max": 94.0
+                "dist": "uniform",
+                "min": 80.0,
+                "max": 96.0
             }
           }
         }
@@ -793,14 +887,17 @@
               "max": 0.2
             },
             "fog_weight": 0.16,
-            "depth_weight": 0.06
+            "depth_weight": 0.06,
+            "black_noise_floor": 0.35,
+            "black_suppression_luminance": 0.022,
+            "black_suppression_softness": 0.065
           }
         },
         "isp": {
           "denoise_sigma": {
             "dist": "uniform",
-            "min": 0.12,
-            "max": 0.38
+            "min": 0.06,
+            "max": 0.22
           },
           "sharpen_amount": {
             "dist": "uniform",
@@ -816,9 +913,9 @@
         "transport": {
           "jpeg": {
             "quality": {
-              "dist": "uniform",
-              "min": 72.0,
-              "max": 90.0
+                "dist": "uniform",
+                "min": 76.0,
+                "max": 94.0
             }
           }
         }
@@ -914,14 +1011,17 @@
               "max": 0.24
             },
             "fog_weight": 0.14,
-            "depth_weight": 0.06
+            "depth_weight": 0.06,
+            "black_noise_floor": 0.24,
+            "black_suppression_luminance": 0.03,
+            "black_suppression_softness": 0.08
           }
         },
         "isp": {
           "denoise_sigma": {
             "dist": "uniform",
-            "min": 0.22,
-            "max": 0.58
+            "min": 0.08,
+            "max": 0.26
           },
           "sharpen_amount": {
             "dist": "uniform",
@@ -937,9 +1037,9 @@
         "transport": {
           "jpeg": {
             "quality": {
-              "dist": "uniform",
-              "min": 66.0,
-              "max": 86.0
+                "dist": "uniform",
+                "min": 72.0,
+                "max": 90.0
             }
           }
         }
@@ -1035,14 +1135,17 @@
               "max": 0.18
             },
             "fog_weight": 0.14,
-            "depth_weight": 0.06
+            "depth_weight": 0.06,
+            "black_noise_floor": 0.16,
+            "black_suppression_luminance": 0.04,
+            "black_suppression_softness": 0.09
           }
         },
         "isp": {
           "denoise_sigma": {
             "dist": "uniform",
-            "min": 0.45,
-            "max": 0.95
+            "min": 0.1,
+            "max": 0.32
           },
           "sharpen_amount": {
             "dist": "uniform",
@@ -1058,9 +1161,9 @@
         "transport": {
           "jpeg": {
             "quality": {
-              "dist": "uniform",
-              "min": 54.0,
-              "max": 78.0
+                "dist": "uniform",
+                "min": 68.0,
+                "max": 88.0
             }
           }
         }
@@ -1173,14 +1276,17 @@
               "max": 0.19
             },
             "fog_weight": 0.16,
-            "depth_weight": 0.07
+            "depth_weight": 0.07,
+            "black_noise_floor": 0.12,
+            "black_suppression_luminance": 0.045,
+            "black_suppression_softness": 0.1
           }
         },
         "isp": {
           "denoise_sigma": {
             "dist": "uniform",
-            "min": 0.65,
-            "max": 1.1
+            "min": 0.12,
+            "max": 0.38
           },
           "local_contrast_strength": {
             "dist": "uniform",
@@ -1201,9 +1307,9 @@
         "transport": {
           "jpeg": {
             "quality": {
-              "dist": "uniform",
-              "min": 48.0,
-              "max": 72.0
+                "dist": "uniform",
+                "min": 62.0,
+                "max": 84.0
             }
           }
         }

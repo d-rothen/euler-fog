@@ -966,6 +966,118 @@ def test_shadow_recovery_noise_is_local_to_dark_regions() -> None:
     assert dark_std > bright_std + 0.012
 
 
+def test_shadow_recovery_chroma_noise_preserves_luminance() -> None:
+    pipeline = _deterministic_sensor_pipeline(
+        auto_exposure={"enabled": False},
+        sensor_overrides={
+            "shadow_recovery_noise": {
+                "enabled": True,
+                "luminance_threshold": 0.5,
+                "luminance_softness": 0.3,
+                "gamma": 1.0,
+                "luma_sigma": 0.0,
+                "chroma_sigma": 0.03,
+                "chroma_mode": "balanced",
+                "chroma_luminance_preservation": 1.0,
+                "blotch_sigma": 0.0,
+                "smooth_sigma": 0.0,
+            },
+        },
+    )
+    image = np.full((96, 128, 3), 0.25, dtype=np.float32)
+
+    result = pipeline.apply_np(
+        image,
+        CaptureContext(rng=np.random.default_rng(41)),
+    )
+
+    weights = np.array([0.2126, 0.7152, 0.0722], dtype=np.float32)
+    luminance_delta = np.sum((result - image) * weights.reshape(1, 1, 3), axis=-1)
+    channel_delta = result - image
+    red_std = float(channel_delta[..., 0].std())
+    blue_std = float(channel_delta[..., 2].std())
+
+    assert float(channel_delta.std()) > 0.006
+    assert float(luminance_delta.std()) < 1e-6
+    assert abs(red_std - blue_std) / max(red_std, blue_std) < 0.08
+
+
+def test_shadow_recovery_noise_is_suppressed_in_pitch_black_regions() -> None:
+    pipeline = _deterministic_sensor_pipeline(
+        auto_exposure={"enabled": False},
+        sensor_overrides={
+            "shadow_recovery_noise": {
+                "enabled": True,
+                "luminance_threshold": 0.2,
+                "luminance_softness": 0.08,
+                "gamma": 1.0,
+                "luma_sigma": 0.0,
+                "chroma_sigma": 0.035,
+                "chroma_mode": "balanced",
+                "chroma_luminance_preservation": 1.0,
+                "blotch_sigma": 0.0,
+                "smooth_sigma": 0.0,
+                "black_noise_floor": 0.1,
+                "black_suppression_luminance": 0.03,
+                "black_suppression_softness": 0.07,
+            },
+        },
+    )
+    image = np.full((64, 96, 3), 0.4, dtype=np.float32)
+    image[:, :32] = 0.0
+    image[:, 32:64] = 0.08
+
+    result = pipeline.apply_np(
+        image,
+        CaptureContext(rng=np.random.default_rng(43)),
+    )
+
+    black_std = float((result[:, 8:24] - image[:, 8:24]).std())
+    dim_std = float((result[:, 40:56] - image[:, 40:56]).std())
+    bright_std = float((result[:, 72:88] - image[:, 72:88]).std())
+
+    assert dim_std > black_std * 2.5
+    assert dim_std > bright_std * 2.5
+
+
+def test_shadow_recovery_chroma_noise_can_bias_blue_channel() -> None:
+    pipeline = _deterministic_sensor_pipeline(
+        auto_exposure={"enabled": False},
+        sensor_overrides={
+            "shadow_recovery_noise": {
+                "enabled": True,
+                "luminance_threshold": 0.5,
+                "luminance_softness": 0.3,
+                "gamma": 1.0,
+                "luma_sigma": 0.0,
+                "chroma_sigma": 0.02,
+                "chroma_mode": "balanced",
+                "red_chroma_gain": 0.65,
+                "blue_chroma_gain": 2.8,
+                "chroma_axis_correlation": 0.15,
+                "chroma_luminance_preservation": 1.0,
+                "blotch_sigma": 0.0,
+                "smooth_sigma": 0.0,
+            },
+        },
+    )
+    image = np.full((96, 128, 3), 0.25, dtype=np.float32)
+
+    result = pipeline.apply_np(
+        image,
+        CaptureContext(rng=np.random.default_rng(53)),
+    )
+
+    weights = np.array([0.2126, 0.7152, 0.0722], dtype=np.float32)
+    delta = result - image
+    luminance_delta = np.sum(delta * weights.reshape(1, 1, 3), axis=-1)
+    red_std = float(delta[..., 0].std())
+    blue_std = float(delta[..., 2].std())
+
+    assert blue_std > red_std * 2.5
+    assert float(luminance_delta.std()) < 1e-6
+
+
 def test_sensor_noise_modulation_is_stronger_in_dark_foggy_regions() -> None:
     pipeline = CaptureArtifactPipeline.from_config(
         {
@@ -1025,6 +1137,63 @@ def test_sensor_noise_modulation_is_stronger_in_dark_foggy_regions() -> None:
     left_std = float(result[:, :32, 0].std())
     right_std = float(result[:, 32:, 0].std())
     assert right_std > left_std * 1.35
+
+
+def test_sensor_noise_modulation_can_drop_in_pitch_black_regions() -> None:
+    pipeline = CaptureArtifactPipeline.from_config(
+        {
+            "capture": {
+                "stages": [
+                    {
+                        "type": "sensor",
+                        "input_space": "linear",
+                        "exposure_gain": 1.0,
+                        "white_balance": [1.0, 1.0, 1.0],
+                        "white_balance_jitter": 0.0,
+                        "channel_gain_sigma": 0.0,
+                        "camera_matrix": [
+                            [1.0, 0.0, 0.0],
+                            [0.0, 1.0, 0.0],
+                            [0.0, 0.0, 1.0],
+                        ],
+                        "bayer_pattern": "RGGB",
+                        "shot_noise_electrons": 0.0,
+                        "read_noise_sigma": 0.012,
+                        "fixed_pattern_sigma": 0.0,
+                        "row_noise_sigma": 0.0,
+                        "column_noise_sigma": 0.0,
+                        "black_level": [0.0, 0.0, 0.0],
+                        "black_level_jitter": 0.0,
+                        "white_level": [1.0, 1.0, 1.0],
+                        "white_level_jitter": 0.0,
+                        "adc_bit_depth": 0,
+                        "demosaic": False,
+                        "noise_modulation": {
+                            "enabled": True,
+                            "dark_gain": 2.0,
+                            "gamma": 1.0,
+                            "max_gain": 3.0,
+                            "black_noise_floor": 0.0,
+                            "black_suppression_luminance": 0.02,
+                            "black_suppression_softness": 0.06,
+                        },
+                    }
+                ]
+            }
+        }
+    )
+    image = np.full((64, 96, 3), 0.4, dtype=np.float32)
+    image[:, :32] = 0.0
+    image[:, 32:64] = 0.08
+
+    result = pipeline.apply_np(
+        image,
+        CaptureContext(rng=np.random.default_rng(47)),
+    )
+
+    black_std = float(result[:, 8:24, 0].std())
+    dim_std = float(result[:, 40:56, 0].std())
+    assert dim_std > black_std * 1.35
 
 
 def test_sensor_row_banding_is_smoothed_by_correlation_length() -> None:
