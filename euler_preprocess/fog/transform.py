@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, ClassVar
 
@@ -36,7 +37,7 @@ from euler_preprocess.fog.augmentations import (
     FogAugmentationSpec,
     parse_fog_augmentations,
 )
-from euler_preprocess.fog.capture import CaptureContext
+from euler_preprocess.fog.capture import CaptureArtifactPipeline, CaptureContext
 from euler_preprocess.fog.logging import log_config
 from euler_preprocess.fog.models import (
     AIRLIGHT_METHODS,
@@ -89,6 +90,39 @@ except ImportError:  # pragma: no cover - compatibility with older ds-crawler
 
 SCATTERING_COEFFICIENT_SLOT = "scattering_coefficient"
 ATMOSPHERIC_LIGHT_SLOT = "atmospheric_light"
+
+_SCENARIO_PROFILE_KEYS = (
+    "scenario_profiles",
+    "scene_condition_profiles",
+    "condition_profiles",
+)
+_SCENARIO_PROFILE_METADATA_KEYS = {
+    "name",
+    "id",
+    "description",
+    "weight",
+    "probability",
+    "profile_weight",
+    "config",
+}
+_SCENARIO_CONTROL_KEYS = {
+    "model",
+    "model_name",
+    "fog_model",
+    "model_overrides",
+    "fog_model_overrides",
+    "model_config",
+    "airlight_method",
+}
+
+
+@dataclass(frozen=True)
+class RenderPlan:
+    model_name: str
+    model_cfg: dict[str, Any]
+    airlight_method: str | None = None
+    capture_artifacts: CaptureArtifactPipeline | None = None
+    scenario_name: str | None = None
 
 # Use the canonical euler-loading ``generic.map_2d`` / ``map_3d`` modality
 # annotations.  Auxiliary outputs are written as ``.npy`` files in the
@@ -209,6 +243,7 @@ class FogTransform(Transform):
             self.config
         )
         self.augmentation_specs = list(self.augmentation_config.specs)
+        self.scenario_profiles = self._parse_scenario_profiles(self.config)
         self._configure_output_layout_metadata()
         self._written_configs: set[str] = set()
         self.torch_device = None
@@ -324,6 +359,160 @@ class FogTransform(Transform):
     ) -> tuple[str, dict]:
         base_cfg = resolve_model_config(augmentation.model_name, self.models_cfg)
         return augmentation.model_name, deep_merge(base_cfg, augmentation.model_overrides)
+
+    def _parse_scenario_profiles(
+        self,
+        config: dict[str, Any],
+    ) -> tuple[dict[str, Any], ...]:
+        for key in _SCENARIO_PROFILE_KEYS:
+            if key not in config:
+                continue
+            raw = config[key]
+            if raw is None:
+                return ()
+            if not isinstance(raw, (list, tuple)):
+                raise ValueError(f"{key} must be a list")
+            profiles: list[dict[str, Any]] = []
+            for index, entry in enumerate(raw):
+                if not isinstance(entry, dict):
+                    raise ValueError(f"{key}[{index}] must be an object")
+                profiles.append(dict(entry))
+            return tuple(profiles)
+        return ()
+
+    def _sample_scenario_profile(
+        self,
+        rng: np.random.Generator,
+    ) -> dict[str, Any] | None:
+        if not self.scenario_profiles:
+            return None
+        weights: list[float] = []
+        for index, profile in enumerate(self.scenario_profiles):
+            weight = float(
+                profile.get(
+                    "weight",
+                    profile.get("profile_weight", profile.get("probability", 1.0)),
+                )
+            )
+            if weight < 0.0:
+                raise ValueError(
+                    f"scenario_profiles[{index}].weight must be non-negative"
+                )
+            weights.append(weight)
+        weights_arr = np.asarray(weights, dtype=np.float64)
+        total = float(weights_arr.sum())
+        if not np.isfinite(total) or total <= 0.0:
+            raise ValueError("scenario_profiles must contain a positive weight")
+        index = int(rng.choice(len(self.scenario_profiles), p=weights_arr / total))
+        return self.scenario_profiles[index]
+
+    def _scenario_payload(self, profile: dict[str, Any]) -> dict[str, Any]:
+        raw = profile.get("config", profile)
+        if not isinstance(raw, dict):
+            raise ValueError("scenario profile config must be an object")
+        return dict(raw)
+
+    def _scenario_name(self, profile: dict[str, Any]) -> str | None:
+        name = profile.get("name", profile.get("id"))
+        if name is None and isinstance(profile.get("config"), dict):
+            config = profile["config"]
+            name = config.get("name", config.get("id"))
+        return None if name is None else str(name)
+
+    def _scenario_config_override(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return {
+            key: value
+            for key, value in payload.items()
+            if key not in _SCENARIO_PROFILE_METADATA_KEYS
+            and key not in _SCENARIO_CONTROL_KEYS
+        }
+
+    def _scenario_airlight_method(self, payload: dict[str, Any]) -> str | None:
+        method = payload.get("airlight_method", payload.get("airlight"))
+        if method is None:
+            return None
+        if not isinstance(method, str):
+            return None
+        if method not in AIRLIGHT_METHODS:
+            raise ValueError(
+                f"scenario airlight_method must be one of {AIRLIGHT_METHODS}, "
+                f"got {method!r}"
+            )
+        return method
+
+    def _scenario_model_name(
+        self,
+        payload: dict[str, Any],
+        effective_config: dict[str, Any],
+        rng: np.random.Generator,
+    ) -> str:
+        for key in ("model", "model_name", "fog_model"):
+            if key in payload:
+                return str(sample_value(payload[key], rng))
+        return select_model(effective_config, rng)
+
+    def _scenario_model_overrides(self, payload: dict[str, Any]) -> dict[str, Any]:
+        overrides: dict[str, Any] = {}
+        for key in ("model_config", "model_overrides", "fog_model_overrides"):
+            raw = payload.get(key)
+            if raw is None:
+                continue
+            if not isinstance(raw, dict):
+                raise ValueError(f"scenario {key} must be an object")
+            overrides = deep_merge(overrides, raw)
+        return overrides
+
+    def _resolve_render_plan(
+        self,
+        rng: np.random.Generator,
+        augmentation: FogAugmentationSpec | None = None,
+    ) -> RenderPlan:
+        scenario = self._sample_scenario_profile(rng)
+        if scenario is None:
+            if augmentation is not None:
+                model_name, model_cfg = self._resolve_augmented_model(augmentation)
+                return RenderPlan(
+                    model_name=model_name,
+                    model_cfg=model_cfg,
+                    airlight_method=augmentation.airlight_method,
+                )
+            model_name = select_model(self.config, rng)
+            model_cfg = resolve_model_config(model_name, self.models_cfg)
+            return RenderPlan(model_name=model_name, model_cfg=model_cfg)
+
+        payload = self._scenario_payload(scenario)
+        effective_config = deep_merge(
+            self.config,
+            self._scenario_config_override(payload),
+        )
+        models_cfg = (
+            effective_config.get("models")
+            or effective_config.get("fog_models")
+            or {}
+        )
+        scenario_overrides = self._scenario_model_overrides(payload)
+
+        if augmentation is not None:
+            model_name = augmentation.model_name
+            model_cfg = resolve_model_config(model_name, models_cfg)
+            model_cfg = deep_merge(model_cfg, scenario_overrides)
+            model_cfg = deep_merge(model_cfg, augmentation.model_overrides)
+            airlight_method = (
+                augmentation.airlight_method or self._scenario_airlight_method(payload)
+            )
+        else:
+            model_name = self._scenario_model_name(payload, effective_config, rng)
+            model_cfg = resolve_model_config(model_name, models_cfg)
+            model_cfg = deep_merge(model_cfg, scenario_overrides)
+            airlight_method = self._scenario_airlight_method(payload)
+
+        return RenderPlan(
+            model_name=model_name,
+            model_cfg=model_cfg,
+            airlight_method=airlight_method,
+            capture_artifacts=CaptureArtifactPipeline.from_config(effective_config),
+            scenario_name=self._scenario_name(scenario),
+        )
 
     def _source_extension(self, sample: dict, backend: Any | None = None) -> str:
         meta = sample.get("meta")
@@ -508,26 +697,25 @@ class FogTransform(Transform):
                 if self.augmentation_specs:
                     for aug_index, augmentation in enumerate(self.augmentation_specs):
                         rng = self._rng_for(index, aug_index)
-                        model_name, model_cfg = self._resolve_augmented_model(
-                            augmentation
-                        )
+                        plan = self._resolve_render_plan(rng, augmentation)
                         result = self.pipeline.process_np(
                             rgb=rgb,
                             depth_m=depth,
                             sky_mask=sky_mask,
-                            model_name=model_name,
-                            model_cfg=model_cfg,
+                            model_name=plan.model_name,
+                            model_cfg=plan.model_cfg,
                             rng=rng,
                             sample_id=sample.get("id"),
                             intrinsics=intrinsics,
-                            airlight_method=augmentation.airlight_method,
+                            airlight_method=plan.airlight_method,
+                            capture_artifacts=plan.capture_artifacts,
                         )
                         saved_paths.append(
                             self._write_primary_output(
                                 sample,
                                 result.rgb,
                                 sample_id=sample["id"],
-                                model_name=model_name,
+                                model_name=plan.model_name,
                                 beta=result.beta,
                                 airlight=result.airlight,
                                 full_id=sample.get("full_id"),
@@ -536,8 +724,8 @@ class FogTransform(Transform):
                         )
                         if not self.output_backend.is_source_backed:
                             self._write_model_config(
-                                model_name,
-                                model_cfg,
+                                plan.model_name,
+                                plan.model_cfg,
                                 saved_paths,
                             )
                         self._write_auxiliary(
@@ -545,7 +733,7 @@ class FogTransform(Transform):
                             k_map=result.k_map,
                             ls_map=result.ls_map,
                             sample_id=sample["id"],
-                            model_name=model_name,
+                            model_name=plan.model_name,
                             full_id=sample.get("full_id"),
                             beta=result.beta,
                             airlight=result.airlight,
@@ -553,37 +741,42 @@ class FogTransform(Transform):
                         )
                 else:
                     rng = self._rng_for(index)
-                    model_name = select_model(self.config, rng)
-                    model_cfg = resolve_model_config(model_name, self.models_cfg)
+                    plan = self._resolve_render_plan(rng)
                     result = self.pipeline.process_np(
                         rgb=rgb,
                         depth_m=depth,
                         sky_mask=sky_mask,
-                        model_name=model_name,
-                        model_cfg=model_cfg,
+                        model_name=plan.model_name,
+                        model_cfg=plan.model_cfg,
                         rng=rng,
                         sample_id=sample.get("id"),
                         intrinsics=intrinsics,
+                        airlight_method=plan.airlight_method,
+                        capture_artifacts=plan.capture_artifacts,
                     )
                     saved_paths.append(
                         self._write_primary_output(
                             sample,
                             result.rgb,
                             sample_id=sample["id"],
-                            model_name=model_name,
+                            model_name=plan.model_name,
                             beta=result.beta,
                             airlight=result.airlight,
                             full_id=sample.get("full_id"),
                         )
                     )
                     if not self.output_backend.is_source_backed:
-                        self._write_model_config(model_name, model_cfg, saved_paths)
+                        self._write_model_config(
+                            plan.model_name,
+                            plan.model_cfg,
+                            saved_paths,
+                        )
                     self._write_auxiliary(
                         sample,
                         k_map=result.k_map,
                         ls_map=result.ls_map,
                         sample_id=sample["id"],
-                        model_name=model_name,
+                        model_name=plan.model_name,
                         full_id=sample.get("full_id"),
                     )
 
@@ -604,6 +797,7 @@ class FogTransform(Transform):
         sample_id: str | None = None,
         intrinsics: np.ndarray | None = None,
         depth_m: Any | None = None,
+        capture_artifacts: CaptureArtifactPipeline | None = None,
     ) -> tuple[
         "torch.Tensor", float, "torch.Tensor", "torch.Tensor", "torch.Tensor"
     ]:
@@ -634,6 +828,7 @@ class FogTransform(Transform):
                 sample_id=sample_id,
                 intrinsics=intrinsics,
                 depth_m=depth_m,
+                capture_artifacts=capture_artifacts,
             )
 
         if model_name in ("heterogeneous_k", "heterogeneous_k_ls"):
@@ -704,6 +899,7 @@ class FogTransform(Transform):
             sample_id=sample_id,
             intrinsics=intrinsics,
             depth_m=depth_m,
+            capture_artifacts=capture_artifacts,
         )
 
     def _finalize_torch_pipeline_result(
@@ -718,6 +914,7 @@ class FogTransform(Transform):
         sample_id: str | None,
         intrinsics: np.ndarray | None = None,
         depth_m: Any | None = None,
+        capture_artifacts: CaptureArtifactPipeline | None = None,
     ) -> tuple[
         "torch.Tensor", float, "torch.Tensor", "torch.Tensor", "torch.Tensor"
     ]:
@@ -738,6 +935,7 @@ class FogTransform(Transform):
                 depth_m=depth_m,
                 k_map=k_map,
             ),
+            capture_artifacts=capture_artifacts,
         )
         return result.rgb, result.beta, result.airlight, result.k_map, result.ls_map
 
@@ -795,8 +993,7 @@ class FogTransform(Transform):
                         )
                     else:
                         rng = self.base_rng
-                    model_name = select_model(self.config, rng)
-                    model_cfg = resolve_model_config(model_name, self.models_cfg)
+                    plan = self._resolve_render_plan(rng)
                     items.append(
                         {
                             "sample_id": sample["id"],
@@ -807,8 +1004,11 @@ class FogTransform(Transform):
                             "intrinsics": intrinsics,
                             "sky_mask": normalize_sky_mask(sample["semantic_segmentation"]),
                             "rng": rng,
-                            "model_name": model_name,
-                            "model_cfg": model_cfg,
+                            "model_name": plan.model_name,
+                            "model_cfg": plan.model_cfg,
+                            "airlight_method": plan.airlight_method,
+                            "capture_artifacts": plan.capture_artifacts,
+                            "scenario_name": plan.scenario_name,
                             "index": global_index,
                         }
                     )
@@ -822,16 +1022,20 @@ class FogTransform(Transform):
                     grouped.setdefault(shape, []).append(item)
 
                 for group_items in grouped.values():
-                    uniform_items = [
-                        item
-                        for item in group_items
-                        if item["model_name"] == "uniform"
-                    ]
-                    other_items = [
-                        item
-                        for item in group_items
-                        if item["model_name"] != "uniform"
-                    ]
+                    if self.scenario_profiles:
+                        uniform_items = []
+                        other_items = list(group_items)
+                    else:
+                        uniform_items = [
+                            item
+                            for item in group_items
+                            if item["model_name"] == "uniform"
+                        ]
+                        other_items = [
+                            item
+                            for item in group_items
+                            if item["model_name"] != "uniform"
+                        ]
 
                     if uniform_items:
                         rgb_batch = torch.stack(
@@ -970,10 +1174,11 @@ class FogTransform(Transform):
                         sky_mask_t = (
                             torch.from_numpy(item["sky_mask"]).to(device).bool()
                         )
-                        estimated_airlight = self.atmospheric_light.estimate_torch(
+                        estimated_airlight = self._estimate_airlight_torch(
                             rgb_t,
                             sky_mask_t,
                             sample_id=item["sample_id"],
+                            method=item.get("airlight_method"),
                         )
                         torch_gen = torch_generator_for_index(
                             self.torch_device,
@@ -993,6 +1198,7 @@ class FogTransform(Transform):
                                 sample_id=item["sample_id"],
                                 intrinsics=item.get("intrinsics"),
                                 depth_m=depth_t,
+                                capture_artifacts=item.get("capture_artifacts"),
                             )
                         )
                         foggy_img = torch.clamp(foggy_t, 0.0, 1.0).cpu().numpy()
@@ -1087,14 +1293,12 @@ class FogTransform(Transform):
 
                 for aug_index, augmentation in enumerate(self.augmentation_specs):
                     rng = self._rng_for(index, aug_index)
-                    model_name, model_cfg = self._resolve_augmented_model(
-                        augmentation
-                    )
+                    plan = self._resolve_render_plan(rng, augmentation)
                     estimated_airlight = self._estimate_airlight_torch(
                         rgb_t,
                         sky_mask_t,
                         sample_id=sample.get("id"),
-                        method=augmentation.airlight_method,
+                        method=plan.airlight_method,
                     )
                     torch_gen = torch_generator_for_index(
                         self.torch_device,
@@ -1106,14 +1310,15 @@ class FogTransform(Transform):
                         self._apply_model_torch(
                             rgb_t,
                             depth_t,
-                            model_name,
-                            model_cfg,
+                            plan.model_name,
+                            plan.model_cfg,
                             rng,
                             estimated_airlight,
                             torch_gen,
                             sample_id=sample.get("id"),
                             intrinsics=intrinsics,
                             depth_m=depth_t,
+                            capture_artifacts=plan.capture_artifacts,
                         )
                     )
                     foggy_img = torch.clamp(foggy_t, 0.0, 1.0).cpu().numpy()
@@ -1123,7 +1328,7 @@ class FogTransform(Transform):
                             sample,
                             foggy_img,
                             sample_id=sample["id"],
-                            model_name=model_name,
+                            model_name=plan.model_name,
                             beta=beta,
                             airlight=airlight_np,
                             full_id=sample.get("full_id"),
@@ -1131,7 +1336,11 @@ class FogTransform(Transform):
                         )
                     )
                     if not self.output_backend.is_source_backed:
-                        self._write_model_config(model_name, model_cfg, saved_paths)
+                        self._write_model_config(
+                            plan.model_name,
+                            plan.model_cfg,
+                            saved_paths,
+                        )
 
                     if (
                         SCATTERING_COEFFICIENT_SLOT in self.output_backends
@@ -1142,7 +1351,7 @@ class FogTransform(Transform):
                             k_map=k_map_t.detach().cpu().numpy(),
                             ls_map=ls_map_t.detach().cpu().numpy(),
                             sample_id=sample["id"],
-                            model_name=model_name,
+                            model_name=plan.model_name,
                             full_id=sample.get("full_id"),
                             beta=beta,
                             airlight=airlight_np,

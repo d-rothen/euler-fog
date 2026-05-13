@@ -644,6 +644,7 @@ class CaptureArtifactPipeline:
         if raw.get("enabled", True) is False:
             return cls()
         camera_profile = _resolve_camera_profile(config, raw)
+        stage_overrides = _resolve_capture_stage_overrides(config, raw)
 
         stages = raw.get("stages")
         if stages is None:
@@ -658,7 +659,13 @@ class CaptureArtifactPipeline:
 
         parsed: list[CaptureArtifactStage] = []
         for entry in stages:
-            parsed.extend(_build_stage(entry, camera_profile=camera_profile))
+            parsed.extend(
+                _build_stage(
+                    entry,
+                    camera_profile=camera_profile,
+                    stage_overrides=stage_overrides,
+                )
+            )
         return cls(tuple(parsed))
 
     def apply_np(self, image, context: CaptureContext):
@@ -771,6 +778,7 @@ def _build_stage(
     entry: Any,
     *,
     camera_profile: Mapping[str, Any] | None = None,
+    stage_overrides: Mapping[str, Any] | None = None,
 ) -> list[CaptureArtifactStage]:
     if isinstance(entry, str):
         stage_type = entry
@@ -785,15 +793,42 @@ def _build_stage(
     if normalized in {"camera", "camera_stack", "foggy_camera", "realistic_camera"}:
         stages = []
         for preset_entry in _preset_stages(normalized):
-            stages.extend(_build_stage(preset_entry, camera_profile=camera_profile))
+            stages.extend(
+                _build_stage(
+                    preset_entry,
+                    camera_profile=camera_profile,
+                    stage_overrides=stage_overrides,
+                )
+            )
         return stages
 
     stage_cls = _STAGE_TYPES.get(normalized)
     if stage_cls is None:
         raise ValueError(f"Unsupported capture artifact stage: {stage_type}")
     profile_cfg = _profile_stage_config(camera_profile or {}, normalized)
+    override_cfg = _profile_stage_config(stage_overrides or {}, normalized)
     cfg = deep_merge(profile_cfg, cfg)
+    cfg = deep_merge(cfg, override_cfg)
     return [stage_cls(cfg)]
+
+
+def _resolve_capture_stage_overrides(
+    config: Mapping[str, Any],
+    capture_config: Mapping[str, Any],
+) -> dict[str, Any]:
+    overrides: dict[str, Any] = {}
+    for source, keys in (
+        (config, ("capture_overrides", "capture_stage_overrides")),
+        (capture_config, ("overrides", "stage_overrides", "capture_overrides")),
+    ):
+        for key in keys:
+            raw = source.get(key)
+            if raw is None:
+                continue
+            if not isinstance(raw, dict):
+                raise ValueError(f"{key} must be an object")
+            overrides = deep_merge(overrides, raw)
+    return overrides
 
 
 def _resolve_camera_profile(
@@ -880,6 +915,10 @@ _CONDITION_PROFILE_KEYS = (
     "profile_choices",
     "exposure_profiles",
 )
+_CONDITION_PROFILE_SELECTOR_KEYS = (
+    "condition_profile",
+    "selected_condition_profile",
+)
 _CONDITION_PROFILE_METADATA = {
     "name",
     "id",
@@ -911,9 +950,11 @@ def _conditioned_stage_config(
         key: value
         for key, value in dict(config).items()
         if key not in _CONDITION_PROFILE_KEYS
+        and key not in _CONDITION_PROFILE_SELECTOR_KEYS
     }
     weights: list[float] = []
     choices: list[dict[str, Any]] = []
+    names: list[str | None] = []
     for index, entry in enumerate(profiles):
         if not isinstance(entry, dict):
             raise ValueError(f"{profile_key}[{index}] must be an object")
@@ -935,6 +976,19 @@ def _conditioned_stage_config(
         }
         weights.append(weight)
         choices.append(profile)
+        name = entry.get("name", entry.get("id"))
+        names.append(None if name is None else str(name))
+
+    selector = _condition_profile_selector(config)
+    if selector is not None:
+        for name, profile in zip(names, choices):
+            if name == selector:
+                return deep_merge(base, profile)
+        available = ", ".join(name for name in names if name is not None)
+        raise ValueError(
+            f"Unknown condition_profile '{selector}' for {profile_key}. "
+            f"Known: {available or '<none>'}"
+        )
 
     weights_arr = np.asarray(weights, dtype=np.float64)
     total = float(weights_arr.sum())
@@ -943,6 +997,14 @@ def _conditioned_stage_config(
 
     selected = choices[int(rng.choice(len(choices), p=weights_arr / total))]
     return deep_merge(base, selected)
+
+
+def _condition_profile_selector(config: Mapping[str, Any]) -> str | None:
+    for key in _CONDITION_PROFILE_SELECTOR_KEYS:
+        value = config.get(key)
+        if value is not None:
+            return str(value)
+    return None
 
 
 def _context_intrinsics(context: CaptureContext) -> np.ndarray | None:
