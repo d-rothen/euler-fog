@@ -820,6 +820,121 @@ def test_sensor_stage_supports_raw_and_post_demosaic_quantization() -> None:
     np.testing.assert_allclose(result, np.round(result * 15.0) / 15.0)
 
 
+def _deterministic_sensor_pipeline(
+    *,
+    auto_exposure: dict,
+    exposure_gain: float = 1.0,
+) -> CaptureArtifactPipeline:
+    return CaptureArtifactPipeline.from_config(
+        {
+            "capture": {
+                "stages": [
+                    {
+                        "type": "sensor",
+                        "input_space": "linear",
+                        "exposure_gain": exposure_gain,
+                        "auto_exposure": auto_exposure,
+                        "white_balance": [1.0, 1.0, 1.0],
+                        "white_balance_jitter": 0.0,
+                        "channel_gain_sigma": 0.0,
+                        "camera_matrix": [
+                            [1.0, 0.0, 0.0],
+                            [0.0, 1.0, 0.0],
+                            [0.0, 0.0, 1.0],
+                        ],
+                        "bayer_pattern": "RGGB",
+                        "shot_noise_electrons": 0.0,
+                        "read_noise_electrons": 0.0,
+                        "fixed_pattern_sigma": 0.0,
+                        "row_noise_sigma": 0.0,
+                        "column_noise_sigma": 0.0,
+                        "black_level": [0.0, 0.0, 0.0],
+                        "black_level_jitter": 0.0,
+                        "white_level": [1.0, 1.0, 1.0],
+                        "white_level_jitter": 0.0,
+                        "adc_bit_depth": 0,
+                        "post_demosaic_bit_depth": 0,
+                        "hot_pixel_probability": 0.0,
+                        "dead_pixel_probability": 0.0,
+                    }
+                ]
+            }
+        }
+    )
+
+
+def test_sensor_auto_exposure_meters_rendered_luminance() -> None:
+    pipeline = _deterministic_sensor_pipeline(
+        auto_exposure={
+            "enabled": True,
+            "metering": "mean",
+            "target_luminance": 0.2,
+            "highlight_protection": 0.0,
+            "min_gain": 0.1,
+            "max_gain": 8.0,
+        }
+    )
+
+    dark = pipeline.apply_np(
+        np.full((12, 16, 3), 0.08, dtype=np.float32),
+        CaptureContext(rng=np.random.default_rng(23)),
+    )
+    bright = pipeline.apply_np(
+        np.full((12, 16, 3), 0.4, dtype=np.float32),
+        CaptureContext(rng=np.random.default_rng(23)),
+    )
+
+    np.testing.assert_allclose(float(dark.mean()), 0.2, atol=0.015)
+    np.testing.assert_allclose(float(bright.mean()), 0.2, atol=0.015)
+
+
+def test_sensor_auto_exposure_keeps_exposure_gain_as_compensation() -> None:
+    pipeline = _deterministic_sensor_pipeline(
+        exposure_gain=0.5,
+        auto_exposure={
+            "enabled": True,
+            "metering": "mean",
+            "target_luminance": 0.2,
+            "highlight_protection": 0.0,
+            "manual_gain_weight": 1.0,
+            "min_gain": 0.1,
+            "max_gain": 8.0,
+        },
+    )
+
+    result = pipeline.apply_np(
+        np.full((12, 16, 3), 0.1, dtype=np.float32),
+        CaptureContext(rng=np.random.default_rng(29)),
+    )
+
+    np.testing.assert_allclose(float(result.mean()), 0.1, atol=0.015)
+
+
+def test_sensor_auto_exposure_can_protect_highlights() -> None:
+    pipeline = _deterministic_sensor_pipeline(
+        auto_exposure={
+            "enabled": True,
+            "metering": "mean",
+            "target_luminance": 0.4,
+            "highlight_percentile": 80.0,
+            "highlight_target": 0.72,
+            "highlight_protection": 1.0,
+            "min_gain": 0.1,
+            "max_gain": 8.0,
+        }
+    )
+    image = np.full((16, 16, 3), 0.05, dtype=np.float32)
+    image[:, :6] = 0.9
+
+    result = pipeline.apply_np(
+        image,
+        CaptureContext(rng=np.random.default_rng(31)),
+    )
+
+    assert float(result.max()) <= 0.74
+    assert float(result.mean()) < 0.32
+
+
 def test_sensor_noise_modulation_is_stronger_in_dark_foggy_regions() -> None:
     pipeline = CaptureArtifactPipeline.from_config(
         {

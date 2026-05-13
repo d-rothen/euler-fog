@@ -276,6 +276,29 @@ class SensorStage(ConfiguredCaptureStage):
     DEFAULTS = {
         "input_space": "linear",
         "exposure_gain": {"dist": "uniform", "min": 0.85, "max": 1.25},
+        "auto_exposure": {
+            "enabled": False,
+            "metering": "center_weighted",
+            "target_luminance": 0.18,
+            "center_weight": 0.55,
+            "center_sigma": 0.35,
+            "meter_percentile": 50.0,
+            "highlight_percentile": 98.5,
+            "highlight_target": 0.92,
+            "highlight_protection": 0.65,
+            "min_gain": 0.35,
+            "max_gain": 2.6,
+            "exposure_compensation_ev": 0.0,
+            "manual_gain_weight": 1.0,
+            "resolve_iso": False,
+            "min_iso": None,
+            "max_iso": 1600.0,
+            "iso_activation_gain": 1.2,
+            "iso_gain_power": 0.85,
+            "dark_fraction_threshold": 0.12,
+            "dark_iso_boost": 0.0,
+            "fog_iso_boost": 0.0,
+        },
         "white_balance": [1.0, 1.0, 1.0],
         "white_balance_jitter": 0.03,
         "channel_gain_sigma": 0.01,
@@ -336,6 +359,13 @@ class SensorStage(ConfiguredCaptureStage):
         img = _apply_color_matrix(img, matrix)
 
         exposure = _sample_float(config, "exposure_gain", 1.0, rng)
+        exposure, config = _resolve_auto_exposure_np(
+            img,
+            context,
+            config,
+            rng,
+            manual_exposure_gain=exposure,
+        )
         wb = _sample_triplet(config.get("white_balance", [1.0, 1.0, 1.0]), rng)
         wb_jitter = _sample_float(config, "white_balance_jitter", 0.0, rng)
         if wb_jitter > 0.0:
@@ -1139,6 +1169,175 @@ def _sample_sensor_levels(
     rng: np.random.Generator,
 ) -> np.ndarray:
     return _sample_triplet(config.get(key, [1.0, 1.0, 1.0]), rng)
+
+
+def _resolve_auto_exposure_np(
+    image: np.ndarray,
+    context: CaptureContext,
+    config: Mapping[str, Any],
+    rng: np.random.Generator,
+    *,
+    manual_exposure_gain: float,
+) -> tuple[float, Mapping[str, Any]]:
+    cfg = _config_block(config, "auto_exposure")
+    if not _block_enabled(cfg, rng):
+        return float(manual_exposure_gain), config
+
+    metrics = _auto_exposure_metrics_np(image, context, cfg, rng)
+    meter = max(float(metrics["meter_luminance"]), 1e-6)
+    target = max(_sample_float(cfg, "target_luminance", 0.18, rng), 1e-6)
+    auto_gain = target / meter
+
+    highlight = max(float(metrics["highlight_luminance"]), 1e-6)
+    highlight_target = max(_sample_float(cfg, "highlight_target", 0.92, rng), 1e-6)
+    highlight_gain = highlight_target / highlight
+    protection = float(
+        np.clip(_sample_float(cfg, "highlight_protection", 0.65, rng), 0.0, 1.0)
+    )
+    if protection > 0.0 and auto_gain > highlight_gain > 0.0:
+        log_auto = math.log(max(auto_gain, 1e-6))
+        log_highlight = math.log(max(highlight_gain, 1e-6))
+        auto_gain = math.exp(
+            (1.0 - protection) * log_auto + protection * log_highlight
+        )
+
+    compensation_ev = _sample_float(cfg, "exposure_compensation_ev", 0.0, rng)
+    auto_gain *= 2.0**compensation_ev
+
+    manual_weight = max(_sample_float(cfg, "manual_gain_weight", 1.0, rng), 0.0)
+    manual_gain = max(float(manual_exposure_gain), 1e-6)
+    exposure = auto_gain * (manual_gain**manual_weight)
+    min_gain = max(_sample_float(cfg, "min_gain", 0.0, rng), 0.0)
+    max_gain = max(_sample_float(cfg, "max_gain", 2.6, rng), max(min_gain, 1e-6))
+    exposure = float(np.clip(exposure, min_gain, max_gain))
+
+    if not _bool_value(cfg.get("resolve_iso", False)):
+        return exposure, config
+
+    resolved_config = dict(config)
+    base_iso = max(_sample_float(config, "base_iso", 100.0, rng), 1e-6)
+    configured_iso = max(_sample_float(config, "iso", base_iso, rng), 1e-6)
+    min_iso_cfg = cfg.get("min_iso")
+    min_iso = (
+        max(float(sample_value(min_iso_cfg, rng)), 1e-6)
+        if min_iso_cfg is not None
+        else base_iso
+    )
+    max_iso = max(_sample_float(cfg, "max_iso", 1600.0, rng), min_iso)
+    activation_gain = max(_sample_float(cfg, "iso_activation_gain", 1.2, rng), 1e-6)
+    iso_power = max(_sample_float(cfg, "iso_gain_power", 0.85, rng), 0.0)
+    iso_pressure = max(auto_gain / activation_gain, 1.0)
+    resolved_iso = configured_iso * (iso_pressure**iso_power)
+
+    dark_iso_boost = max(_sample_float(cfg, "dark_iso_boost", 0.0, rng), 0.0)
+    if dark_iso_boost > 0.0:
+        resolved_iso *= 1.0 + dark_iso_boost * float(metrics["dark_fraction"])
+
+    fog_iso_boost = max(_sample_float(cfg, "fog_iso_boost", 0.0, rng), 0.0)
+    if fog_iso_boost > 0.0:
+        resolved_iso *= 1.0 + fog_iso_boost * float(metrics["mean_fog_opacity"])
+
+    resolved_config["iso"] = float(np.clip(resolved_iso, min_iso, max_iso))
+    resolved_config["base_iso"] = float(base_iso)
+    return exposure, resolved_config
+
+
+def _auto_exposure_metrics_np(
+    image: np.ndarray,
+    context: CaptureContext,
+    config: Mapping[str, Any],
+    rng: np.random.Generator,
+) -> dict[str, float]:
+    luminance = _linear_luminance_np(image)
+    finite = np.isfinite(luminance)
+    if not finite.any():
+        return {
+            "meter_luminance": 0.18,
+            "mean_luminance": 0.18,
+            "center_luminance": 0.18,
+            "percentile_luminance": 0.18,
+            "highlight_luminance": 0.18,
+            "dark_fraction": 0.0,
+            "contrast": 0.0,
+            "mean_fog_opacity": 0.0,
+        }
+    luma = np.clip(luminance[finite], 0.0, None)
+    mean_luma = float(luma.mean())
+    center_luma = _center_weighted_mean_np(luminance, config, rng)
+    meter_percentile = float(
+        np.clip(_sample_float(config, "meter_percentile", 50.0, rng), 0.0, 100.0)
+    )
+    percentile_luma = float(np.percentile(luma, meter_percentile))
+    highlight_percentile = float(
+        np.clip(_sample_float(config, "highlight_percentile", 98.5, rng), 0.0, 100.0)
+    )
+    highlight_luma = float(np.percentile(luma, highlight_percentile))
+    low_luma = float(np.percentile(luma, 5.0))
+    high_luma = float(np.percentile(luma, 95.0))
+    dark_threshold = max(
+        _sample_float(config, "dark_fraction_threshold", 0.12, rng),
+        0.0,
+    )
+    dark_fraction = float(np.mean(luma < dark_threshold))
+    opacity = _context_fog_opacity(context, luminance.shape)
+    mean_fog_opacity = float(np.mean(opacity)) if opacity is not None else 0.0
+
+    metering = str(config.get("metering", "center_weighted")).strip().lower()
+    center_weight = float(
+        np.clip(_sample_float(config, "center_weight", 0.55, rng), 0.0, 1.0)
+    )
+    if metering in {"mean", "average"}:
+        meter_luma = mean_luma
+    elif metering in {"percentile", "median"}:
+        meter_luma = percentile_luma
+    elif metering in {"center_percentile", "centered_percentile"}:
+        meter_luma = (
+            (1.0 - center_weight) * percentile_luma
+            + center_weight * center_luma
+        )
+    elif metering in {"highlight", "highlight_protect", "highlight_protected"}:
+        meter_luma = max(center_luma, percentile_luma)
+    else:
+        meter_luma = (1.0 - center_weight) * mean_luma + center_weight * center_luma
+
+    return {
+        "meter_luminance": max(float(meter_luma), 1e-6),
+        "mean_luminance": mean_luma,
+        "center_luminance": center_luma,
+        "percentile_luminance": percentile_luma,
+        "highlight_luminance": highlight_luma,
+        "dark_fraction": dark_fraction,
+        "contrast": max(high_luma - low_luma, 0.0),
+        "mean_fog_opacity": mean_fog_opacity,
+    }
+
+
+def _linear_luminance_np(image: np.ndarray) -> np.ndarray:
+    weights = np.array([0.2126, 0.7152, 0.0722], dtype=np.float32)
+    return np.sum(np.clip(image, 0.0, None) * weights, axis=-1).astype(
+        np.float32,
+        copy=False,
+    )
+
+
+def _center_weighted_mean_np(
+    luminance: np.ndarray,
+    config: Mapping[str, Any],
+    rng: np.random.Generator,
+) -> float:
+    height, width = luminance.shape
+    if height <= 0 or width <= 0:
+        return 0.18
+    sigma = max(_sample_float(config, "center_sigma", 0.35, rng), 1e-3)
+    yy, xx = _coordinate_grid(height, width)
+    x = (xx - (width - 1) / 2.0) / max(width - 1, 1)
+    y = (yy - (height - 1) / 2.0) / max(height - 1, 1)
+    weights = np.exp(-0.5 * (x * x + y * y) / (sigma * sigma)).astype(np.float32)
+    finite = np.isfinite(luminance)
+    if not finite.any():
+        return 0.18
+    weighted = np.where(finite, np.clip(luminance, 0.0, None), 0.0) * weights
+    return float(weighted.sum() / max(float(weights[finite].sum()), 1e-6))
 
 
 def _resolve_electron_capacity(

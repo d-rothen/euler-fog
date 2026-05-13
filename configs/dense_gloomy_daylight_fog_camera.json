@@ -111,6 +111,41 @@
           "min": 0.72,
           "max": 1.0
         },
+        "auto_exposure": {
+          "enabled": true,
+          "metering": "center_weighted",
+          "target_luminance": {
+            "dist": "uniform",
+            "min": 0.16,
+            "max": 0.24
+          },
+          "center_weight": 0.58,
+          "center_sigma": 0.38,
+          "meter_percentile": 50.0,
+          "highlight_percentile": 98.5,
+          "highlight_target": {
+            "dist": "uniform",
+            "min": 0.82,
+            "max": 0.94
+          },
+          "highlight_protection": 0.72,
+          "min_gain": 0.35,
+          "max_gain": 2.5,
+          "exposure_compensation_ev": {
+            "dist": "uniform",
+            "min": -0.25,
+            "max": 0.1
+          },
+          "manual_gain_weight": 1.0,
+          "resolve_iso": true,
+          "min_iso": 100.0,
+          "max_iso": 1600.0,
+          "iso_activation_gain": 1.18,
+          "iso_gain_power": 0.82,
+          "dark_fraction_threshold": 0.12,
+          "dark_iso_boost": 0.35,
+          "fog_iso_boost": 0.25
+        },
         "white_balance": [
           0.92,
           1.0,
@@ -514,7 +549,29 @@
       },
       "capture_overrides": {
         "sensor": {
-          "condition_profile": "clean_daylight"
+          "condition_profile": "clean_daylight",
+          "auto_exposure": {
+            "target_luminance": {
+              "dist": "uniform",
+              "min": 0.2,
+              "max": 0.28
+            },
+            "highlight_target": {
+              "dist": "uniform",
+              "min": 0.86,
+              "max": 0.97
+            },
+            "highlight_protection": 0.82,
+            "max_gain": 1.7,
+            "exposure_compensation_ev": {
+              "dist": "uniform",
+              "min": 0.0,
+              "max": 0.15
+            },
+            "max_iso": 500.0,
+            "dark_iso_boost": 0.12,
+            "fog_iso_boost": 0.08
+          }
         },
         "isp": {
           "denoise_sigma": {
@@ -603,7 +660,29 @@
       },
       "capture_overrides": {
         "sensor": {
-          "condition_profile": "clean_daylight"
+          "condition_profile": "clean_daylight",
+          "auto_exposure": {
+            "target_luminance": {
+              "dist": "uniform",
+              "min": 0.18,
+              "max": 0.25
+            },
+            "highlight_target": {
+              "dist": "uniform",
+              "min": 0.84,
+              "max": 0.94
+            },
+            "highlight_protection": 0.76,
+            "max_gain": 2.0,
+            "exposure_compensation_ev": {
+              "dist": "uniform",
+              "min": -0.1,
+              "max": 0.08
+            },
+            "max_iso": 800.0,
+            "dark_iso_boost": 0.22,
+            "fog_iso_boost": 0.16
+          }
         },
         "isp": {
           "denoise_sigma": {
@@ -692,7 +771,29 @@
       },
       "capture_overrides": {
         "sensor": {
-          "condition_profile": "nominal_gloom"
+          "condition_profile": "nominal_gloom",
+          "auto_exposure": {
+            "target_luminance": {
+              "dist": "uniform",
+              "min": 0.15,
+              "max": 0.22
+            },
+            "highlight_target": {
+              "dist": "uniform",
+              "min": 0.8,
+              "max": 0.92
+            },
+            "highlight_protection": 0.72,
+            "max_gain": 2.35,
+            "exposure_compensation_ev": {
+              "dist": "uniform",
+              "min": -0.25,
+              "max": 0.05
+            },
+            "max_iso": 1250.0,
+            "dark_iso_boost": 0.38,
+            "fog_iso_boost": 0.26
+          }
         },
         "isp": {
           "denoise_sigma": {
@@ -781,7 +882,29 @@
       },
       "capture_overrides": {
         "sensor": {
-          "condition_profile": "underexposed_noisy"
+          "condition_profile": "underexposed_noisy",
+          "auto_exposure": {
+            "target_luminance": {
+              "dist": "uniform",
+              "min": 0.12,
+              "max": 0.18
+            },
+            "highlight_target": {
+              "dist": "uniform",
+              "min": 0.74,
+              "max": 0.88
+            },
+            "highlight_protection": 0.68,
+            "max_gain": 2.0,
+            "exposure_compensation_ev": {
+              "dist": "uniform",
+              "min": -0.55,
+              "max": -0.15
+            },
+            "max_iso": 1600.0,
+            "dark_iso_boost": 0.55,
+            "fog_iso_boost": 0.34
+          }
         },
         "isp": {
           "denoise_sigma": {
@@ -887,7 +1010,29 @@
           }
         },
         "sensor": {
-          "condition_profile": "underexposed_noisy"
+          "condition_profile": "underexposed_noisy",
+          "auto_exposure": {
+            "target_luminance": {
+              "dist": "uniform",
+              "min": 0.1,
+              "max": 0.16
+            },
+            "highlight_target": {
+              "dist": "uniform",
+              "min": 0.68,
+              "max": 0.82
+            },
+            "highlight_protection": 0.62,
+            "max_gain": 1.85,
+            "exposure_compensation_ev": {
+              "dist": "uniform",
+              "min": -0.8,
+              "max": -0.25
+            },
+            "max_iso": 1800.0,
+            "dark_iso_boost": 0.7,
+            "fog_iso_boost": 0.45
+          }
         },
         "isp": {
           "denoise_sigma": {
