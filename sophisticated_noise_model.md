@@ -87,9 +87,21 @@ more denoising.
 
 The dense daylight config now also separates global grain from local shadow
 corruption. Baseline read/fixed/banding noise is lower, while
-`shadow_recovery_noise` adds luma/chroma grain and mild blotching where the
-pre-exposure fog-rendered image was dark. Scenario profiles scale this from
-subtle in clearer cases to aggressive in severe, underexposed fog.
+`shadow_recovery_noise` adds mostly chroma grain where the pre-exposure
+fog-rendered image was dark. The chroma noise is luminance-preserving by default
+(`chroma_luminance_preservation: 1.0`) and uses a balanced red/blue chroma basis
+instead of subtracting luminance equally from RGB. The basis is configurable via
+`red_chroma_gain`, `blue_chroma_gain`, and `chroma_axis_correlation`; the dense
+config intentionally gives the bad profiles stronger blue-channel chroma energy,
+matching the blue/purple cast seen in real high-ISO fog footage. The dense config
+keeps luma/blotch noise low so high-ISO dark regions read as colored sensor
+noise instead of black speckle dropout. A black-region suppression gate reduces
+extra sensor and shadow noise in near-clipped pixels, so visible noise peaks in
+dim-but-readable shadows and falls off again in pitch black. Low ISP denoising,
+zero chroma spatial blur, and no JPEG chroma subsampling preserve fine-grained
+noise resolution instead of turning it into blocky color patches. Scenario
+profiles scale this from subtle in clearer cases to aggressive in severe,
+underexposed fog.
 
 ### 3. Heterogeneous Fog Is Image-Space, Not World-Space
 

@@ -214,8 +214,18 @@ For tighter control, provide explicit stages in camera order:
       "shadow_recovery_noise": {
         "enabled": true,
         "luminance_threshold": {"dist": "uniform", "min": 0.16, "max": 0.24},
-        "luma_sigma": {"dist": "uniform", "min": 0.002, "max": 0.006},
-        "chroma_sigma": {"dist": "uniform", "min": 0.004, "max": 0.012}
+        "luma_sigma": {"dist": "uniform", "min": 0.0, "max": 0.001},
+        "chroma_sigma": {"dist": "uniform", "min": 0.012, "max": 0.028},
+        "chroma_mode": "balanced",
+        "red_chroma_gain": {"dist": "uniform", "min": 0.7, "max": 1.0},
+        "blue_chroma_gain": {"dist": "uniform", "min": 1.7, "max": 2.7},
+        "chroma_axis_correlation": {"dist": "uniform", "min": 0.05, "max": 0.25},
+        "chroma_spatial_sigma": 0.0,
+        "chroma_fine_fraction": 1.0,
+        "chroma_luminance_preservation": 1.0,
+        "black_noise_floor": 0.25,
+        "black_suppression_luminance": 0.03,
+        "black_suppression_softness": 0.08
       },
       "black_level": [0.003, 0.0035, 0.003],
       "white_level": [1.0, 0.995, 1.0],
@@ -287,7 +297,17 @@ applies as scenario-specific exposure compensation.
 Set `sensor.shadow_recovery_noise.enabled` to add extra post-demosaic luma and
 chroma corruption only where the pre-exposure rendered luminance was low. This
 is useful for reducing broad global grain while keeping lifted shadows visibly
-noisy.
+noisy. For dark high-ISO scenes, keep `luma_sigma` much lower than
+`chroma_sigma`, use `chroma_mode: "balanced"`, and leave
+`chroma_luminance_preservation` near `1.0`; this makes the local corruption read
+as color noise instead of black luma speckles. `red_chroma_gain`,
+`blue_chroma_gain`, and `chroma_axis_correlation` can match camera-specific
+color noise, including blue/purple-biased high-ISO noise. Keep
+`chroma_spatial_sigma` near `0` and avoid chroma subsampling when the target
+noise is fine-grained rather than blocky. `black_noise_floor` with
+`black_suppression_luminance`/`black_suppression_softness` reduces the extra
+noise in near-clipped black regions, so the strongest visible noise sits in
+dim-but-readable shadows.
 
 Any stage can define `condition_profiles` to sample coherent per-image settings
 before the stage runs. This is useful for exposure states where ISO, exposure

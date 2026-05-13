@@ -332,6 +332,9 @@ class SensorStage(ConfiguredCaptureStage):
             "gamma": 1.0,
             "max_gain": 3.0,
             "smooth_sigma": 0.0,
+            "black_noise_floor": 1.0,
+            "black_suppression_luminance": 0.0,
+            "black_suppression_softness": 0.05,
         },
         "shadow_recovery_noise": {
             "enabled": False,
@@ -341,11 +344,21 @@ class SensorStage(ConfiguredCaptureStage):
             "strength": 1.0,
             "luma_sigma": 0.0,
             "chroma_sigma": 0.0,
+            "chroma_mode": "balanced",
+            "red_chroma_gain": 1.0,
+            "blue_chroma_gain": 1.0,
+            "chroma_axis_correlation": 0.0,
+            "chroma_spatial_sigma": 0.0,
+            "chroma_fine_fraction": 1.0,
+            "chroma_luminance_preservation": 1.0,
             "blotch_sigma": 0.0,
             "fog_weight": 0.0,
             "depth_weight": 0.0,
             "smooth_sigma": 1.0,
             "max_weight": 1.0,
+            "black_noise_floor": 1.0,
+            "black_suppression_luminance": 0.0,
+            "black_suppression_softness": 0.05,
         },
         "black_level": [0.003, 0.003, 0.003],
         "black_level_jitter": {"dist": "uniform", "min": 0.0, "max": 0.002},
@@ -1425,6 +1438,10 @@ def _sensor_noise_modulation(
         if opacity is not None:
             modulation += fog_gain * np.power(np.clip(opacity, 0.0, 1.0), gamma)
 
+    black_gate = _black_suppression_gate_np(signal, cfg, rng)
+    if black_gate is not None:
+        modulation = 1.0 + (modulation - 1.0) * black_gate
+
     smooth_sigma = _sample_float(cfg, "smooth_sigma", 0.0, rng)
     if smooth_sigma > 1e-4:
         modulation = _gaussian_blur_np(modulation, smooth_sigma)
@@ -1460,7 +1477,20 @@ def _apply_shadow_recovery_noise_np(
 
     chroma_sigma = max(_sample_float(cfg, "chroma_sigma", 0.0, rng), 0.0) * strength
     if chroma_sigma > 0.0:
-        chroma_noise = rng.normal(0.0, chroma_sigma, image.shape).astype(np.float32)
+        chroma_preservation = float(
+            np.clip(
+                _sample_float(cfg, "chroma_luminance_preservation", 1.0, rng),
+                0.0,
+                1.0,
+            )
+        )
+        chroma_noise = _shadow_chroma_noise_np(
+            image.shape,
+            chroma_sigma,
+            cfg,
+            rng,
+            chroma_preservation,
+        )
         out += chroma_noise * weight[..., None]
 
     blotch_sigma = max(_sample_float(cfg, "blotch_sigma", 0.0, rng), 0.0) * strength
@@ -1496,12 +1526,124 @@ def _shadow_recovery_weight_np(
         if depth is not None:
             weight += depth_weight * _normalize_context_map(depth)
 
+    black_gate = _black_suppression_gate_np(luma, config, rng)
+    if black_gate is not None:
+        weight *= black_gate
+
     smooth_sigma = _sample_float(config, "smooth_sigma", 1.0, rng)
     if smooth_sigma > 1e-4:
         weight = _gaussian_blur_np(weight, smooth_sigma)
 
     max_weight = max(_sample_float(config, "max_weight", 1.0, rng), 0.0)
     return np.clip(weight, 0.0, max_weight).astype(np.float32, copy=False)
+
+
+def _shadow_chroma_noise_np(
+    shape: tuple[int, int, int],
+    sigma: float,
+    config: Mapping[str, Any],
+    rng: np.random.Generator,
+    luminance_preservation: float,
+) -> np.ndarray:
+    raw = rng.normal(0.0, sigma, shape).astype(np.float32)
+    if luminance_preservation <= 0.0:
+        return raw
+
+    mode = str(config.get("chroma_mode", "balanced")).strip().lower().replace("-", "_")
+    if mode in {"balanced", "balanced_luminance", "balanced_luminance_preserving"}:
+        preserved = _balanced_luminance_preserving_chroma_noise_np(
+            shape,
+            sigma,
+            config,
+            rng,
+        )
+    else:
+        weights = np.array([0.2126, 0.7152, 0.0722], dtype=np.float32)
+        chroma_luma = np.sum(raw * weights.reshape(1, 1, 3), axis=-1)
+        preserved = raw - chroma_luma[..., None]
+
+    if luminance_preservation >= 1.0:
+        return preserved
+    return (
+        (1.0 - luminance_preservation) * raw
+        + luminance_preservation * preserved
+    ).astype(np.float32, copy=False)
+
+
+def _balanced_luminance_preserving_chroma_noise_np(
+    shape: tuple[int, int, int],
+    sigma: float,
+    config: Mapping[str, Any],
+    rng: np.random.Generator,
+) -> np.ndarray:
+    if len(shape) != 3 or shape[2] != 3:
+        return rng.normal(0.0, sigma, shape).astype(np.float32)
+
+    weights = np.array([0.2126, 0.7152, 0.0722], dtype=np.float32)
+    red_axis = np.array([1.0, -weights[0] / weights[1], 0.0], dtype=np.float32)
+    blue_axis = np.array([0.0, -weights[2] / weights[1], 1.0], dtype=np.float32)
+
+    red_gain = max(_sample_float(config, "red_chroma_gain", 1.0, rng), 0.0)
+    blue_gain = max(_sample_float(config, "blue_chroma_gain", 1.0, rng), 0.0)
+    correlation = float(
+        np.clip(
+            _sample_float(config, "chroma_axis_correlation", 0.0, rng),
+            -0.95,
+            0.95,
+        )
+    )
+    red_unit = rng.normal(0.0, 1.0, shape[:2]).astype(np.float32)
+    blue_unit = rng.normal(0.0, 1.0, shape[:2]).astype(np.float32)
+    if abs(correlation) > 1e-6:
+        blue_unit = (
+            correlation * red_unit
+            + np.sqrt(max(1.0 - correlation * correlation, 0.0)) * blue_unit
+        ).astype(np.float32, copy=False)
+
+    red_noise = red_unit * (sigma * red_gain)
+    blue_noise = blue_unit * (sigma * blue_gain)
+    noise = (
+        red_noise[..., None] * red_axis.reshape(1, 1, 3)
+        + blue_noise[..., None] * blue_axis.reshape(1, 1, 3)
+    ).astype(np.float32, copy=False)
+
+    spatial_sigma = _sample_float(config, "chroma_spatial_sigma", 0.0, rng)
+    if spatial_sigma > 1e-4:
+        fine_fraction = float(
+            np.clip(
+                _sample_float(config, "chroma_fine_fraction", 1.0, rng),
+                0.0,
+                1.0,
+            )
+        )
+        blurred = _gaussian_blur_np(noise, spatial_sigma)
+        noise = fine_fraction * noise + (1.0 - fine_fraction) * blurred
+
+    return noise.astype(np.float32, copy=False)
+
+
+def _black_suppression_gate_np(
+    luminance_or_signal: np.ndarray,
+    config: Mapping[str, Any],
+    rng: np.random.Generator,
+) -> np.ndarray | None:
+    floor = float(
+        np.clip(_sample_float(config, "black_noise_floor", 1.0, rng), 0.0, 1.0)
+    )
+    if floor >= 1.0:
+        return None
+
+    threshold = max(
+        _sample_float(config, "black_suppression_luminance", 0.0, rng),
+        0.0,
+    )
+    softness = max(
+        _sample_float(config, "black_suppression_softness", 0.05, rng),
+        1e-6,
+    )
+    x = np.clip((luminance_or_signal - threshold) / softness, 0.0, 1.0)
+    smooth = x * x * (3.0 - 2.0 * x)
+    return (floor + (1.0 - floor) * smooth).astype(np.float32, copy=False)
 
 
 def _normalize_context_map(value: np.ndarray) -> np.ndarray:
