@@ -1,0 +1,330 @@
+{
+  "airlight": "dcp_heuristic",
+  "seed": 1337,
+  "depth_scale": 1.0,
+  "resize_depth": true,
+  "contrast_threshold": 0.05,
+  "device": "mps",
+  "gpu_batch_size": 4,
+  "camera_profiles": {
+    "dense_gloomy_daylight_dashcam": {
+      "optics": {
+        "blur_sigma": {
+          "dist": "uniform",
+          "min": 0.35,
+          "max": 0.9
+        },
+        "motion_blur": {
+          "enabled": true,
+          "probability": 0.18,
+          "length_px": {
+            "dist": "uniform",
+            "min": 2.0,
+            "max": 4.0
+          },
+          "angle_deg": {
+            "dist": "uniform",
+            "min": -6.0,
+            "max": 6.0
+          }
+        },
+        "vignetting_strength": {
+          "dist": "uniform",
+          "min": 0.16,
+          "max": 0.32
+        },
+        "vignetting_radius": 1.05,
+        "chromatic_aberration_px": {
+          "dist": "uniform",
+          "min": 0.15,
+          "max": 0.65
+        },
+        "lens_distortion": {
+          "dist": "uniform",
+          "min": -0.012,
+          "max": 0.006
+        },
+        "bloom": {
+          "enabled": true,
+          "threshold": {
+            "dist": "uniform",
+            "min": 0.58,
+            "max": 0.74
+          },
+          "strength": {
+            "dist": "uniform",
+            "min": 0.05,
+            "max": 0.16
+          },
+          "sigma": {
+            "dist": "uniform",
+            "min": 3.5,
+            "max": 8.5
+          }
+        },
+        "veiling_glare_strength": {
+          "dist": "uniform",
+          "min": 0.025,
+          "max": 0.08
+        },
+        "windshield_haze": {
+          "enabled": true,
+          "probability": 0.7,
+          "strength": {
+            "dist": "uniform",
+            "min": 0.06,
+            "max": 0.16
+          },
+          "blur_sigma": {
+            "dist": "uniform",
+            "min": 7.0,
+            "max": 18.0
+          },
+          "color": [
+            0.64,
+            0.67,
+            0.68
+          ]
+        },
+        "droplets": {
+          "enabled": false
+        }
+      },
+      "sensor": {
+        "input_space": "srgb",
+        "exposure_gain": {
+          "dist": "uniform",
+          "min": 0.72,
+          "max": 1.0
+        },
+        "white_balance": [
+          0.92,
+          1.0,
+          1.08
+        ],
+        "white_balance_jitter": 0.035,
+        "channel_gain_sigma": 0.018,
+        "camera_matrix": [
+          [
+            1.04,
+            -0.025,
+            -0.015
+          ],
+          [
+            -0.015,
+            1.03,
+            -0.015
+          ],
+          [
+            -0.015,
+            -0.035,
+            1.05
+          ]
+        ],
+        "bayer_pattern": "RGGB",
+        "iso": {
+          "dist": "choice",
+          "values": [
+            800.0,
+            1250.0,
+            1600.0
+          ],
+          "weights": [
+            0.35,
+            0.4,
+            0.25
+          ]
+        },
+        "base_iso": 100.0,
+        "full_well_electrons": [
+          13500.0,
+          12000.0,
+          12500.0
+        ],
+        "read_noise_electrons": {
+          "dist": "uniform",
+          "min": 3.0,
+          "max": 8.0
+        },
+        "fixed_pattern_sigma": {
+          "dist": "uniform",
+          "min": 0.001,
+          "max": 0.006
+        },
+        "row_noise_sigma": {
+          "dist": "uniform",
+          "min": 0.002,
+          "max": 0.009
+        },
+        "column_noise_sigma": {
+          "dist": "uniform",
+          "min": 0.001,
+          "max": 0.004
+        },
+        "black_level": [
+          0.004,
+          0.0045,
+          0.004
+        ],
+        "black_level_jitter": {
+          "dist": "uniform",
+          "min": 0.0005,
+          "max": 0.0025
+        },
+        "white_level": [
+          1.0,
+          0.995,
+          1.0
+        ],
+        "white_level_jitter": {
+          "dist": "uniform",
+          "min": 0.001,
+          "max": 0.004
+        },
+        "adc_bit_depth": 12,
+        "post_demosaic_bit_depth": 12,
+        "hot_pixel_probability": 0.00004,
+        "dead_pixel_probability": 0.00002
+      },
+      "isp": {
+        "denoise_sigma": {
+          "dist": "uniform",
+          "min": 0.25,
+          "max": 0.75
+        },
+        "color_matrix": [
+          [
+            0.96,
+            0.02,
+            0.02
+          ],
+          [
+            0.015,
+            0.98,
+            0.005
+          ],
+          [
+            0.02,
+            0.035,
+            0.945
+          ]
+        ],
+        "tone_map": "reinhard",
+        "tone_map_strength": {
+          "dist": "uniform",
+          "min": 0.22,
+          "max": 0.42
+        },
+        "gamma": {
+          "dist": "uniform",
+          "min": 2.05,
+          "max": 2.3
+        },
+        "local_contrast_strength": {
+          "dist": "uniform",
+          "min": 0.02,
+          "max": 0.1
+        },
+        "local_contrast_sigma": {
+          "dist": "uniform",
+          "min": 10.0,
+          "max": 24.0
+        },
+        "sharpen_amount": {
+          "dist": "uniform",
+          "min": 0.08,
+          "max": 0.28
+        },
+        "sharpen_sigma": 0.9,
+        "saturation": {
+          "dist": "uniform",
+          "min": 0.58,
+          "max": 0.82
+        }
+      },
+      "transport": {
+        "bit_depth": 8,
+        "jpeg": {
+          "enabled": true,
+          "quality": {
+            "dist": "uniform",
+            "min": 62.0,
+            "max": 86.0
+          },
+          "subsampling": 2
+        }
+      }
+    }
+  },
+  "camera_profile": "dense_gloomy_daylight_dashcam",
+  "capture": {
+    "preset": "camera"
+  },
+  "selection": {
+    "mode": "fixed",
+    "model": "heterogeneous_k_ls"
+  },
+  "dcp_heuristic": {
+    "patch_size": 15,
+    "top_percent": 0.001,
+    "white_bias": 0.03,
+    "cool_bias": 0.18,
+    "cool_target": [
+      0.82,
+      0.87,
+      0.9
+    ]
+  },
+  "models": {
+    "heterogeneous_k_ls": {
+      "visibility_m": {
+        "dist": "normal",
+        "mean": 42.0,
+        "std": 11.0,
+        "min": 22.0,
+        "max": 72.0
+      },
+      "atmospheric_light": "dcp_heuristic",
+      "airlight_dampening": {
+        "enabled": true,
+        "apply_to": "estimated",
+        "reference_visibility_m": 90.0,
+        "min_factor": {
+          "dist": "uniform",
+          "min": 0.26,
+          "max": 0.36
+        },
+        "max_factor": {
+          "dist": "uniform",
+          "min": 0.66,
+          "max": 0.82
+        },
+        "strength": {
+          "dist": "uniform",
+          "min": 1.25,
+          "max": 2.25
+        }
+      },
+      "k_hetero": {
+        "scales": "smooth_auto",
+        "correlation_length_fraction": 0.32,
+        "octaves": 4,
+        "max_scale": null,
+        "min_factor": 0.62,
+        "max_factor": 1.85,
+        "contrast": 0.78,
+        "normalize_to_mean": true
+      },
+      "ls_hetero": {
+        "scales": "smooth_auto",
+        "correlation_length_fraction": 0.46,
+        "octaves": 4,
+        "max_scale": null,
+        "min_factor": 0.68,
+        "max_factor": 1.04,
+        "contrast": 0.62,
+        "normalize_to_mean": false
+      }
+    }
+  }
+}
