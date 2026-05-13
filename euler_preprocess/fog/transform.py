@@ -6,8 +6,16 @@ from typing import Any, ClassVar
 
 import numpy as np
 
-from euler_preprocess.common.device import configure_device, iter_batches, torch_generator_for_index
-from euler_preprocess.common.intrinsics import extract_intrinsics, planar_to_radial_depth, planar_to_radial_depth_torch
+from euler_preprocess.common.device import (
+    configure_device,
+    iter_batches,
+    torch_generator_for_index,
+)
+from euler_preprocess.common.intrinsics import (
+    extract_intrinsics,
+    planar_to_radial_depth,
+    planar_to_radial_depth_torch,
+)
 from euler_preprocess.common.io import load_json
 from euler_preprocess.common.logging import get_logger, progress_bar
 from euler_preprocess.common.noise import perlin_fbm_torch
@@ -510,6 +518,7 @@ class FogTransform(Transform):
                             model_cfg=model_cfg,
                             rng=rng,
                             sample_id=sample.get("id"),
+                            intrinsics=intrinsics,
                             airlight_method=augmentation.airlight_method,
                         )
                         saved_paths.append(
@@ -553,6 +562,7 @@ class FogTransform(Transform):
                         model_cfg=model_cfg,
                         rng=rng,
                         sample_id=sample.get("id"),
+                        intrinsics=intrinsics,
                     )
                     saved_paths.append(
                         self._write_primary_output(
@@ -591,6 +601,7 @@ class FogTransform(Transform):
         estimated_airlight_t: "torch.Tensor",
         torch_gen: "torch.Generator",
         sample_id: str | None = None,
+        intrinsics: np.ndarray | None = None,
     ) -> tuple[
         "torch.Tensor", float, "torch.Tensor", "torch.Tensor", "torch.Tensor"
     ]:
@@ -619,6 +630,7 @@ class FogTransform(Transform):
                 ls_map,
                 rng=rng,
                 sample_id=sample_id,
+                intrinsics=intrinsics,
             )
 
         if model_name in ("heterogeneous_k", "heterogeneous_k_ls"):
@@ -679,6 +691,7 @@ class FogTransform(Transform):
             ls_map,
             rng=rng,
             sample_id=sample_id,
+            intrinsics=intrinsics,
         )
 
     def _finalize_torch_pipeline_result(
@@ -691,6 +704,7 @@ class FogTransform(Transform):
         *,
         rng: np.random.Generator,
         sample_id: str | None,
+        intrinsics: np.ndarray | None = None,
     ) -> tuple[
         "torch.Tensor", float, "torch.Tensor", "torch.Tensor", "torch.Tensor"
     ]:
@@ -707,6 +721,7 @@ class FogTransform(Transform):
                 sample_id=sample_id,
                 rng=rng,
                 device=self.torch_device,
+                intrinsics=intrinsics,
             ),
         )
         return result.rgb, result.beta, result.airlight, result.k_map, result.ls_map
@@ -811,28 +826,25 @@ class FogTransform(Transform):
                             ],
                             dim=0,
                         )
-                        depth_batch = torch.stack(
-                            [
-                                torch.from_numpy(item["depth"]).to(
-                                    device=device, dtype=torch.float32
+                        depth_tensors = []
+                        for item in uniform_items:
+                            depth_t = torch.from_numpy(item["depth"]).to(
+                                device=device,
+                                dtype=torch.float32,
+                            )
+                            depth_t = torch.clamp(
+                                depth_t * self.depth_scale,
+                                min=0.0,
+                            )
+                            K_np = item.get("intrinsics")
+                            if K_np is not None:
+                                K_t = torch.from_numpy(K_np).to(
+                                    device=device,
+                                    dtype=torch.float32,
                                 )
-                                for item in uniform_items
-                            ],
-                            dim=0,
-                        )
-                        depth_batch = torch.clamp(
-                            depth_batch * self.depth_scale, min=0.0
-                        )
-
-                        # Planar -> radial depth using intrinsics
-                        K_np = uniform_items[0].get("intrinsics")
-                        if K_np is not None:
-                            K_t = torch.from_numpy(K_np).to(
-                                device=device, dtype=torch.float32,
-                            )
-                            depth_batch = planar_to_radial_depth_torch(
-                                depth_batch, K_t,
-                            )
+                                depth_t = planar_to_radial_depth_torch(depth_t, K_t)
+                            depth_tensors.append(depth_t)
+                        depth_batch = torch.stack(depth_tensors, dim=0)
 
                         k_means, ls_base = (
                             self.atmospheric_light.resolve_uniform_batch_torch(
@@ -858,6 +870,7 @@ class FogTransform(Transform):
                                     sample_id=item["sample_id"],
                                     rng=item["rng"],
                                     device=device,
+                                    intrinsics=item.get("intrinsics"),
                                 )
                                 for item in uniform_items
                             ),
@@ -940,7 +953,12 @@ class FogTransform(Transform):
                             sky_mask_t,
                             sample_id=item["sample_id"],
                         )
-                        torch_gen = torch_generator_for_index(self.torch_device, self.seed, self.base_rng, item["index"])
+                        torch_gen = torch_generator_for_index(
+                            self.torch_device,
+                            self.seed,
+                            self.base_rng,
+                            item["index"],
+                        )
                         foggy_t, beta, airlight_t, k_map_t, ls_map_t = (
                             self._apply_model_torch(
                                 rgb_t,
@@ -951,6 +969,7 @@ class FogTransform(Transform):
                                 estimated_airlight,
                                 torch_gen,
                                 sample_id=item["sample_id"],
+                                intrinsics=item.get("intrinsics"),
                             )
                         )
                         foggy_img = torch.clamp(foggy_t, 0.0, 1.0).cpu().numpy()
@@ -1070,6 +1089,7 @@ class FogTransform(Transform):
                             estimated_airlight,
                             torch_gen,
                             sample_id=sample.get("id"),
+                            intrinsics=intrinsics,
                         )
                     )
                     foggy_img = torch.clamp(foggy_t, 0.0, 1.0).cpu().numpy()

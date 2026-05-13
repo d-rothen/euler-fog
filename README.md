@@ -84,7 +84,7 @@ starting at index 10 with stride 5.
 
 | Transform | `modalities` | `hierarchical_modalities` |
 |---|---|---|
-| `fog` | `rgb`, `depth`, `semantic_segmentation` | — (intrinsics optional) |
+| `fog` | `rgb`, `depth`, `semantic_segmentation` | `intrinsics` optional, used for radial depth and camera-profile optics when present |
 | `sky-depth` | `depth`, `semantic_segmentation` | — |
 | `radial` | `depth` | `intrinsics` |
 
@@ -137,6 +137,7 @@ Controls the fog simulation.
   "device": "cpu",
   "gpu_batch_size": 4,
   "capture": { "preset": "camera" },
+  "camera_profile": "dashcam",
   "augmentations": { ... },
   "selection": { ... },
   "models": { ... }
@@ -153,6 +154,8 @@ Controls the fog simulation.
 | `device` | `"cpu"`, `"cuda"`, `"mps"`, or `"gpu"` (alias for cuda). |
 | `gpu_batch_size` | Batch size when running on GPU. Uniform-model samples are batched; heterogeneous samples are processed individually. |
 | `capture` / `capture_artifacts` | Optional post-fog camera artifact pipeline. Omit it or set `{"stages": []}` for the legacy no-op path. Set `true`, `{"preset": "camera"}`, or a custom `stages` list to enable optics, raw sensor, ISP, and compression artifacts. |
+| `camera_profile` | Optional named or inline camera profile whose stage defaults are merged into the capture stack before per-stage overrides. Built-ins are `"default"`, `"generic"`, `"dashcam"`, and `"low_light_fog"`. |
+| `camera_profiles` | Optional map of project-specific named profiles. Use this for calibrated lens, sensor, ISP, and transport settings. |
 | `augmentations` | Optional stepped augmentation set. When present, every input sample produces every configured augmentation and uses the file-id hierarchy output layout described below. |
 
 ### Processing Pipeline
@@ -186,6 +189,38 @@ or equivalently:
 For tighter control, provide explicit stages in camera order:
 
 ```json
+"camera_profiles": {
+  "real_drive_front": {
+    "optics": {
+      "lens_distortion": -0.012,
+      "vignetting_strength": 0.18,
+      "windshield_haze": {"enabled": true, "probability": 0.55}
+    },
+    "sensor": {
+      "bayer_pattern": "RGGB",
+      "iso": {"dist": "choice", "values": [200, 400, 800]},
+      "base_iso": 100,
+      "full_well_electrons": [14000, 12000, 13000],
+      "read_noise_electrons": {"dist": "uniform", "min": 2.0, "max": 6.0},
+      "black_level": [0.003, 0.0035, 0.003],
+      "white_level": [1.0, 0.995, 1.0],
+      "adc_bit_depth": 12,
+      "post_demosaic_bit_depth": 12
+    },
+    "isp": {
+      "tone_map": "reinhard",
+      "gamma": "srgb",
+      "denoise_sigma": 0.2,
+      "sharpen_amount": 0.2,
+      "saturation": 0.9
+    },
+    "transport": {
+      "jpeg": {"enabled": true, "quality": {"dist": "uniform", "min": 65, "max": 92}},
+      "bit_depth": 8
+    }
+  }
+},
+"camera_profile": "real_drive_front",
 "capture": {
   "stages": [
     {
@@ -199,10 +234,7 @@ For tighter control, provide explicit stages in camera order:
       "type": "sensor",
       "input_space": "srgb",
       "exposure_gain": {"dist": "uniform", "min": 0.85, "max": 1.2},
-      "shot_noise_electrons": {"dist": "uniform", "min": 400, "max": 1600},
-      "read_noise_sigma": {"dist": "uniform", "min": 0.001, "max": 0.006},
-      "row_noise_sigma": 0.003,
-      "bayer_pattern": "RGGB"
+      "row_noise_sigma": 0.003
     },
     {
       "type": "isp",

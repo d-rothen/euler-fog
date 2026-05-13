@@ -571,6 +571,127 @@ def test_capture_custom_stage_chain_can_resize_and_quantize() -> None:
     np.testing.assert_allclose(result, np.round(result * 15.0) / 15.0)
 
 
+def test_capture_camera_profile_supplies_stage_defaults() -> None:
+    pipeline = CaptureArtifactPipeline.from_config(
+        {
+            "camera_profiles": {
+                "unit_test": {
+                    "sensor": {
+                        "iso": 800.0,
+                        "bayer_pattern": "RGGB",
+                        "read_noise_electrons": 3.0,
+                    }
+                }
+            },
+            "camera_profile": "unit_test",
+            "capture": {"stages": [{"type": "sensor", "iso": 400.0}]},
+        }
+    )
+
+    assert len(pipeline.stages) == 1
+    assert pipeline.stages[0].config["iso"] == 400.0
+    assert pipeline.stages[0].config["bayer_pattern"] == "RGGB"
+    assert pipeline.stages[0].config["read_noise_electrons"] == 3.0
+
+
+def test_optics_stage_uses_intrinsics_principal_point() -> None:
+    pipeline = CaptureArtifactPipeline.from_config(
+        {
+            "capture": {
+                "stages": [
+                    {
+                        "type": "optics",
+                        "lens_distortion": 0.25,
+                        "blur_sigma": 0.0,
+                        "chromatic_aberration_px": 0.0,
+                        "motion_blur": {"enabled": False},
+                        "bloom": {"enabled": False},
+                        "vignetting_strength": 0.0,
+                        "veiling_glare_strength": 0.0,
+                        "windshield_haze": {"enabled": False},
+                        "droplets": {"enabled": False},
+                    }
+                ]
+            }
+        }
+    )
+    x = np.linspace(0.0, 1.0, 18, dtype=np.float32)
+    y = np.linspace(0.0, 1.0, 14, dtype=np.float32)
+    image = np.dstack(
+        [
+            np.broadcast_to(x, (14, 18)),
+            np.broadcast_to(y[:, None], (14, 18)),
+            np.full((14, 18), 0.4, dtype=np.float32),
+        ]
+    )
+    centered_k = np.array(
+        [[12.0, 0.0, 8.5], [0.0, 12.0, 6.5], [0.0, 0.0, 1.0]],
+        dtype=np.float32,
+    )
+    shifted_k = np.array(
+        [[12.0, 0.0, 3.0], [0.0, 12.0, 10.0], [0.0, 0.0, 1.0]],
+        dtype=np.float32,
+    )
+
+    centered = pipeline.apply_np(
+        image,
+        CaptureContext(rng=np.random.default_rng(11), intrinsics=centered_k),
+    )
+    shifted = pipeline.apply_np(
+        image,
+        CaptureContext(rng=np.random.default_rng(11), intrinsics=shifted_k),
+    )
+
+    assert not np.allclose(centered, shifted)
+
+
+def test_sensor_stage_supports_raw_and_post_demosaic_quantization() -> None:
+    pipeline = CaptureArtifactPipeline.from_config(
+        {
+            "capture": {
+                "stages": [
+                    {
+                        "type": "sensor",
+                        "input_space": "linear",
+                        "exposure_gain": 1.0,
+                        "white_balance": [1.0, 1.0, 1.0],
+                        "white_balance_jitter": 0.0,
+                        "channel_gain_sigma": 0.0,
+                        "camera_matrix": [
+                            [1.0, 0.0, 0.0],
+                            [0.0, 1.0, 0.0],
+                            [0.0, 0.0, 1.0],
+                        ],
+                        "bayer_pattern": "RGGB",
+                        "shot_noise_electrons": 0.0,
+                        "read_noise_electrons": 0.0,
+                        "fixed_pattern_sigma": 0.0,
+                        "row_noise_sigma": 0.0,
+                        "column_noise_sigma": 0.0,
+                        "black_level": [0.0, 0.0, 0.0],
+                        "black_level_jitter": 0.0,
+                        "white_level": [1.0, 1.0, 1.0],
+                        "white_level_jitter": 0.0,
+                        "adc_bit_depth": 4,
+                        "post_demosaic_bit_depth": 4,
+                        "hot_pixel_probability": 0.0,
+                        "dead_pixel_probability": 0.0,
+                    }
+                ]
+            }
+        }
+    )
+    image = np.full((8, 10, 3), 0.41, dtype=np.float32)
+
+    result = pipeline.apply_np(
+        image,
+        CaptureContext(rng=np.random.default_rng(5)),
+    )
+
+    assert result.shape == image.shape
+    np.testing.assert_allclose(result, np.round(result * 15.0) / 15.0)
+
+
 def test_apply_model_returns_full_size_maps_for_uniform() -> None:
     """Sanity-check the broadcast logic on the model layer."""
     from euler_preprocess.fog.models import apply_model

@@ -9,6 +9,7 @@
   "capture": {
     "preset": "camera"
   },
+  "camera_profile": "dashcam",
   "selection": {
     "mode": "weighted",
     "weights": {

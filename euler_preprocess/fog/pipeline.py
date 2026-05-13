@@ -100,6 +100,7 @@ class FogProcessingPipeline:
         model_cfg: dict,
         rng: np.random.Generator,
         sample_id: str | None,
+        intrinsics: np.ndarray | None = None,
         airlight_method: str | None = None,
     ) -> FogPipelineResult:
         result = self.render_scene_np(
@@ -114,7 +115,11 @@ class FogProcessingPipeline:
         )
         return self.apply_capture_np(
             result,
-            context=CaptureContext(sample_id=sample_id, rng=rng),
+            context=CaptureContext(
+                sample_id=sample_id,
+                rng=rng,
+                intrinsics=intrinsics,
+            ),
         )
 
     def apply_capture_np(

@@ -24,6 +24,7 @@ class CaptureContext:
     sample_id: str | None = None
     rng: Any | None = None
     device: Any | None = None
+    intrinsics: Any | None = None
     attributes: Mapping[str, Any] = field(default_factory=dict)
 
 
@@ -144,10 +145,12 @@ class OpticsStage(ConfiguredCaptureStage):
         rng: np.random.Generator,
     ) -> np.ndarray:
         img = image
+        intrinsics = _context_intrinsics(context)
 
         distortion = _sample_float(self.config, "lens_distortion", 0.0, rng)
         if abs(distortion) > 1e-5:
-            img = _lens_distort_np(img, distortion)
+            k2 = _sample_float(self.config, "lens_distortion_k2", 0.0, rng)
+            img = _lens_distort_np(img, distortion, k2, intrinsics)
 
         aberration_px = _sample_float(
             self.config,
@@ -156,7 +159,7 @@ class OpticsStage(ConfiguredCaptureStage):
             rng,
         )
         if aberration_px > 1e-4:
-            img = _chromatic_aberration_np(img, aberration_px)
+            img = _chromatic_aberration_np(img, aberration_px, intrinsics)
 
         blur_sigma = _sample_float(self.config, "blur_sigma", 0.0, rng)
         if blur_sigma > 1e-4:
@@ -181,9 +184,14 @@ class OpticsStage(ConfiguredCaptureStage):
         vignette = _sample_float(self.config, "vignetting_strength", 0.0, rng)
         if vignette > 1e-5:
             radius = _sample_float(self.config, "vignetting_radius", 1.15, rng)
-            img = img * _vignette_mask(img.shape[0], img.shape[1], vignette, radius)[
-                ..., None
-            ]
+            mask = _vignette_mask(
+                img.shape[0],
+                img.shape[1],
+                vignette,
+                radius,
+                intrinsics,
+            )
+            img = img * mask[..., None]
 
         windshield_cfg = _config_block(self.config, "windshield_haze")
         if _block_enabled(windshield_cfg, rng):
@@ -239,12 +247,20 @@ class SensorStage(ConfiguredCaptureStage):
         "camera_matrix": [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
         "clip": 1.0,
         "bayer_pattern": {"dist": "choice", "values": ["RGGB", "BGGR", "GRBG", "GBRG"]},
-        "shot_noise_electrons": {"dist": "uniform", "min": 350.0, "max": 1800.0},
-        "read_noise_sigma": {"dist": "uniform", "min": 0.001, "max": 0.008},
+        "iso": {"dist": "choice", "values": [100.0, 200.0, 400.0, 800.0]},
+        "base_iso": 100.0,
+        "full_well_electrons": {"dist": "uniform", "min": 8000.0, "max": 24000.0},
+        "read_noise_electrons": {"dist": "uniform", "min": 1.5, "max": 7.0},
+        "read_noise_sigma": None,
         "fixed_pattern_sigma": {"dist": "uniform", "min": 0.0, "max": 0.004},
         "row_noise_sigma": {"dist": "uniform", "min": 0.0, "max": 0.006},
         "column_noise_sigma": {"dist": "uniform", "min": 0.0, "max": 0.003},
-        "black_level": {"dist": "uniform", "min": 0.0, "max": 0.01},
+        "black_level": [0.003, 0.003, 0.003],
+        "black_level_jitter": {"dist": "uniform", "min": 0.0, "max": 0.002},
+        "white_level": [1.0, 1.0, 1.0],
+        "white_level_jitter": {"dist": "uniform", "min": 0.0, "max": 0.004},
+        "adc_bit_depth": 12,
+        "post_demosaic_bit_depth": 12,
         "hot_pixel_probability": 0.00002,
         "dead_pixel_probability": 0.00001,
         "demosaic": True,
@@ -281,21 +297,60 @@ class SensorStage(ConfiguredCaptureStage):
         img = np.clip(img, 0.0, max(white_clip, 1e-6)) / max(white_clip, 1e-6)
 
         pattern = str(_sample_any(self.config.get("bayer_pattern", "RGGB"), rng)).upper()
-        raw = _bayer_mosaic_np(img, pattern)
+        raw_signal = _clip01(_bayer_mosaic_np(img, pattern))
 
-        black_level = _sample_float(self.config, "black_level", 0.0, rng)
-        if black_level > 0.0:
-            raw = raw + black_level
+        black_levels = _sample_sensor_levels(self.config, "black_level", rng)
+        black_levels += rng.normal(
+            0.0,
+            _sample_float(self.config, "black_level_jitter", 0.0, rng),
+            size=3,
+        ).astype(np.float32)
+        black_levels = np.clip(black_levels, 0.0, 0.95)
 
-        electrons = _sample_float(self.config, "shot_noise_electrons", 0.0, rng)
-        if electrons > 0.0:
-            raw = rng.poisson(np.clip(raw, 0.0, None) * electrons).astype(
-                np.float32
-            ) / electrons
+        white_levels = _sample_sensor_levels(self.config, "white_level", rng)
+        white_levels += rng.normal(
+            0.0,
+            _sample_float(self.config, "white_level_jitter", 0.0, rng),
+            size=3,
+        ).astype(np.float32)
+        white_levels = np.clip(white_levels, 0.05, 1.0)
 
-        read_sigma = _sample_float(self.config, "read_noise_sigma", 0.0, rng)
-        if read_sigma > 0.0:
-            raw = raw + rng.normal(0.0, read_sigma, raw.shape).astype(np.float32)
+        black_map = _mosaic_channel_values(raw_signal.shape, pattern, black_levels)
+        white_map = _mosaic_channel_values(raw_signal.shape, pattern, white_levels)
+        white_map = np.maximum(white_map, black_map + 1e-4)
+        raw_range = white_map - black_map
+
+        electron_capacity = _resolve_electron_capacity(
+            raw_signal.shape,
+            pattern,
+            self.config,
+            rng,
+        )
+        noisy_signal = raw_signal
+        if np.any(electron_capacity > 0.0):
+            noisy_signal = rng.poisson(
+                np.clip(raw_signal, 0.0, None) * electron_capacity
+            ).astype(np.float32) / np.maximum(electron_capacity, 1e-6)
+
+        read_sigma_cfg = self.config.get("read_noise_sigma")
+        if read_sigma_cfg is not None:
+            read_sigma = _sample_float(self.config, "read_noise_sigma", 0.0, rng)
+        else:
+            read_electrons = _sample_float(
+                self.config,
+                "read_noise_electrons",
+                0.0,
+                rng,
+            )
+            read_sigma = read_electrons / np.maximum(electron_capacity, 1e-6)
+        if np.any(np.asarray(read_sigma) > 0.0):
+            noisy_signal = noisy_signal + rng.normal(
+                0.0,
+                1.0,
+                raw_signal.shape,
+            ).astype(np.float32) * read_sigma
+
+        raw = black_map + noisy_signal * raw_range
 
         fixed_sigma = _sample_float(self.config, "fixed_pattern_sigma", 0.0, rng)
         if fixed_sigma > 0.0:
@@ -313,15 +368,45 @@ class SensorStage(ConfiguredCaptureStage):
                 np.float32
             )
 
-        raw = _apply_bad_pixels_np(raw, self.config, rng)
+        raw = _apply_bad_pixels_np(
+            raw,
+            self.config,
+            rng,
+            hot_value=white_map,
+            dead_value=black_map,
+        )
+        raw = np.clip(raw, black_map, white_map)
 
-        if black_level > 0.0:
-            raw = raw - black_level
+        bit_depth_key = (
+            "raw_bit_depth"
+            if self.config.get("raw_bit_depth") is not None
+            else "adc_bit_depth"
+        )
+        adc_bit_depth = int(round(_sample_float(self.config, bit_depth_key, 12.0, rng)))
+        if adc_bit_depth > 0:
+            raw = _quantize_np(raw, adc_bit_depth)
+
+        raw = (raw - black_map) / raw_range
         raw = _clip01(raw)
 
         if _bool_value(self.config.get("demosaic", True)):
-            return _clip01(_demosaic_bilinear_np(raw, pattern))
-        return np.repeat(raw[..., None], 3, axis=-1).astype(np.float32, copy=False)
+            demosaiced = _clip01(_demosaic_bilinear_np(raw, pattern))
+            post_bits = int(
+                round(
+                    _sample_float(
+                        self.config,
+                        "post_demosaic_bit_depth",
+                        0.0,
+                        rng,
+                    )
+                )
+            )
+            if post_bits > 0:
+                demosaiced = _quantize_np(demosaiced, post_bits)
+            return demosaiced
+
+        raw_rgb = np.repeat(raw[..., None], 3, axis=-1).astype(np.float32, copy=False)
+        return raw_rgb
 
 
 class ISPStage(ConfiguredCaptureStage):
@@ -468,6 +553,7 @@ class CaptureArtifactPipeline:
             raise ValueError("capture must be a boolean, object, or stage list")
         if raw.get("enabled", True) is False:
             return cls()
+        camera_profile = _resolve_camera_profile(config, raw)
 
         stages = raw.get("stages")
         if stages is None:
@@ -482,7 +568,7 @@ class CaptureArtifactPipeline:
 
         parsed: list[CaptureArtifactStage] = []
         for entry in stages:
-            parsed.extend(_build_stage(entry))
+            parsed.extend(_build_stage(entry, camera_profile=camera_profile))
         return cls(tuple(parsed))
 
     def apply_np(self, image, context: CaptureContext):
@@ -523,6 +609,56 @@ _STAGE_TYPES = {
     "compression": TransportStage,
 }
 
+_CANONICAL_STAGE_TYPES = {
+    "lens": "optics",
+    "windshield": "optics",
+    "raw_sensor": "sensor",
+    "sensor_raw": "sensor",
+    "bayer": "sensor",
+    "noise": "sensor",
+    "compression": "transport",
+}
+
+_BUILTIN_CAMERA_PROFILES: dict[str, dict[str, Any]] = {
+    "default": {},
+    "generic": {},
+    "dashcam": {
+        "optics": {
+            "windshield_haze": {"enabled": True, "probability": 0.5},
+            "vignetting_strength": {"dist": "uniform", "min": 0.08, "max": 0.24},
+        },
+        "sensor": {
+            "iso": {"dist": "choice", "values": [200.0, 400.0, 800.0]},
+            "full_well_electrons": {
+                "dist": "uniform",
+                "min": 6000.0,
+                "max": 18000.0,
+            },
+        },
+        "transport": {
+            "jpeg": {
+                "enabled": True,
+                "quality": {"dist": "uniform", "min": 58.0, "max": 88.0},
+            }
+        },
+    },
+    "low_light_fog": {
+        "optics": {
+            "bloom": {"strength": {"dist": "uniform", "min": 0.08, "max": 0.22}},
+            "veiling_glare_strength": {"dist": "uniform", "min": 0.02, "max": 0.08},
+        },
+        "sensor": {
+            "iso": {"dist": "choice", "values": [800.0, 1600.0, 3200.0]},
+            "read_noise_electrons": {"dist": "uniform", "min": 3.0, "max": 10.0},
+            "row_noise_sigma": {"dist": "uniform", "min": 0.002, "max": 0.009},
+        },
+        "isp": {
+            "denoise_sigma": {"dist": "uniform", "min": 0.25, "max": 0.8},
+            "sharpen_amount": {"dist": "uniform", "min": 0.08, "max": 0.28},
+        },
+    },
+}
+
 
 _CAMERA_PRESET = (
     {"type": "optics"},
@@ -541,7 +677,11 @@ def _preset_stages(name: str) -> tuple[dict[str, Any], ...]:
     raise ValueError(f"Unsupported capture preset: {name}")
 
 
-def _build_stage(entry: Any) -> list[CaptureArtifactStage]:
+def _build_stage(
+    entry: Any,
+    *,
+    camera_profile: Mapping[str, Any] | None = None,
+) -> list[CaptureArtifactStage]:
     if isinstance(entry, str):
         stage_type = entry
         cfg: dict[str, Any] = {}
@@ -555,13 +695,78 @@ def _build_stage(entry: Any) -> list[CaptureArtifactStage]:
     if normalized in {"camera", "camera_stack", "foggy_camera", "realistic_camera"}:
         stages = []
         for preset_entry in _preset_stages(normalized):
-            stages.extend(_build_stage(preset_entry))
+            stages.extend(_build_stage(preset_entry, camera_profile=camera_profile))
         return stages
 
     stage_cls = _STAGE_TYPES.get(normalized)
     if stage_cls is None:
         raise ValueError(f"Unsupported capture artifact stage: {stage_type}")
+    profile_cfg = _profile_stage_config(camera_profile or {}, normalized)
+    cfg = deep_merge(profile_cfg, cfg)
     return [stage_cls(cfg)]
+
+
+def _resolve_camera_profile(
+    config: Mapping[str, Any],
+    capture_config: Mapping[str, Any],
+) -> dict[str, Any]:
+    profiles = {
+        name: dict(profile)
+        for name, profile in _BUILTIN_CAMERA_PROFILES.items()
+    }
+    configured_profiles = config.get("camera_profiles", {})
+    if configured_profiles is not None:
+        if not isinstance(configured_profiles, dict):
+            raise ValueError("camera_profiles must be an object")
+        profiles = deep_merge(profiles, configured_profiles)
+
+    profile: dict[str, Any] = {}
+    root_profile = config.get("camera_profile")
+    if root_profile is not None:
+        profile = deep_merge(profile, _resolve_profile_ref(root_profile, profiles))
+
+    capture_profile = capture_config.get("camera_profile")
+    if capture_profile is not None:
+        profile = deep_merge(profile, _resolve_profile_ref(capture_profile, profiles))
+
+    return profile
+
+
+def _resolve_profile_ref(
+    value: Any,
+    profiles: Mapping[str, Any],
+) -> dict[str, Any]:
+    if isinstance(value, str):
+        if value not in profiles:
+            known = ", ".join(sorted(profiles))
+            raise ValueError(f"Unknown camera_profile '{value}'. Known: {known}")
+        profile = profiles[value]
+        if not isinstance(profile, dict):
+            raise ValueError(f"camera_profiles.{value} must be an object")
+        return dict(profile)
+
+    if isinstance(value, dict):
+        inline = dict(value)
+        name = inline.pop("name", None)
+        base = {}
+        if name is not None:
+            base = _resolve_profile_ref(str(name), profiles)
+        return deep_merge(base, inline)
+
+    raise ValueError("camera_profile must be a string or object")
+
+
+def _profile_stage_config(
+    camera_profile: Mapping[str, Any],
+    stage_type: str,
+) -> dict[str, Any]:
+    canonical = _CANONICAL_STAGE_TYPES.get(stage_type, stage_type)
+    raw = camera_profile.get(canonical, {})
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ValueError(f"camera_profile.{canonical} must be an object")
+    return dict(raw)
 
 
 def _stack_like(reference, images: list[Any]):
@@ -578,6 +783,19 @@ def _rng(context: CaptureContext) -> np.random.Generator:
     if isinstance(context.rng, np.random.Generator):
         return context.rng
     return np.random.default_rng()
+
+
+def _context_intrinsics(context: CaptureContext) -> np.ndarray | None:
+    if context.intrinsics is None:
+        return None
+    intrinsics = np.asarray(context.intrinsics, dtype=np.float32)
+    if intrinsics.shape != (3, 3):
+        return None
+    fx = float(intrinsics[0, 0])
+    fy = float(intrinsics[1, 1])
+    if abs(fx) < 1e-6 or abs(fy) < 1e-6:
+        return None
+    return intrinsics
 
 
 def _as_float_rgb(image) -> np.ndarray:
@@ -649,6 +867,42 @@ def _sample_matrix(spec: Any, rng: np.random.Generator) -> np.ndarray:
     if arr.shape != (3, 3):
         raise ValueError("Color matrix must have shape 3x3")
     return arr
+
+
+def _sample_sensor_levels(
+    config: Mapping[str, Any],
+    key: str,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    return _sample_triplet(config.get(key, [1.0, 1.0, 1.0]), rng)
+
+
+def _resolve_electron_capacity(
+    shape: tuple[int, int],
+    pattern: str,
+    config: Mapping[str, Any],
+    rng: np.random.Generator,
+) -> np.ndarray:
+    legacy = config.get("shot_noise_electrons")
+    if legacy is not None:
+        electrons = float(sample_value(legacy, rng))
+        if electrons <= 0.0:
+            return np.zeros(shape, dtype=np.float32)
+        return np.full(shape, electrons, dtype=np.float32)
+
+    iso = max(_sample_float(config, "iso", 100.0, rng), 1e-6)
+    base_iso = max(_sample_float(config, "base_iso", 100.0, rng), 1e-6)
+    iso_gain = max(iso / base_iso, 1e-6)
+    full_well = _sample_triplet(
+        config.get("full_well_electrons", [12000.0, 12000.0, 12000.0]),
+        rng,
+    )
+    full_well_map = _mosaic_channel_values(shape, pattern, full_well)
+    capacity = full_well_map / iso_gain
+    return np.where(capacity > 0.0, np.maximum(capacity, 1.0), 0.0).astype(
+        np.float32,
+        copy=False,
+    )
 
 
 def _bool_value(value: Any) -> bool:
@@ -761,6 +1015,24 @@ def _coordinate_grid(height: int, width: int) -> tuple[np.ndarray, np.ndarray]:
     return yy, xx
 
 
+def _camera_geometry(
+    height: int,
+    width: int,
+    intrinsics: np.ndarray | None,
+) -> tuple[float, float, float, float]:
+    if intrinsics is not None:
+        fx = max(abs(float(intrinsics[0, 0])), 1e-6)
+        fy = max(abs(float(intrinsics[1, 1])), 1e-6)
+        cx = float(intrinsics[0, 2])
+        cy = float(intrinsics[1, 2])
+        return fx, fy, cx, cy
+    fx = max((width - 1) / 2.0, 1e-6)
+    fy = max((height - 1) / 2.0, 1e-6)
+    cx = (width - 1) / 2.0
+    cy = (height - 1) / 2.0
+    return fx, fy, cx, cy
+
+
 def _sample_bilinear_np(
     image: np.ndarray,
     y: np.ndarray,
@@ -788,25 +1060,32 @@ def _sample_bilinear_np(
     return (top * (1.0 - wy3) + bottom * wy3).astype(np.float32, copy=False)
 
 
-def _lens_distort_np(image: np.ndarray, strength: float) -> np.ndarray:
+def _lens_distort_np(
+    image: np.ndarray,
+    k1: float,
+    k2: float,
+    intrinsics: np.ndarray | None = None,
+) -> np.ndarray:
     height, width = image.shape[:2]
     yy, xx = _coordinate_grid(height, width)
-    cx = max((width - 1) / 2.0, 1e-6)
-    cy = max((height - 1) / 2.0, 1e-6)
-    nx = (xx - cx) / cx
-    ny = (yy - cy) / cy
+    fx, fy, cx, cy = _camera_geometry(height, width, intrinsics)
+    nx = (xx - cx) / fx
+    ny = (yy - cy) / fy
     r2 = nx * nx + ny * ny
-    scale = 1.0 + float(strength) * r2
-    src_x = cx + nx * scale * cx
-    src_y = cy + ny * scale * cy
+    scale = 1.0 + float(k1) * r2 + float(k2) * r2 * r2
+    src_x = cx + nx * scale * fx
+    src_y = cy + ny * scale * fy
     return _sample_bilinear_np(image, src_y, src_x)
 
 
-def _chromatic_aberration_np(image: np.ndarray, amount_px: float) -> np.ndarray:
+def _chromatic_aberration_np(
+    image: np.ndarray,
+    amount_px: float,
+    intrinsics: np.ndarray | None = None,
+) -> np.ndarray:
     height, width = image.shape[:2]
     yy, xx = _coordinate_grid(height, width)
-    cx = (width - 1) / 2.0
-    cy = (height - 1) / 2.0
+    _, _, cx, cy = _camera_geometry(height, width, intrinsics)
     dx = xx - cx
     dy = yy - cy
     radius = np.sqrt(dx * dx + dy * dy)
@@ -866,12 +1145,12 @@ def _vignette_mask(
     width: int,
     strength: float,
     radius: float,
+    intrinsics: np.ndarray | None = None,
 ) -> np.ndarray:
     yy, xx = _coordinate_grid(height, width)
-    cx = max((width - 1) / 2.0, 1e-6)
-    cy = max((height - 1) / 2.0, 1e-6)
-    nx = (xx - cx) / cx
-    ny = (yy - cy) / cy
+    fx, fy, cx, cy = _camera_geometry(height, width, intrinsics)
+    nx = (xx - cx) / fx
+    ny = (yy - cy) / fy
     r = np.sqrt(nx * nx + ny * ny) / max(float(radius), 1e-6)
     mask = 1.0 - float(strength) * np.clip(r * r, 0.0, 1.0)
     return np.clip(mask, 0.0, 1.0).astype(np.float32)
@@ -961,6 +1240,16 @@ def _bayer_mosaic_np(image: np.ndarray, pattern: str) -> np.ndarray:
     return np.sum(image * masks.astype(np.float32), axis=-1).astype(np.float32)
 
 
+def _mosaic_channel_values(
+    shape: tuple[int, int],
+    pattern: str,
+    values: np.ndarray,
+) -> np.ndarray:
+    height, width = shape
+    masks = _bayer_masks(height, width, pattern)
+    return np.sum(masks.astype(np.float32) * values.reshape(1, 1, 3), axis=-1)
+
+
 def _demosaic_bilinear_np(raw: np.ndarray, pattern: str) -> np.ndarray:
     masks = _bayer_masks(raw.shape[0], raw.shape[1], pattern).astype(np.float32)
     kernel = np.array(
@@ -980,6 +1269,9 @@ def _apply_bad_pixels_np(
     raw: np.ndarray,
     config: Mapping[str, Any],
     rng: np.random.Generator,
+    *,
+    hot_value: float | np.ndarray = 1.0,
+    dead_value: float | np.ndarray = 0.0,
 ) -> np.ndarray:
     out = raw
     hot_prob = _sample_float(config, "hot_pixel_probability", 0.0, rng)
@@ -987,13 +1279,15 @@ def _apply_bad_pixels_np(
         mask = rng.random(raw.shape) < hot_prob
         if mask.any():
             out = out.copy()
-            out[mask] = 1.0
+            hot_arr = np.asarray(hot_value, dtype=np.float32)
+            out[mask] = hot_arr[mask] if hot_arr.shape else float(hot_arr)
     dead_prob = _sample_float(config, "dead_pixel_probability", 0.0, rng)
     if dead_prob > 0.0:
         mask = rng.random(raw.shape) < dead_prob
         if mask.any():
             out = out.copy()
-            out[mask] = 0.0
+            dead_arr = np.asarray(dead_value, dtype=np.float32)
+            out[mask] = dead_arr[mask] if dead_arr.shape else float(dead_arr)
     return out
 
 
