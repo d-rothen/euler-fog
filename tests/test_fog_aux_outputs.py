@@ -579,9 +579,10 @@ def test_capture_stage_condition_profiles_override_stage_config() -> None:
                     {
                         "type": "exposure",
                         "gain": 1.0,
+                        "condition_profile": "selected",
                         "condition_profiles": [
-                            {"name": "selected", "weight": 1.0, "gain": 0.5},
-                            {"name": "unused", "weight": 0.0, "gain": 2.0},
+                            {"name": "selected", "weight": 0.0, "gain": 0.5},
+                            {"name": "unused", "weight": 1.0, "gain": 2.0},
                         ],
                     }
                 ]
@@ -596,6 +597,106 @@ def test_capture_stage_condition_profiles_override_stage_config() -> None:
     )
 
     np.testing.assert_allclose(result, 0.4)
+
+
+def test_capture_overrides_can_force_named_condition_profile() -> None:
+    pipeline = CaptureArtifactPipeline.from_config(
+        {
+            "capture": {
+                "stages": [
+                    {
+                        "type": "exposure",
+                        "gain": 1.0,
+                        "condition_profiles": [
+                            {"name": "clean", "weight": 1.0, "gain": 1.0},
+                            {"name": "dark", "weight": 0.0, "gain": 0.25},
+                        ],
+                    }
+                ]
+            },
+            "capture_overrides": {
+                "exposure": {
+                    "condition_profile": "dark",
+                }
+            },
+        }
+    )
+    image = np.full((2, 3, 3), 0.8, dtype=np.float32)
+
+    result = pipeline.apply_np(
+        image,
+        context=CaptureContext(rng=np.random.default_rng(7)),
+    )
+
+    np.testing.assert_allclose(result, 0.2)
+
+
+def test_scenario_profile_correlates_model_and_capture_overrides(
+    tmp_path: Path,
+) -> None:
+    cfg = {
+        "airlight": "from_sky",
+        "device": "cpu",
+        "seed": 7,
+        "contrast_threshold": 0.05,
+        "capture": {
+            "stages": [
+                {
+                    "type": "exposure",
+                    "gain": 1.0,
+                    "condition_profiles": [
+                        {"name": "clean", "weight": 1.0, "gain": 1.0},
+                        {"name": "dark", "weight": 0.0, "gain": 0.25},
+                    ],
+                }
+            ]
+        },
+        "scenario_profiles": [
+            {
+                "name": "underexposed_dense",
+                "weight": 1.0,
+                "model": "uniform",
+                "models": {
+                    "uniform": {
+                        "visibility_m": {"dist": "constant", "value": 20.0},
+                        "atmospheric_light": [0.2, 0.2, 0.2],
+                    }
+                },
+                "capture_overrides": {
+                    "exposure": {
+                        "condition_profile": "dark",
+                    }
+                },
+            }
+        ],
+    }
+    config_path = tmp_path / "scenario_config.json"
+    config_path.write_text(json.dumps(cfg))
+    transform = FogTransform(
+        config_path=str(config_path),
+        out_path=str(tmp_path / "out"),
+    )
+
+    plan = transform._resolve_render_plan(np.random.default_rng(3))
+    assert plan.scenario_name == "underexposed_dense"
+    assert plan.model_name == "uniform"
+    assert plan.model_cfg["visibility_m"]["value"] == 20.0
+
+    rgb = np.full((4, 5, 3), 0.8, dtype=np.float32)
+    depth = np.zeros((4, 5), dtype=np.float32)
+    sky_mask = np.ones((4, 5), dtype=bool)
+    result = transform.pipeline.process_np(
+        rgb=rgb,
+        depth_m=depth,
+        sky_mask=sky_mask,
+        model_name=plan.model_name,
+        model_cfg=plan.model_cfg,
+        rng=np.random.default_rng(3),
+        sample_id="sample",
+        capture_artifacts=plan.capture_artifacts,
+    )
+
+    np.testing.assert_allclose(result.rgb, 0.2)
 
 
 def test_capture_camera_profile_supplies_stage_defaults() -> None:

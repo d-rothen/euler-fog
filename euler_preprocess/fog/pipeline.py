@@ -102,6 +102,7 @@ class FogProcessingPipeline:
         sample_id: str | None,
         intrinsics: np.ndarray | None = None,
         airlight_method: str | None = None,
+        capture_artifacts: CaptureArtifactPipeline | None = None,
     ) -> FogPipelineResult:
         result = self.render_scene_np(
             rgb=rgb,
@@ -122,6 +123,7 @@ class FogProcessingPipeline:
                 depth_m=depth_m,
                 k_map=result.k_map,
             ),
+            capture_artifacts=capture_artifacts,
         )
 
     def apply_capture_np(
@@ -129,8 +131,10 @@ class FogProcessingPipeline:
         result: FogPipelineResult,
         *,
         context: CaptureContext,
+        capture_artifacts: CaptureArtifactPipeline | None = None,
     ) -> FogPipelineResult:
-        rgb = self.capture_artifacts.apply_np(result.rgb, context)
+        artifacts = capture_artifacts or self.capture_artifacts
+        rgb = artifacts.apply_np(result.rgb, context)
         return replace(result, rgb=rgb)
 
     def apply_capture_torch(
@@ -138,8 +142,10 @@ class FogProcessingPipeline:
         result: FogPipelineResult,
         *,
         context: CaptureContext,
+        capture_artifacts: CaptureArtifactPipeline | None = None,
     ) -> FogPipelineResult:
-        rgb = self.capture_artifacts.apply_torch(result.rgb, context)
+        artifacts = capture_artifacts or self.capture_artifacts
+        rgb = artifacts.apply_torch(result.rgb, context)
         return replace(result, rgb=rgb)
 
     def apply_capture_torch_batch(
@@ -147,5 +153,7 @@ class FogProcessingPipeline:
         rgb_batch,
         *,
         contexts: tuple[CaptureContext, ...],
+        capture_artifacts: CaptureArtifactPipeline | None = None,
     ):
-        return self.capture_artifacts.apply_torch_batch(rgb_batch, contexts)
+        artifacts = capture_artifacts or self.capture_artifacts
+        return artifacts.apply_torch_batch(rgb_batch, contexts)

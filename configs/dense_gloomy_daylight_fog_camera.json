@@ -454,6 +454,475 @@
   "capture": {
     "preset": "camera"
   },
+  "scenario_profiles": [
+    {
+      "name": "clear_high_visibility_daylight_reference",
+      "weight": 0.1,
+      "model": "heterogeneous_k_ls",
+      "airlight_method": "dcp_heuristic",
+      "models": {
+        "heterogeneous_k_ls": {
+          "visibility_m": {
+            "dist": "normal",
+            "mean": 155.0,
+            "std": 32.0,
+            "min": 90.0,
+            "max": 240.0
+          },
+          "airlight_dampening": {
+            "min_factor": {
+              "dist": "uniform",
+              "min": 0.62,
+              "max": 0.72
+            },
+            "max_factor": {
+              "dist": "uniform",
+              "min": 0.9,
+              "max": 0.98
+            },
+            "strength": {
+              "dist": "uniform",
+              "min": 0.45,
+              "max": 0.9
+            }
+          },
+          "k_hetero": {
+            "min_factor": 0.86,
+            "max_factor": 1.18,
+            "contrast": 0.25
+          },
+          "ls_hetero": {
+            "min_factor": 0.92,
+            "max_factor": 1.04,
+            "contrast": 0.25,
+            "ls_gradient": {
+              "probability": 0.15,
+              "top_factor": {
+                "dist": "uniform",
+                "min": 1.0,
+                "max": 1.04
+              },
+              "bottom_factor": {
+                "dist": "uniform",
+                "min": 0.96,
+                "max": 1.0
+              },
+              "fog_opacity_weight": 0.25
+            }
+          }
+        }
+      },
+      "capture_overrides": {
+        "sensor": {
+          "condition_profile": "clean_daylight"
+        },
+        "isp": {
+          "denoise_sigma": {
+            "dist": "uniform",
+            "min": 0.04,
+            "max": 0.22
+          },
+          "sharpen_amount": {
+            "dist": "uniform",
+            "min": 0.08,
+            "max": 0.24
+          },
+          "saturation": {
+            "dist": "uniform",
+            "min": 0.72,
+            "max": 0.94
+          }
+        },
+        "transport": {
+          "jpeg": {
+            "quality": {
+              "dist": "uniform",
+              "min": 78.0,
+              "max": 94.0
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "light_haze_soft_overcast",
+      "weight": 0.15,
+      "model": "heterogeneous_k_ls",
+      "airlight_method": "dcp_heuristic",
+      "models": {
+        "heterogeneous_k_ls": {
+          "visibility_m": {
+            "dist": "normal",
+            "mean": 95.0,
+            "std": 20.0,
+            "min": 55.0,
+            "max": 160.0
+          },
+          "airlight_dampening": {
+            "min_factor": {
+              "dist": "uniform",
+              "min": 0.54,
+              "max": 0.64
+            },
+            "max_factor": {
+              "dist": "uniform",
+              "min": 0.84,
+              "max": 0.94
+            },
+            "strength": {
+              "dist": "uniform",
+              "min": 0.7,
+              "max": 1.25
+            }
+          },
+          "k_hetero": {
+            "min_factor": 0.74,
+            "max_factor": 1.36,
+            "contrast": 0.42
+          },
+          "ls_hetero": {
+            "min_factor": 0.84,
+            "max_factor": 1.04,
+            "contrast": 0.38,
+            "ls_gradient": {
+              "probability": 0.35,
+              "top_factor": {
+                "dist": "uniform",
+                "min": 1.01,
+                "max": 1.07
+              },
+              "bottom_factor": {
+                "dist": "uniform",
+                "min": 0.93,
+                "max": 0.99
+              },
+              "fog_opacity_weight": 0.45
+            }
+          }
+        }
+      },
+      "capture_overrides": {
+        "sensor": {
+          "condition_profile": "clean_daylight"
+        },
+        "isp": {
+          "denoise_sigma": {
+            "dist": "uniform",
+            "min": 0.12,
+            "max": 0.38
+          },
+          "sharpen_amount": {
+            "dist": "uniform",
+            "min": 0.08,
+            "max": 0.26
+          },
+          "saturation": {
+            "dist": "uniform",
+            "min": 0.66,
+            "max": 0.86
+          }
+        },
+        "transport": {
+          "jpeg": {
+            "quality": {
+              "dist": "uniform",
+              "min": 72.0,
+              "max": 90.0
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "moderate_gloomy_fog_nominal_camera",
+      "weight": 0.2,
+      "model": "heterogeneous_k_ls",
+      "airlight_method": "dcp_heuristic",
+      "models": {
+        "heterogeneous_k_ls": {
+          "visibility_m": {
+            "dist": "normal",
+            "mean": 62.0,
+            "std": 13.0,
+            "min": 36.0,
+            "max": 98.0
+          },
+          "airlight_dampening": {
+            "min_factor": {
+              "dist": "uniform",
+              "min": 0.42,
+              "max": 0.52
+            },
+            "max_factor": {
+              "dist": "uniform",
+              "min": 0.78,
+              "max": 0.9
+            },
+            "strength": {
+              "dist": "uniform",
+              "min": 0.95,
+              "max": 1.7
+            }
+          },
+          "k_hetero": {
+            "min_factor": 0.68,
+            "max_factor": 1.62,
+            "contrast": 0.58
+          },
+          "ls_hetero": {
+            "min_factor": 0.76,
+            "max_factor": 1.04,
+            "contrast": 0.52,
+            "ls_gradient": {
+              "probability": 0.55,
+              "top_factor": {
+                "dist": "uniform",
+                "min": 1.02,
+                "max": 1.1
+              },
+              "bottom_factor": {
+                "dist": "uniform",
+                "min": 0.9,
+                "max": 0.98
+              },
+              "fog_opacity_weight": 0.58
+            }
+          }
+        }
+      },
+      "capture_overrides": {
+        "sensor": {
+          "condition_profile": "nominal_gloom"
+        },
+        "isp": {
+          "denoise_sigma": {
+            "dist": "uniform",
+            "min": 0.22,
+            "max": 0.58
+          },
+          "sharpen_amount": {
+            "dist": "uniform",
+            "min": 0.08,
+            "max": 0.24
+          },
+          "saturation": {
+            "dist": "uniform",
+            "min": 0.6,
+            "max": 0.8
+          }
+        },
+        "transport": {
+          "jpeg": {
+            "quality": {
+              "dist": "uniform",
+              "min": 66.0,
+              "max": 86.0
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "underexposed_dense_gloom",
+      "weight": 0.3,
+      "model": "heterogeneous_k_ls",
+      "airlight_method": "dcp_heuristic",
+      "models": {
+        "heterogeneous_k_ls": {
+          "visibility_m": {
+            "dist": "normal",
+            "mean": 34.0,
+            "std": 8.0,
+            "min": 18.0,
+            "max": 54.0
+          },
+          "airlight_dampening": {
+            "min_factor": {
+              "dist": "uniform",
+              "min": 0.28,
+              "max": 0.38
+            },
+            "max_factor": {
+              "dist": "uniform",
+              "min": 0.66,
+              "max": 0.8
+            },
+            "strength": {
+              "dist": "uniform",
+              "min": 1.6,
+              "max": 2.7
+            }
+          },
+          "k_hetero": {
+            "min_factor": 0.58,
+            "max_factor": 2.05,
+            "contrast": 0.84
+          },
+          "ls_hetero": {
+            "min_factor": 0.62,
+            "max_factor": 1.02,
+            "contrast": 0.68,
+            "ls_gradient": {
+              "probability": 0.85,
+              "top_factor": {
+                "dist": "uniform",
+                "min": 1.06,
+                "max": 1.18
+              },
+              "bottom_factor": {
+                "dist": "uniform",
+                "min": 0.82,
+                "max": 0.94
+              },
+              "fog_opacity_weight": 0.78
+            }
+          }
+        }
+      },
+      "capture_overrides": {
+        "sensor": {
+          "condition_profile": "underexposed_noisy"
+        },
+        "isp": {
+          "denoise_sigma": {
+            "dist": "uniform",
+            "min": 0.45,
+            "max": 0.95
+          },
+          "sharpen_amount": {
+            "dist": "uniform",
+            "min": 0.04,
+            "max": 0.18
+          },
+          "saturation": {
+            "dist": "uniform",
+            "min": 0.48,
+            "max": 0.72
+          }
+        },
+        "transport": {
+          "jpeg": {
+            "quality": {
+              "dist": "uniform",
+              "min": 54.0,
+              "max": 78.0
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "severe_low_contrast_sensor_stress",
+      "weight": 0.25,
+      "model": "heterogeneous_k_ls",
+      "airlight_method": "dcp_heuristic",
+      "models": {
+        "heterogeneous_k_ls": {
+          "visibility_m": {
+            "dist": "normal",
+            "mean": 24.0,
+            "std": 6.0,
+            "min": 12.0,
+            "max": 40.0
+          },
+          "airlight_dampening": {
+            "min_factor": {
+              "dist": "uniform",
+              "min": 0.24,
+              "max": 0.34
+            },
+            "max_factor": {
+              "dist": "uniform",
+              "min": 0.58,
+              "max": 0.72
+            },
+            "strength": {
+              "dist": "uniform",
+              "min": 2.0,
+              "max": 3.2
+            }
+          },
+          "k_hetero": {
+            "min_factor": 0.52,
+            "max_factor": 2.3,
+            "contrast": 0.92
+          },
+          "ls_hetero": {
+            "min_factor": 0.56,
+            "max_factor": 1.0,
+            "contrast": 0.76,
+            "ls_gradient": {
+              "probability": 0.9,
+              "top_factor": {
+                "dist": "uniform",
+                "min": 1.08,
+                "max": 1.22
+              },
+              "bottom_factor": {
+                "dist": "uniform",
+                "min": 0.78,
+                "max": 0.9
+              },
+              "gamma": {
+                "dist": "uniform",
+                "min": 1.0,
+                "max": 1.9
+              },
+              "fog_opacity_weight": 0.86
+            }
+          }
+        }
+      },
+      "capture_overrides": {
+        "optics": {
+          "blur_sigma": {
+            "dist": "uniform",
+            "min": 0.55,
+            "max": 1.15
+          },
+          "veiling_glare_strength": {
+            "dist": "uniform",
+            "min": 0.04,
+            "max": 0.1
+          }
+        },
+        "sensor": {
+          "condition_profile": "underexposed_noisy"
+        },
+        "isp": {
+          "denoise_sigma": {
+            "dist": "uniform",
+            "min": 0.65,
+            "max": 1.1
+          },
+          "local_contrast_strength": {
+            "dist": "uniform",
+            "min": 0.0,
+            "max": 0.05
+          },
+          "sharpen_amount": {
+            "dist": "uniform",
+            "min": 0.0,
+            "max": 0.12
+          },
+          "saturation": {
+            "dist": "uniform",
+            "min": 0.42,
+            "max": 0.65
+          }
+        },
+        "transport": {
+          "jpeg": {
+            "quality": {
+              "dist": "uniform",
+              "min": 48.0,
+              "max": 72.0
+            }
+          }
+        }
+      }
+    }
+  ],
   "selection": {
     "mode": "fixed",
     "model": "heterogeneous_k_ls"

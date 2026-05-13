@@ -156,6 +156,7 @@ Controls the fog simulation.
 | `capture` / `capture_artifacts` | Optional post-fog camera artifact pipeline. Omit it or set `{"stages": []}` for the legacy no-op path. Set `true`, `{"preset": "camera"}`, or a custom `stages` list to enable optics, raw sensor, ISP, and compression artifacts. |
 | `camera_profile` | Optional named or inline camera profile whose stage defaults are merged into the capture stack before per-stage overrides. Built-ins are `"default"`, `"generic"`, `"dashcam"`, and `"low_light_fog"`. |
 | `camera_profiles` | Optional map of project-specific named profiles. Use this for calibrated lens, sensor, ISP, and transport settings. |
+| `scenario_profiles` | Optional top-level correlated condition sampler. Each sampled scenario can choose the fog model, override model parameters, select the airlight method, switch camera profile/settings, and force named capture-stage condition profiles. |
 | `augmentations` | Optional stepped augmentation set. When present, every input sample produces every configured augmentation and uses the file-id hierarchy output layout described below. |
 
 ### Processing Pipeline
@@ -276,6 +277,51 @@ gain, read noise, banding, and dark/fog noise modulation should move together:
   ]
 }
 ```
+
+Top-level `scenario_profiles` sample one latent scene/camera condition before
+rendering. The selected scenario is merged over the root config, so it can drive
+fog density, atmospheric light, camera profile, capture-stage overrides, ISP, and
+compression together:
+
+```json
+"scenario_profiles": [
+  {
+    "name": "clean_low_noise_haze",
+    "weight": 0.22,
+    "model": "heterogeneous_k_ls",
+    "airlight_method": "dcp_heuristic",
+    "models": {
+      "heterogeneous_k_ls": {
+        "visibility_m": {"dist": "uniform", "min": 60.0, "max": 130.0}
+      }
+    },
+    "capture_overrides": {
+      "sensor": {"condition_profile": "clean_daylight"},
+      "isp": {"denoise_sigma": {"dist": "uniform", "min": 0.08, "max": 0.32}}
+    }
+  },
+  {
+    "name": "underexposed_dense_gloom",
+    "weight": 0.25,
+    "model": "heterogeneous_k_ls",
+    "airlight_method": "dcp_heuristic",
+    "models": {
+      "heterogeneous_k_ls": {
+        "visibility_m": {"dist": "uniform", "min": 18.0, "max": 55.0}
+      }
+    },
+    "capture_overrides": {
+      "sensor": {"condition_profile": "underexposed_noisy"},
+      "transport": {"jpeg": {"quality": {"dist": "uniform", "min": 54, "max": 78}}}
+    }
+  }
+]
+```
+
+`capture_overrides` is merged after camera-profile and stage settings. Use
+`condition_profile` to force one named profile from a stage's
+`condition_profiles`; if omitted, the stage continues sampling its own profile
+weights locally.
 
 ### Fog Model
 
