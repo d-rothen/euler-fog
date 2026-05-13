@@ -2,6 +2,7 @@
 __pycache__
 .tmp
 .out
+.qualitative_fog_outputs
 UniDepth
 .vscode
 uv.lock
