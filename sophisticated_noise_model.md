@@ -25,6 +25,8 @@ The current implementation includes:
 - intrinsics-aware optics where relevant;
 - heteroscedastic sensor noise that can depend on darkness, distance, and fog
   opacity;
+- shadow-local recovery noise keyed from pre-exposure luminance, so dark regions
+  can degrade without raising the whole-image grain floor;
 - smoothed row/column banding instead of pixel-independent striping;
 - depth/fog-weighted chromatic fringing;
 - per-stage `condition_profiles`, currently used for coherent sensor exposure
@@ -82,6 +84,12 @@ Scenario-level `exposure_gain` remains useful as exposure compensation. Clear,
 bright samples can remain low ISO and low noise, while dense gloomy fog can push
 the camera toward higher ISO, lower effective exposure, more read noise, and
 more denoising.
+
+The dense daylight config now also separates global grain from local shadow
+corruption. Baseline read/fixed/banding noise is lower, while
+`shadow_recovery_noise` adds luma/chroma grain and mild blotching where the
+pre-exposure fog-rendered image was dark. Scenario profiles scale this from
+subtle in clearer cases to aggressive in severe, underexposed fog.
 
 ### 3. Heterogeneous Fog Is Image-Space, Not World-Space
 
