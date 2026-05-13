@@ -22,14 +22,12 @@ from euler_preprocess.common.normalize import (
 from euler_preprocess.common.output import LegacyOutputBackend, OutputSlotSpec
 from euler_preprocess.common.sampling import deep_merge, format_value, sample_value
 from euler_preprocess.common.transform import Transform
-from euler_preprocess.fog.airlight_from_sky import AirlightFromSky
+from euler_preprocess.fog.atmospheric_light import AtmosphericLightResolver
 from euler_preprocess.fog.augmentations import (
     FogAugmentationConfig,
     FogAugmentationSpec,
     parse_fog_augmentations,
 )
-from euler_preprocess.fog.dcp_airlight import DCPAirlight
-from euler_preprocess.fog.dcp_heuristic_airlight import DCPHeuristicAirlight
 from euler_preprocess.fog.logging import log_config
 from euler_preprocess.fog.models import (
     AIRLIGHT_METHODS,
@@ -37,16 +35,11 @@ from euler_preprocess.fog.models import (
     DEFAULT_MODEL_CONFIGS,
     apply_fog_torch,
     apply_model,
-    dampen_airlight_torch,
-    estimate_airlight_torch,
     modulate_with_noise_torch,
-    normalize_atmospheric_light_torch,
     prepare_noise_field_torch,
     resolve_model_config,
-    resolve_scattering_coefficient,
     resolve_scales,
     select_model,
-    uses_estimated_airlight,
 )
 from euler_loading.loaders.cpu.generic import (
     write_map_2d as _write_map_2d,
@@ -226,58 +219,21 @@ class FogTransform(Transform):
             self.contrast_threshold_default,
         )
 
-        # Initialize the airlight estimator
         airlight_method = self.config.get("airlight")
         if airlight_method is None:
             raise ValueError(
                 "Config must specify 'airlight' key. "
                 f"Supported values: {AIRLIGHT_METHODS}"
             )
-        if airlight_method not in AIRLIGHT_METHODS:
-            raise ValueError(
-                f"Unknown airlight method '{airlight_method}'. "
-                f"Supported values: {AIRLIGHT_METHODS}"
-            )
-        self.airlight_method = airlight_method
-        dcp_heuristic_cfg = self.config.get("dcp_heuristic", {})
-        if not isinstance(dcp_heuristic_cfg, dict):
-            raise ValueError("Config key 'dcp_heuristic' must be an object")
-        dcp_heuristic_kwargs = {
-            key: dcp_heuristic_cfg[key]
-            for key in (
-                "patch_size",
-                "top_percent",
-                "white_bias",
-                "cool_bias",
-                "cool_target",
-            )
-            if key in dcp_heuristic_cfg
-        }
-        self.dcp_heuristic_kwargs = dcp_heuristic_kwargs
-        self._airlight_estimators: dict[str, Any] = {}
-        self._airlight_estimators_torch: dict[str, Any] = {}
-        self.airlight_estimator_torch = None
-        if airlight_method == "from_sky":
-            self.airlight_estimator = AirlightFromSky(sky_depth_threshold=0.0)
-        elif airlight_method == "dcp":
-            self.airlight_estimator = DCPAirlight()
-            if torch is not None:
-                from euler_preprocess.fog.dcp_airlight_torch import DCPAirlightTorch
-                self.airlight_estimator_torch = DCPAirlightTorch()
-        elif airlight_method == "dcp_heuristic":
-            self.airlight_estimator = DCPHeuristicAirlight(**dcp_heuristic_kwargs)
-            if torch is not None:
-                from euler_preprocess.fog.dcp_heuristic_airlight_torch import (
-                    DCPHeuristicAirlightTorch,
-                )
-                self.airlight_estimator_torch = DCPHeuristicAirlightTorch(
-                    **dcp_heuristic_kwargs
-                )
-        self._airlight_estimators[airlight_method] = self.airlight_estimator
-        if self.airlight_estimator_torch is not None:
-            self._airlight_estimators_torch[airlight_method] = (
-                self.airlight_estimator_torch
-            )
+        self.atmospheric_light = AtmosphericLightResolver(
+            airlight_method,
+            dcp_heuristic_config=self.config.get("dcp_heuristic", {}),
+            logger=self.logger,
+        )
+        self.airlight_method = self.atmospheric_light.method
+        self.dcp_heuristic_kwargs = self.atmospheric_light.dcp_heuristic_kwargs
+        self.airlight_estimator = self.atmospheric_light.estimator
+        self.airlight_estimator_torch = self.atmospheric_light.estimator_torch
 
     def run(self, samples: Iterable[dict]) -> list[Path]:
         """Run the fog transform. Alias for :meth:`generate_fog`."""
@@ -309,43 +265,10 @@ class FogTransform(Transform):
         return self.base_rng
 
     def _get_airlight_estimator(self, method: str):
-        estimator = self._airlight_estimators.get(method)
-        if estimator is not None:
-            return estimator
-        if method == "from_sky":
-            estimator = AirlightFromSky(sky_depth_threshold=0.0)
-        elif method == "dcp":
-            estimator = DCPAirlight()
-        elif method == "dcp_heuristic":
-            estimator = DCPHeuristicAirlight(**self.dcp_heuristic_kwargs)
-        else:
-            raise ValueError(
-                f"Unknown airlight method '{method}'. Supported values: "
-                f"{AIRLIGHT_METHODS}"
-            )
-        self._airlight_estimators[method] = estimator
-        return estimator
+        return self.atmospheric_light.get_estimator(method)
 
     def _get_airlight_estimator_torch(self, method: str):
-        estimator = self._airlight_estimators_torch.get(method)
-        if estimator is not None:
-            return estimator
-        if torch is None:
-            return None
-        if method == "dcp":
-            from euler_preprocess.fog.dcp_airlight_torch import DCPAirlightTorch
-
-            estimator = DCPAirlightTorch()
-        elif method == "dcp_heuristic":
-            from euler_preprocess.fog.dcp_heuristic_airlight_torch import (
-                DCPHeuristicAirlightTorch,
-            )
-
-            estimator = DCPHeuristicAirlightTorch(**self.dcp_heuristic_kwargs)
-        else:
-            return None
-        self._airlight_estimators_torch[method] = estimator
-        return estimator
+        return self.atmospheric_light.get_estimator_torch(method)
 
     def _estimate_airlight_np(
         self,
@@ -355,9 +278,12 @@ class FogTransform(Transform):
         sample_id: str | None,
         method: str | None = None,
     ) -> np.ndarray:
-        resolved_method = method or self.airlight_method
-        estimator = self._get_airlight_estimator(resolved_method)
-        return estimator.estimate_airlight(rgb, sky_mask, sample_id=sample_id)
+        return self.atmospheric_light.estimate_np(
+            rgb,
+            sky_mask,
+            sample_id=sample_id,
+            method=method,
+        )
 
     def _estimate_airlight_torch(
         self,
@@ -367,21 +293,11 @@ class FogTransform(Transform):
         sample_id: str | None,
         method: str | None = None,
     ) -> "torch.Tensor":
-        resolved_method = method or self.airlight_method
-        if resolved_method == "from_sky":
-            return estimate_airlight_torch(rgb_t, sky_mask_t, sample_id=sample_id)
-        estimator = self._get_airlight_estimator_torch(resolved_method)
-        if estimator is None:
-            raise RuntimeError(
-                f"Torch airlight estimator unavailable for method "
-                f"'{resolved_method}'."
-            )
-        if resolved_method == "dcp":
-            return estimator.compute(rgb_t)
-        return estimator.estimate_airlight(
+        return self.atmospheric_light.estimate_torch(
             rgb_t,
             sky_mask_t,
             sample_id=sample_id,
+            method=method,
         )
 
     def _resolve_augmented_model(
@@ -678,34 +594,15 @@ class FogTransform(Transform):
     ]:
         if model_name not in DEFAULT_MODEL_CONFIGS:
             raise ValueError(f"Unsupported fog model: {model_name}")
-        k_mean, _visibility, _contrast_threshold = resolve_scattering_coefficient(
-            model_cfg,
-            rng,
-            self.contrast_threshold_default,
+        k_mean, ls_base = self.atmospheric_light.resolve_model_torch(
+            model_cfg=model_cfg,
+            rng=rng,
+            contrast_threshold_default=self.contrast_threshold_default,
+            estimated_airlight_t=estimated_airlight_t,
+            device=self.torch_device,
         )
-
-        al_spec = model_cfg.get("atmospheric_light", "from_sky")
-        airlight_is_estimated = uses_estimated_airlight(al_spec)
-        if airlight_is_estimated:
-            raw_ls_base = normalize_atmospheric_light_torch(
-                estimated_airlight_t
-            ).squeeze(0)
-        else:
-            sampled_al = sample_value(al_spec, rng)
-            raw_ls_base = normalize_atmospheric_light_torch(
-                torch.tensor(sampled_al, device=self.torch_device, dtype=torch.float32)
-            ).squeeze(0)
-
         height = int(depth_t.shape[0])
         width = int(depth_t.shape[1])
-        ls_base = dampen_airlight_torch(
-            raw_ls_base,
-            k_mean,
-            model_cfg,
-            rng,
-            _contrast_threshold,
-            estimated_airlight=airlight_is_estimated,
-        )
 
         if model_name == "uniform":
             ls_field = ls_base.view(1, 1, 3)
@@ -889,107 +786,18 @@ class FogTransform(Transform):
                                 depth_batch, K_t,
                             )
 
-                        # Resolve atmospheric_light per the model config
-                        al_spec = uniform_items[0]["model_cfg"].get(
-                            "atmospheric_light", "from_sky"
-                        )
-                        airlight_is_estimated = uses_estimated_airlight(al_spec)
-                        if airlight_is_estimated:
-                            if self.airlight_method == "from_sky":
-                                sky_mask_batch = torch.stack(
-                                    [
-                                        torch.from_numpy(item["sky_mask"]).to(device)
-                                        for item in uniform_items
-                                    ],
-                                    dim=0,
-                                ).to(torch.float32)
-                                mask_sum = sky_mask_batch.sum(dim=(1, 2))
-                                no_sky = mask_sum == 0
-                                safe_sum = mask_sum.clone()
-                                safe_sum[no_sky] = 1.0  # avoid division by zero
-                                airlight = (
-                                    rgb_batch * sky_mask_batch[..., None]
-                                ).sum(dim=(1, 2)) / safe_sum[:, None]
-                                # Replace NaN rows (no sky) with white fallback
-                                if no_sky.any():
-                                    for idx_ns in no_sky.nonzero(as_tuple=False):
-                                        i = int(idx_ns.item())
-                                        self.logger.warning(
-                                            "No sky pixels in segmentation mask "
-                                            "(sample %s); using default airlight "
-                                            "fallback [1.0, 1.0, 1.0]",
-                                            uniform_items[i]["sample_id"],
-                                        )
-                                    airlight[no_sky] = 1.0
-                            elif self.airlight_method == "dcp_heuristic":
-                                assert self.airlight_estimator_torch is not None
-                                al_list = []
-                                for idx in range(len(uniform_items)):
-                                    sky_mask_t = torch.from_numpy(
-                                        uniform_items[idx]["sky_mask"]
-                                    ).to(device=device, dtype=torch.bool)
-                                    al_t = self.airlight_estimator_torch.estimate_airlight(
-                                        rgb_batch[idx],
-                                        sky_mask_t,
-                                        sample_id=uniform_items[idx]["sample_id"],
-                                    )
-                                    al_list.append(al_t)
-                                airlight = torch.stack(al_list, dim=0)
-                            else:
-                                # Plain DCP: per-sample on GPU
-                                assert self.airlight_estimator_torch is not None
-                                al_list = []
-                                for idx in range(len(uniform_items)):
-                                    al_t = self.airlight_estimator_torch.compute(
-                                        rgb_batch[idx]
-                                    )
-                                    al_list.append(al_t)
-                                airlight = torch.stack(al_list, dim=0)
-                            ls_base = normalize_atmospheric_light_torch(airlight)
-                        else:
-                            ls_values = []
-                            for item in uniform_items:
-                                sampled_al = sample_value(al_spec, item["rng"])
-                                ls_values.append(
-                                    normalize_atmospheric_light_torch(
-                                        torch.tensor(
-                                            sampled_al,
-                                            device=device,
-                                            dtype=torch.float32,
-                                        )
-                                    ).squeeze(0)
-                                )
-                            ls_base = torch.stack(ls_values, dim=0)
-
-                        k_means: list[float] = []
-                        contrast_thresholds: list[float] = []
-                        for item in uniform_items:
-                            k_mean, _visibility, contrast_threshold = (
-                                resolve_scattering_coefficient(
-                                    item["model_cfg"],
-                                    item["rng"],
-                                    self.contrast_threshold_default,
-                                )
+                        k_means, ls_base = (
+                            self.atmospheric_light.resolve_uniform_batch_torch(
+                                rgb_batch=rgb_batch,
+                                items=uniform_items,
+                                device=device,
+                                contrast_threshold_default=(
+                                    self.contrast_threshold_default
+                                ),
                             )
-                            k_means.append(k_mean)
-                            contrast_thresholds.append(contrast_threshold)
-
+                        )
                         k_tensor = torch.tensor(
                             k_means, device=device, dtype=rgb_batch.dtype
-                        )
-                        ls_base = torch.stack(
-                            [
-                                dampen_airlight_torch(
-                                    ls_base[idx],
-                                    k_means[idx],
-                                    uniform_items[idx]["model_cfg"],
-                                    uniform_items[idx]["rng"],
-                                    contrast_thresholds[idx],
-                                    estimated_airlight=airlight_is_estimated,
-                                )
-                                for idx in range(len(uniform_items))
-                            ],
-                            dim=0,
                         )
                         t = torch.exp(-depth_batch * k_tensor[:, None, None])
                         foggy = rgb_batch * t[..., None] + ls_base[
@@ -1065,30 +873,14 @@ class FogTransform(Transform):
                                 device=device, dtype=torch.float32,
                             )
                             depth_t = planar_to_radial_depth_torch(depth_t, K_t)
-                        if self.airlight_method == "from_sky":
-                            sky_mask_t = (
-                                torch.from_numpy(item["sky_mask"]).to(device).bool()
-                            )
-                            estimated_airlight = estimate_airlight_torch(
-                                rgb_t, sky_mask_t, sample_id=item["sample_id"]
-                            )
-                        elif self.airlight_method == "dcp_heuristic":
-                            assert self.airlight_estimator_torch is not None
-                            sky_mask_t = (
-                                torch.from_numpy(item["sky_mask"]).to(device).bool()
-                            )
-                            estimated_airlight = (
-                                self.airlight_estimator_torch.estimate_airlight(
-                                    rgb_t,
-                                    sky_mask_t,
-                                    sample_id=item["sample_id"],
-                                )
-                            )
-                        else:
-                            assert self.airlight_estimator_torch is not None
-                            estimated_airlight = (
-                                self.airlight_estimator_torch.compute(rgb_t)
-                            )
+                        sky_mask_t = (
+                            torch.from_numpy(item["sky_mask"]).to(device).bool()
+                        )
+                        estimated_airlight = self.atmospheric_light.estimate_torch(
+                            rgb_t,
+                            sky_mask_t,
+                            sample_id=item["sample_id"],
+                        )
                         torch_gen = torch_generator_for_index(self.torch_device, self.seed, self.base_rng, item["index"])
                         foggy_t, beta, airlight_t, k_map_t, ls_map_t = (
                             self._apply_model_torch(
