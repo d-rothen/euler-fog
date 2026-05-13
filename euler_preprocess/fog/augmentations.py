@@ -9,6 +9,10 @@ from euler_preprocess.common.sampling import deep_merge, format_value
 
 
 _MODEL_OVERRIDE_KEYS = {
+    "airlight_dampening",
+    "airlight_damping",
+    "airlight_intensity_dampening",
+    "airlight_intensity_damping",
     "atmospheric_light",
     "contrast_threshold",
     "k_hetero",

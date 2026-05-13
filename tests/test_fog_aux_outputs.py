@@ -527,6 +527,140 @@ def test_apply_model_returns_full_size_maps_for_uniform() -> None:
     np.testing.assert_allclose(ls_map, np.broadcast_to(ls_base, ls_map.shape))
 
 
+def test_estimated_airlight_is_dampened_by_scattering_strength() -> None:
+    """Dense fog should not push DCP/sky-estimated airlight toward overbright white."""
+    from euler_preprocess.fog.models import apply_model, visibility_to_k
+
+    rgb = np.full((6, 8, 3), 0.35, dtype=np.float32)
+    depth = np.full((6, 8), 30.0, dtype=np.float32)
+    estimated = np.array([0.9, 0.9, 0.9], dtype=np.float32)
+
+    light_cfg = {
+        "visibility_m": {"dist": "constant", "value": 300.0},
+        "atmospheric_light": "from_sky",
+    }
+    dense_cfg = {
+        "visibility_m": {"dist": "constant", "value": 20.0},
+        "atmospheric_light": "from_sky",
+    }
+
+    _, light_beta, light_airlight, _, _ = apply_model(
+        rgb,
+        depth,
+        "uniform",
+        light_cfg,
+        np.random.default_rng(0),
+        contrast_threshold_default=0.05,
+        estimated_airlight=estimated,
+    )
+    _, dense_beta, dense_airlight, _, _ = apply_model(
+        rgb,
+        depth,
+        "uniform",
+        dense_cfg,
+        np.random.default_rng(0),
+        contrast_threshold_default=0.05,
+        estimated_airlight=estimated,
+    )
+
+    ref_beta = visibility_to_k(80.0, 0.05)
+    expected_dense_factor = 0.45 + 0.55 / (1.0 + dense_beta / ref_beta)
+
+    assert dense_beta > light_beta
+    assert float(dense_airlight.mean()) < float(light_airlight.mean())
+    np.testing.assert_allclose(
+        dense_airlight,
+        estimated * expected_dense_factor,
+        rtol=1e-6,
+    )
+
+
+def test_literal_atmospheric_light_is_not_dampened_by_default() -> None:
+    """Hand-authored L_s values remain exact unless the config opts into all values."""
+    from euler_preprocess.fog.models import apply_model
+
+    rng = np.random.default_rng(0)
+    rgb = np.full((4, 5, 3), 0.35, dtype=np.float32)
+    depth = np.full((4, 5), 30.0, dtype=np.float32)
+    estimated = np.array([0.1, 0.1, 0.1], dtype=np.float32)
+    literal = np.array([0.9, 0.8, 0.7], dtype=np.float32)
+    cfg = {
+        "visibility_m": {"dist": "constant", "value": 20.0},
+        "atmospheric_light": literal.tolist(),
+    }
+
+    _, _, airlight, _, ls_map = apply_model(
+        rgb,
+        depth,
+        "uniform",
+        cfg,
+        rng,
+        contrast_threshold_default=0.05,
+        estimated_airlight=estimated,
+    )
+
+    np.testing.assert_allclose(airlight, literal, atol=1e-6)
+    np.testing.assert_allclose(ls_map, np.broadcast_to(literal, ls_map.shape))
+
+
+def test_airlight_dampening_alias_can_disable_default() -> None:
+    from euler_preprocess.fog.models import apply_model
+
+    rgb = np.full((4, 5, 3), 0.35, dtype=np.float32)
+    depth = np.full((4, 5), 30.0, dtype=np.float32)
+    estimated = np.array([0.9, 0.9, 0.9], dtype=np.float32)
+    cfg = {
+        "visibility_m": {"dist": "constant", "value": 20.0},
+        "atmospheric_light": "from_sky",
+        "airlight_damping": {"enabled": False},
+    }
+
+    _, _, airlight, _, _ = apply_model(
+        rgb,
+        depth,
+        "uniform",
+        cfg,
+        np.random.default_rng(0),
+        contrast_threshold_default=0.05,
+        estimated_airlight=estimated,
+    )
+
+    np.testing.assert_allclose(airlight, estimated, atol=1e-6)
+
+
+def test_heterogeneous_ls_uses_dampened_airlight_base() -> None:
+    """Perlin L_s modes should modulate around the already dampened base airlight."""
+    from euler_preprocess.fog.models import apply_model
+
+    rng = np.random.default_rng(123)
+    rgb = np.full((16, 16, 3), 0.35, dtype=np.float32)
+    depth = np.full((16, 16), 40.0, dtype=np.float32)
+    estimated = np.array([0.9, 0.9, 0.9], dtype=np.float32)
+    cfg = {
+        "scattering_coefficient": {"dist": "constant", "value": 0.15},
+        "atmospheric_light": "from_sky",
+        "ls_hetero": {
+            "scales": [4],
+            "min_factor": 1.0,
+            "max_factor": 1.0,
+            "normalize_to_mean": False,
+        },
+    }
+
+    _, _, airlight, _, ls_map = apply_model(
+        rgb,
+        depth,
+        "heterogeneous_ls",
+        cfg,
+        rng,
+        contrast_threshold_default=0.05,
+        estimated_airlight=estimated,
+    )
+
+    assert float(airlight.mean()) < float(estimated.mean())
+    np.testing.assert_allclose(ls_map, np.broadcast_to(airlight, ls_map.shape))
+
+
 def test_apply_model_returns_spatial_fields_for_heterogeneous() -> None:
     """Heterogeneous models should return the actual non-constant maps used."""
     from euler_preprocess.fog.models import apply_model

@@ -210,6 +210,39 @@ When `airlight` is `"dcp_heuristic"`, you can optionally add:
 - `white_bias + cool_bias` must be `<= 1`.
 - The tint bias preserves the estimated airlight luminance, so it shifts colour without silently changing fog density.
 
+### Airlight Intensity Dampening
+
+Estimated airlight is dampened by default as fog density increases. This keeps
+strong fog closer to the low, grey lighting seen in real in-car fog footage
+instead of letting DCP-style estimates wash dense fog toward white.
+
+Each fog model can override the dampening curve:
+
+```json
+"airlight_dampening": {
+  "enabled": true,
+  "apply_to": "estimated",
+  "reference_visibility_m": 80.0,
+  "min_factor": 0.45,
+  "max_factor": 1.0,
+  "strength": 1.0
+}
+```
+
+The factor is:
+`min_factor + (max_factor - min_factor) / (1 + strength * beta / reference_beta)`.
+`reference_beta` is either `reference_scattering_coefficient` /
+`reference_beta`, or it is derived from `reference_visibility_m` using the
+model's contrast threshold. The default applies only when `atmospheric_light`
+uses an estimated airlight method (`"from_sky"`, `"dcp"`, or
+`"dcp_heuristic"`); literal RGB `atmospheric_light` values stay exact unless
+`apply_to` is set to `"all"`. Set `"enabled": false` or `apply_to: "none"` to
+preserve the previous undampened behavior.
+
+For `heterogeneous_ls` and `heterogeneous_k_ls`, the Perlin atmospheric-light
+field is sampled around the dampened base airlight, so the spatial variation
+does not reintroduce the old over-illuminated look.
+
 ### Model Selection
 
 Each image is assigned a fog model via the `selection` block:

@@ -19,14 +19,32 @@ AIRLIGHT_METHODS = ("from_sky", "dcp", "dcp_heuristic")
 
 DEFAULT_CONTRAST_THRESHOLD = 0.05
 
+DEFAULT_AIRLIGHT_DAMPENING_CONFIG = {
+    "enabled": True,
+    "apply_to": "estimated",
+    "reference_visibility_m": 80.0,
+    "min_factor": 0.45,
+    "max_factor": 1.0,
+    "strength": 1.0,
+}
+
+_AIRLIGHT_DAMPENING_KEYS = (
+    "airlight_dampening",
+    "airlight_damping",
+    "airlight_intensity_dampening",
+    "airlight_intensity_damping",
+)
+
 DEFAULT_MODEL_CONFIGS = {
     "uniform": {
         "visibility_m": {"dist": "constant", "value": 80.0},
         "atmospheric_light": "from_sky",
+        "airlight_dampening": dict(DEFAULT_AIRLIGHT_DAMPENING_CONFIG),
     },
     "heterogeneous_k": {
         "visibility_m": {"dist": "constant", "value": 80.0},
         "atmospheric_light": "from_sky",
+        "airlight_dampening": dict(DEFAULT_AIRLIGHT_DAMPENING_CONFIG),
         "k_hetero": {
             "scales": "smooth_auto",
             "correlation_length_fraction": 0.25,
@@ -41,6 +59,7 @@ DEFAULT_MODEL_CONFIGS = {
     "heterogeneous_ls": {
         "visibility_m": {"dist": "constant", "value": 80.0},
         "atmospheric_light": "from_sky",
+        "airlight_dampening": dict(DEFAULT_AIRLIGHT_DAMPENING_CONFIG),
         "ls_hetero": {
             "scales": "smooth_auto",
             "correlation_length_fraction": 0.35,
@@ -55,6 +74,7 @@ DEFAULT_MODEL_CONFIGS = {
     "heterogeneous_k_ls": {
         "visibility_m": {"dist": "constant", "value": 80.0},
         "atmospheric_light": "from_sky",
+        "airlight_dampening": dict(DEFAULT_AIRLIGHT_DAMPENING_CONFIG),
         "k_hetero": {
             "scales": "smooth_auto",
             "correlation_length_fraction": 0.25,
@@ -143,6 +163,202 @@ def normalize_atmospheric_light_torch(value: "torch.Tensor") -> "torch.Tensor":
     if max_val > 1.0:
         value_t = value_t / 255.0
     return torch.clamp(value_t, 0.0, 1.0)
+
+
+def _raw_airlight_dampening_config(model_cfg: dict):
+    raw_cfg = model_cfg.get("airlight_dampening", {})
+    for key in _AIRLIGHT_DAMPENING_KEYS[1:]:
+        if key not in model_cfg:
+            continue
+        override = model_cfg[key]
+        if isinstance(raw_cfg, dict) and isinstance(override, dict):
+            raw_cfg = deep_merge(raw_cfg, override)
+        else:
+            raw_cfg = override
+    return raw_cfg
+
+
+def resolve_airlight_dampening_config(
+    model_cfg: dict,
+    rng: np.random.Generator,
+    contrast_threshold: float,
+) -> dict:
+    """Resolve model-level airlight intensity dampening controls.
+
+    The default applies only to estimated airlight. Literal atmospheric-light
+    colours remain exact unless ``apply_to`` is set to ``"all"``.
+    """
+    raw_cfg = _raw_airlight_dampening_config(model_cfg)
+    if isinstance(raw_cfg, bool):
+        raw_cfg = {"enabled": raw_cfg}
+    if raw_cfg is None:
+        raw_cfg = {}
+    if not isinstance(raw_cfg, dict):
+        raise ValueError("airlight_dampening must be a boolean or object")
+
+    resolved = deep_merge(DEFAULT_AIRLIGHT_DAMPENING_CONFIG, raw_cfg)
+    enabled = resolved.get("enabled", True)
+    if not isinstance(enabled, bool):
+        raise ValueError("airlight_dampening.enabled must be a boolean")
+
+    apply_to = str(resolved.get("apply_to", "estimated"))
+    if apply_to not in ("estimated", "all", "none"):
+        raise ValueError(
+            "airlight_dampening.apply_to must be 'estimated', 'all', or 'none'"
+        )
+
+    min_factor = _sample_float(
+        resolved.get("min_factor", 0.45),
+        rng,
+        "airlight_dampening.min_factor",
+    )
+    max_factor = _sample_float(
+        resolved.get("max_factor", 1.0),
+        rng,
+        "airlight_dampening.max_factor",
+    )
+    strength = _sample_float(
+        resolved.get("strength", 1.0),
+        rng,
+        "airlight_dampening.strength",
+    )
+    if not 0.0 <= min_factor <= 1.0:
+        raise ValueError(
+            f"airlight_dampening.min_factor must be in [0, 1], got {min_factor}"
+        )
+    if not 0.0 <= max_factor <= 1.0:
+        raise ValueError(
+            f"airlight_dampening.max_factor must be in [0, 1], got {max_factor}"
+        )
+    if min_factor > max_factor:
+        raise ValueError("airlight_dampening.min_factor must be <= max_factor")
+    if strength < 0.0:
+        raise ValueError(
+            f"airlight_dampening.strength must be >= 0, got {strength}"
+        )
+
+    reference_beta_spec = resolved.get(
+        "reference_scattering_coefficient",
+        resolved.get("reference_beta"),
+    )
+    if reference_beta_spec is None:
+        reference_visibility = _sample_float(
+            resolved.get("reference_visibility_m", 80.0),
+            rng,
+            "airlight_dampening.reference_visibility_m",
+        )
+        reference_beta = visibility_to_k(reference_visibility, contrast_threshold)
+    else:
+        reference_beta = _sample_float(
+            reference_beta_spec,
+            rng,
+            "airlight_dampening.reference_scattering_coefficient",
+        )
+        if reference_beta <= 0.0:
+            raise ValueError(
+                "airlight_dampening.reference_scattering_coefficient "
+                f"must be > 0, got {reference_beta}"
+            )
+
+    return {
+        "enabled": enabled,
+        "apply_to": apply_to,
+        "reference_beta": reference_beta,
+        "min_factor": min_factor,
+        "max_factor": max_factor,
+        "strength": strength,
+    }
+
+
+def should_dampen_airlight(
+    dampening_cfg: dict,
+    *,
+    estimated_airlight: bool,
+) -> bool:
+    if not dampening_cfg["enabled"]:
+        return False
+    apply_to = dampening_cfg["apply_to"]
+    if apply_to == "none":
+        return False
+    if apply_to == "all":
+        return True
+    return estimated_airlight
+
+
+def airlight_dampening_factor(beta, dampening_cfg: dict) -> np.ndarray:
+    beta_arr = np.maximum(np.asarray(beta, dtype=np.float32), 0.0)
+    reference_beta = max(
+        float(dampening_cfg["reference_beta"]),
+        np.finfo(np.float32).eps,
+    )
+    relative_strength = beta_arr / reference_beta
+    factor = float(dampening_cfg["min_factor"]) + (
+        float(dampening_cfg["max_factor"]) - float(dampening_cfg["min_factor"])
+    ) / (1.0 + float(dampening_cfg["strength"]) * relative_strength)
+    return np.asarray(factor, dtype=np.float32)
+
+
+def dampen_airlight(
+    airlight: np.ndarray,
+    beta,
+    model_cfg: dict,
+    rng: np.random.Generator,
+    contrast_threshold: float,
+    *,
+    estimated_airlight: bool,
+) -> np.ndarray:
+    light = np.asarray(airlight, dtype=np.float32)
+    dampening_cfg = resolve_airlight_dampening_config(
+        model_cfg,
+        rng,
+        contrast_threshold,
+    )
+    if not should_dampen_airlight(
+        dampening_cfg,
+        estimated_airlight=estimated_airlight,
+    ):
+        return light
+    factor = airlight_dampening_factor(beta, dampening_cfg)
+    while factor.ndim < light.ndim:
+        factor = np.expand_dims(factor, axis=-1)
+    return np.clip(light * factor, 0.0, 1.0).astype(np.float32, copy=False)
+
+
+def dampen_airlight_torch(
+    airlight: "torch.Tensor",
+    beta,
+    model_cfg: dict,
+    rng: np.random.Generator,
+    contrast_threshold: float,
+    *,
+    estimated_airlight: bool,
+) -> "torch.Tensor":
+    dampening_cfg = resolve_airlight_dampening_config(
+        model_cfg,
+        rng,
+        contrast_threshold,
+    )
+    if not should_dampen_airlight(
+        dampening_cfg,
+        estimated_airlight=estimated_airlight,
+    ):
+        return airlight
+    if torch.is_tensor(beta):
+        beta_t = beta.to(device=airlight.device, dtype=airlight.dtype)
+    else:
+        beta_t = torch.tensor(beta, device=airlight.device, dtype=airlight.dtype)
+    beta_t = torch.clamp(beta_t, min=0.0)
+    reference_beta = max(
+        float(dampening_cfg["reference_beta"]),
+        float(torch.finfo(airlight.dtype).eps),
+    )
+    relative_strength = beta_t / reference_beta
+    factor = float(dampening_cfg["min_factor"]) + (
+        float(dampening_cfg["max_factor"]) - float(dampening_cfg["min_factor"])
+    ) / (1.0 + float(dampening_cfg["strength"]) * relative_strength)
+    while factor.ndim < airlight.ndim:
+        factor = factor.unsqueeze(-1)
+    return torch.clamp(airlight * factor, 0.0, 1.0)
 
 
 def estimate_airlight_torch(
@@ -594,13 +810,22 @@ def apply_model(
     )
 
     al_spec = model_cfg.get("atmospheric_light", "from_sky")
-    if uses_estimated_airlight(al_spec):
-        ls_base = normalize_atmospheric_light(estimated_airlight)
+    airlight_is_estimated = uses_estimated_airlight(al_spec)
+    if airlight_is_estimated:
+        raw_ls_base = normalize_atmospheric_light(estimated_airlight)
     else:
         sampled_al = sample_value(al_spec, rng)
-        ls_base = normalize_atmospheric_light(np.asarray(sampled_al))
+        raw_ls_base = normalize_atmospheric_light(np.asarray(sampled_al))
 
     height, width = depth_m.shape
+    ls_base = dampen_airlight(
+        raw_ls_base,
+        k_mean,
+        model_cfg,
+        rng,
+        _contrast_threshold,
+        estimated_airlight=airlight_is_estimated,
+    )
 
     if model_name == "uniform":
         ls_field = ls_base.reshape(1, 1, 3)

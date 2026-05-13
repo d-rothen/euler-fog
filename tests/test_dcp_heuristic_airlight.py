@@ -144,6 +144,7 @@ class TestDCPHeuristicAirlight:
         model_cfg = {
             "visibility_m": {"dist": "constant", "value": 120.0},
             "atmospheric_light": "dcp_heuristic",
+            "airlight_dampening": {"enabled": False},
         }
 
         _, _, airlight, _, _ = apply_model(
@@ -227,6 +228,7 @@ class TestDCPHeuristicAirlightTorch:
                 "uniform": {
                     "visibility_m": {"dist": "constant", "value": 120.0},
                     "atmospheric_light": "dcp_heuristic",
+                    "airlight_dampening": {"enabled": False},
                 },
             },
             "selection": {"mode": "fixed", "model": "uniform"},

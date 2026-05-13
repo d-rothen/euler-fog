@@ -37,6 +37,7 @@ from euler_preprocess.fog.models import (
     DEFAULT_MODEL_CONFIGS,
     apply_fog_torch,
     apply_model,
+    dampen_airlight_torch,
     estimate_airlight_torch,
     modulate_with_noise_torch,
     normalize_atmospheric_light_torch,
@@ -684,16 +685,27 @@ class FogTransform(Transform):
         )
 
         al_spec = model_cfg.get("atmospheric_light", "from_sky")
-        if uses_estimated_airlight(al_spec):
-            ls_base = normalize_atmospheric_light_torch(estimated_airlight_t).squeeze(0)
+        airlight_is_estimated = uses_estimated_airlight(al_spec)
+        if airlight_is_estimated:
+            raw_ls_base = normalize_atmospheric_light_torch(
+                estimated_airlight_t
+            ).squeeze(0)
         else:
             sampled_al = sample_value(al_spec, rng)
-            ls_base = normalize_atmospheric_light_torch(
+            raw_ls_base = normalize_atmospheric_light_torch(
                 torch.tensor(sampled_al, device=self.torch_device, dtype=torch.float32)
             ).squeeze(0)
 
         height = int(depth_t.shape[0])
         width = int(depth_t.shape[1])
+        ls_base = dampen_airlight_torch(
+            raw_ls_base,
+            k_mean,
+            model_cfg,
+            rng,
+            _contrast_threshold,
+            estimated_airlight=airlight_is_estimated,
+        )
 
         if model_name == "uniform":
             ls_field = ls_base.view(1, 1, 3)
@@ -881,7 +893,8 @@ class FogTransform(Transform):
                         al_spec = uniform_items[0]["model_cfg"].get(
                             "atmospheric_light", "from_sky"
                         )
-                        if uses_estimated_airlight(al_spec):
+                        airlight_is_estimated = uses_estimated_airlight(al_spec)
+                        if airlight_is_estimated:
                             if self.airlight_method == "from_sky":
                                 sky_mask_batch = torch.stack(
                                     [
@@ -949,8 +962,9 @@ class FogTransform(Transform):
                             ls_base = torch.stack(ls_values, dim=0)
 
                         k_means: list[float] = []
+                        contrast_thresholds: list[float] = []
                         for item in uniform_items:
-                            k_mean, _visibility, _contrast_threshold = (
+                            k_mean, _visibility, contrast_threshold = (
                                 resolve_scattering_coefficient(
                                     item["model_cfg"],
                                     item["rng"],
@@ -958,9 +972,24 @@ class FogTransform(Transform):
                                 )
                             )
                             k_means.append(k_mean)
+                            contrast_thresholds.append(contrast_threshold)
 
                         k_tensor = torch.tensor(
                             k_means, device=device, dtype=rgb_batch.dtype
+                        )
+                        ls_base = torch.stack(
+                            [
+                                dampen_airlight_torch(
+                                    ls_base[idx],
+                                    k_means[idx],
+                                    uniform_items[idx]["model_cfg"],
+                                    uniform_items[idx]["rng"],
+                                    contrast_thresholds[idx],
+                                    estimated_airlight=airlight_is_estimated,
+                                )
+                                for idx in range(len(uniform_items))
+                            ],
+                            dim=0,
                         )
                         t = torch.exp(-depth_batch * k_tensor[:, None, None])
                         foggy = rgb_batch * t[..., None] + ls_base[
