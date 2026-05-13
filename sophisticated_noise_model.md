@@ -62,25 +62,26 @@ Each scenario can drive fog model parameters, atmospheric light behavior,
 capture profile overrides, exposure behavior, sensor noise, ISP, and transport
 quality together.
 
-### 2. Exposure Should Become Image-Driven
+### 2. Exposure Is Now Image-Driven
 
-Current exposure sampling is useful for dataset diversity, but it is not yet a
-camera metering model. A more realistic camera stack should choose exposure from
-the rendered foggy image and camera metering assumptions.
+The sensor stage now supports `auto_exposure`, which meters the rendered foggy
+image after optics and camera color matrix, but before white balance, clipping,
+raw sampling, and ISP. This makes exposure react to the actual per-image
+luminance distribution instead of depending only on sampled scenario labels.
 
-Useful controls would include:
+Implemented controls include:
 
-- metering mode: center-weighted, average, sky-suppressed, highlight-protecting;
+- metering mode: center-weighted, average, percentile, and highlight-protecting;
 - target middle-gray luminance;
 - exposure compensation;
 - highlight clipping tolerance;
-- allowed shutter/aperture/ISO range;
-- ISO escalation after shutter/aperture constraints are hit;
-- optional auto white balance from the rendered image.
+- allowed exposure gain range;
+- ISO escalation after metering pressure, dark fraction, and fog opacity.
 
-This would let clean and noisy cases arise naturally. Clear, bright samples
-would often remain low ISO and low noise, while dense gloomy fog would push the
-camera toward higher ISO, lower exposure, more read noise, and more denoising.
+Scenario-level `exposure_gain` remains useful as exposure compensation. Clear,
+bright samples can remain low ISO and low noise, while dense gloomy fog can push
+the camera toward higher ISO, lower effective exposure, more read noise, and
+more denoising.
 
 ### 3. Heterogeneous Fog Is Image-Space, Not World-Space
 
@@ -135,11 +136,11 @@ stages to batched torch operations:
 JPEG round trips and some PIL-style image operations may remain CPU-bound unless
 there is a clear need to replace them.
 
-## Recommended Next Implementation
+## Implemented Auto-Exposure Shape
 
-The next full refinement should add image-driven auto-exposure on top of the
-scenario profiles. Scenario sampling handles global correlation; auto-exposure
-would make per-image exposure and ISO respond to actual rendered luminance.
+Image-driven auto-exposure now sits on top of scenario profiles. Scenario
+sampling handles global correlation; auto-exposure makes per-image exposure and
+ISO respond to actual rendered luminance.
 
 ### Proposed Config Shape
 
@@ -188,8 +189,8 @@ idea is that one sampled scenario controls multiple downstream blocks.
 
 ### Auto-Exposure Stage
 
-A camera-like exposure resolver could run between ideal fog rendering and raw
-sensor simulation:
+The exposure resolver runs between ideal fog rendering and raw sensor
+simulation:
 
 1. Render fog in linear or display-normalized RGB.
 2. Compute luminance statistics with configurable metering.
@@ -198,8 +199,8 @@ sensor simulation:
 5. Resolve ISO/noise state from the required gain.
 6. Pass the resolved exposure and ISO into the sensor stage.
 
-This should replace purely random exposure gain where possible, while still
-allowing sampled exposure compensation and metering style for diversity.
+This replaces purely random exposure gain where configured, while still allowing
+sampled exposure compensation and metering style for diversity.
 
 ## Bias Controls
 

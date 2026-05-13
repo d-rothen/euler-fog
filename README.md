@@ -201,6 +201,14 @@ For tighter control, provide explicit stages in camera order:
       "bayer_pattern": "RGGB",
       "iso": {"dist": "choice", "values": [200, 400, 800]},
       "base_iso": 100,
+      "auto_exposure": {
+        "enabled": true,
+        "metering": "center_weighted",
+        "target_luminance": {"dist": "uniform", "min": 0.16, "max": 0.24},
+        "highlight_protection": 0.7,
+        "resolve_iso": true,
+        "max_iso": 1600
+      },
       "full_well_electrons": [14000, 12000, 13000],
       "read_noise_electrons": {"dist": "uniform", "min": 2.0, "max": 6.0},
       "black_level": [0.003, 0.0035, 0.003],
@@ -259,10 +267,16 @@ Supported stage types:
 | Stage | Main effects |
 |---|---|
 | `optics` | Defocus/MTF blur, motion blur, bloom, veiling glare, vignetting, chromatic aberration, lens distortion, windshield haze, optional droplets. |
-| `sensor` | Exposure, white balance, camera matrix, Bayer mosaic, shot/read noise, fixed-pattern noise, row/column banding, hot/dead pixels, bilinear demosaic. |
+| `sensor` | Image-driven or sampled exposure, white balance, camera matrix, Bayer mosaic, shot/read noise, fixed-pattern noise, row/column banding, hot/dead pixels, bilinear demosaic. |
 | `isp` | Denoising, color correction, tone mapping, sRGB/gamma, local contrast, sharpening halos, saturation shifts. |
 | `transport` | Crop/resize, bit-depth quantization, JPEG round-trip compression. |
 | `exposure` | Lightweight standalone exposure and white-balance stage for simple custom chains. |
+
+Set `sensor.auto_exposure.enabled` to meter the rendered image before raw sensor
+sampling. `target_luminance`, `metering`, `highlight_*`, and gain bounds choose
+the exposure; `resolve_iso` can raise ISO from the metering pressure, dark pixel
+fraction, and fog opacity. When auto exposure is enabled, `exposure_gain` still
+applies as scenario-specific exposure compensation.
 
 Any stage can define `condition_profiles` to sample coherent per-image settings
 before the stage runs. This is useful for exposure states where ISO, exposure
