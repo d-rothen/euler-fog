@@ -692,6 +692,169 @@ def test_sensor_stage_supports_raw_and_post_demosaic_quantization() -> None:
     np.testing.assert_allclose(result, np.round(result * 15.0) / 15.0)
 
 
+def test_sensor_noise_modulation_is_stronger_in_dark_foggy_regions() -> None:
+    pipeline = CaptureArtifactPipeline.from_config(
+        {
+            "capture": {
+                "stages": [
+                    {
+                        "type": "sensor",
+                        "input_space": "linear",
+                        "exposure_gain": 1.0,
+                        "white_balance": [1.0, 1.0, 1.0],
+                        "white_balance_jitter": 0.0,
+                        "channel_gain_sigma": 0.0,
+                        "camera_matrix": [
+                            [1.0, 0.0, 0.0],
+                            [0.0, 1.0, 0.0],
+                            [0.0, 0.0, 1.0],
+                        ],
+                        "bayer_pattern": "RGGB",
+                        "shot_noise_electrons": 0.0,
+                        "read_noise_sigma": 0.01,
+                        "fixed_pattern_sigma": 0.0,
+                        "row_noise_sigma": 0.0,
+                        "column_noise_sigma": 0.0,
+                        "black_level": [0.0, 0.0, 0.0],
+                        "black_level_jitter": 0.0,
+                        "white_level": [1.0, 1.0, 1.0],
+                        "white_level_jitter": 0.0,
+                        "adc_bit_depth": 0,
+                        "demosaic": False,
+                        "noise_modulation": {
+                            "enabled": True,
+                            "dark_gain": 1.0,
+                            "depth_gain": 0.6,
+                            "fog_gain": 1.0,
+                            "max_gain": 3.0,
+                        },
+                    }
+                ]
+            }
+        }
+    )
+    image = np.full((48, 64, 3), 0.75, dtype=np.float32)
+    image[:, 32:] = 0.2
+    depth = np.full((48, 64), 5.0, dtype=np.float32)
+    depth[:, 32:] = 80.0
+    k_map = np.full((48, 64), 0.08, dtype=np.float32)
+
+    result = pipeline.apply_np(
+        image,
+        CaptureContext(
+            rng=np.random.default_rng(17),
+            depth_m=depth,
+            k_map=k_map,
+        ),
+    )
+
+    left_std = float(result[:, :32, 0].std())
+    right_std = float(result[:, 32:, 0].std())
+    assert right_std > left_std * 1.35
+
+
+def test_sensor_row_banding_is_smoothed_by_correlation_length() -> None:
+    pipeline = CaptureArtifactPipeline.from_config(
+        {
+            "capture": {
+                "stages": [
+                    {
+                        "type": "sensor",
+                        "input_space": "linear",
+                        "exposure_gain": 1.0,
+                        "white_balance": [1.0, 1.0, 1.0],
+                        "white_balance_jitter": 0.0,
+                        "channel_gain_sigma": 0.0,
+                        "camera_matrix": [
+                            [1.0, 0.0, 0.0],
+                            [0.0, 1.0, 0.0],
+                            [0.0, 0.0, 1.0],
+                        ],
+                        "bayer_pattern": "RGGB",
+                        "shot_noise_electrons": 0.0,
+                        "read_noise_sigma": 0.0,
+                        "fixed_pattern_sigma": 0.0,
+                        "row_noise_sigma": 0.01,
+                        "row_banding_correlation_px": 48.0,
+                        "column_noise_sigma": 0.0,
+                        "black_level": [0.0, 0.0, 0.0],
+                        "black_level_jitter": 0.0,
+                        "white_level": [1.0, 1.0, 1.0],
+                        "white_level_jitter": 0.0,
+                        "adc_bit_depth": 0,
+                        "demosaic": False,
+                    }
+                ]
+            }
+        }
+    )
+    image = np.full((96, 64, 3), 0.5, dtype=np.float32)
+
+    result = pipeline.apply_np(
+        image,
+        CaptureContext(rng=np.random.default_rng(19)),
+    )
+
+    row_mean = result[..., 0].mean(axis=1)
+    assert float(np.diff(row_mean).std()) < float(row_mean.std()) * 0.45
+
+
+def test_depth_chromatic_fringing_is_weighted_by_depth_and_fog() -> None:
+    pipeline = CaptureArtifactPipeline.from_config(
+        {
+            "capture": {
+                "stages": [
+                    {
+                        "type": "optics",
+                        "lens_distortion": 0.0,
+                        "chromatic_aberration_px": 0.0,
+                        "blur_sigma": 0.0,
+                        "motion_blur": {"enabled": False},
+                        "bloom": {"enabled": False},
+                        "vignetting_strength": 0.0,
+                        "veiling_glare_strength": 0.0,
+                        "windshield_haze": {"enabled": False},
+                        "droplets": {"enabled": False},
+                        "depth_chromatic_fringing": {
+                            "enabled": True,
+                            "strength_px": 2.0,
+                            "depth_weight": 0.5,
+                            "fog_weight": 0.5,
+                            "dark_weight": 0.0,
+                            "gamma": 1.0,
+                            "max_alpha": 1.0,
+                            "blur_sigma": 0.0,
+                        },
+                    }
+                ]
+            }
+        }
+    )
+    x = np.linspace(0.0, 1.0, 80, dtype=np.float32)
+    image = np.dstack(
+        [
+            np.broadcast_to(x, (40, 80)),
+            np.full((40, 80), 0.5, dtype=np.float32),
+            np.broadcast_to(1.0 - x, (40, 80)),
+        ]
+    )
+    depth = np.full((40, 80), 5.0, dtype=np.float32)
+    depth[:, 40:] = 90.0
+    k_map = np.full((40, 80), 0.08, dtype=np.float32)
+
+    result = pipeline.apply_np(
+        image,
+        CaptureContext(
+            rng=np.random.default_rng(23),
+            depth_m=depth,
+            k_map=k_map,
+        ),
+    )
+    delta = np.abs(result - image).mean(axis=-1)
+
+    assert float(delta[:, 40:].mean()) > float(delta[:, :40].mean()) * 2.0
+
+
 def test_apply_model_returns_full_size_maps_for_uniform() -> None:
     """Sanity-check the broadcast logic on the model layer."""
     from euler_preprocess.fog.models import apply_model

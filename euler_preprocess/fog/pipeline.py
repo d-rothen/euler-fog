@@ -119,6 +119,8 @@ class FogProcessingPipeline:
                 sample_id=sample_id,
                 rng=rng,
                 intrinsics=intrinsics,
+                depth_m=depth_m,
+                k_map=result.k_map,
             ),
         )
 

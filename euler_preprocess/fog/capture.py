@@ -25,6 +25,9 @@ class CaptureContext:
     rng: Any | None = None
     device: Any | None = None
     intrinsics: Any | None = None
+    depth_m: Any | None = None
+    k_map: Any | None = None
+    fog_opacity: Any | None = None
     attributes: Mapping[str, Any] = field(default_factory=dict)
 
 
@@ -112,6 +115,16 @@ class OpticsStage(ConfiguredCaptureStage):
         "vignetting_strength": {"dist": "uniform", "min": 0.04, "max": 0.22},
         "vignetting_radius": 1.15,
         "chromatic_aberration_px": {"dist": "uniform", "min": 0.0, "max": 0.7},
+        "depth_chromatic_fringing": {
+            "enabled": False,
+            "strength_px": {"dist": "uniform", "min": 0.0, "max": 0.6},
+            "depth_weight": 0.35,
+            "fog_weight": 0.55,
+            "dark_weight": 0.1,
+            "gamma": 1.2,
+            "max_alpha": 0.8,
+            "blur_sigma": 1.2,
+        },
         "lens_distortion": {"dist": "uniform", "min": -0.015, "max": 0.015},
         "bloom": {
             "enabled": True,
@@ -160,6 +173,16 @@ class OpticsStage(ConfiguredCaptureStage):
         )
         if aberration_px > 1e-4:
             img = _chromatic_aberration_np(img, aberration_px, intrinsics)
+
+        fringing_cfg = _config_block(self.config, "depth_chromatic_fringing")
+        if _block_enabled(fringing_cfg, rng):
+            img = _apply_depth_chromatic_fringing_np(
+                img,
+                fringing_cfg,
+                context,
+                intrinsics,
+                rng,
+            )
 
         blur_sigma = _sample_float(self.config, "blur_sigma", 0.0, rng)
         if blur_sigma > 1e-4:
@@ -252,9 +275,29 @@ class SensorStage(ConfiguredCaptureStage):
         "full_well_electrons": {"dist": "uniform", "min": 8000.0, "max": 24000.0},
         "read_noise_electrons": {"dist": "uniform", "min": 1.5, "max": 7.0},
         "read_noise_sigma": None,
-        "fixed_pattern_sigma": {"dist": "uniform", "min": 0.0, "max": 0.004},
-        "row_noise_sigma": {"dist": "uniform", "min": 0.0, "max": 0.006},
-        "column_noise_sigma": {"dist": "uniform", "min": 0.0, "max": 0.003},
+        "fixed_pattern_sigma": {"dist": "uniform", "min": 0.0, "max": 0.0015},
+        "row_noise_sigma": {"dist": "uniform", "min": 0.0, "max": 0.0012},
+        "column_noise_sigma": {"dist": "uniform", "min": 0.0, "max": 0.0007},
+        "row_banding_correlation_px": {
+            "dist": "uniform",
+            "min": 24.0,
+            "max": 96.0,
+        },
+        "column_banding_correlation_px": {
+            "dist": "uniform",
+            "min": 24.0,
+            "max": 96.0,
+        },
+        "banding_modulation": 0.35,
+        "noise_modulation": {
+            "enabled": False,
+            "dark_gain": 0.0,
+            "depth_gain": 0.0,
+            "fog_gain": 0.0,
+            "gamma": 1.0,
+            "max_gain": 3.0,
+            "smooth_sigma": 0.0,
+        },
         "black_level": [0.003, 0.003, 0.003],
         "black_level_jitter": {"dist": "uniform", "min": 0.0, "max": 0.002},
         "white_level": [1.0, 1.0, 1.0],
@@ -331,6 +374,12 @@ class SensorStage(ConfiguredCaptureStage):
             noisy_signal = rng.poisson(
                 np.clip(raw_signal, 0.0, None) * electron_capacity
             ).astype(np.float32) / np.maximum(electron_capacity, 1e-6)
+        noise_modulation = _sensor_noise_modulation(
+            raw_signal,
+            context,
+            self.config,
+            rng,
+        )
 
         read_sigma_cfg = self.config.get("read_noise_sigma")
         if read_sigma_cfg is not None:
@@ -342,31 +391,57 @@ class SensorStage(ConfiguredCaptureStage):
                 0.0,
                 rng,
             )
-            read_sigma = read_electrons / np.maximum(electron_capacity, 1e-6)
+            read_sigma = np.where(
+                electron_capacity > 0.0,
+                read_electrons / np.maximum(electron_capacity, 1e-6),
+                0.0,
+            )
         if np.any(np.asarray(read_sigma) > 0.0):
             noisy_signal = noisy_signal + rng.normal(
                 0.0,
                 1.0,
                 raw_signal.shape,
-            ).astype(np.float32) * read_sigma
+            ).astype(np.float32) * read_sigma * noise_modulation
 
         raw = black_map + noisy_signal * raw_range
 
         fixed_sigma = _sample_float(self.config, "fixed_pattern_sigma", 0.0, rng)
         if fixed_sigma > 0.0:
-            raw = raw + rng.normal(0.0, fixed_sigma, raw.shape).astype(np.float32)
+            raw = raw + (
+                rng.normal(0.0, fixed_sigma, raw.shape).astype(np.float32)
+                * noise_modulation
+            )
 
+        banding_modulation = float(
+            np.clip(_sample_float(self.config, "banding_modulation", 0.35, rng), 0, 1)
+        )
+        banding_gain = 1.0 + banding_modulation * (noise_modulation - 1.0)
         row_sigma = _sample_float(self.config, "row_noise_sigma", 0.0, rng)
         if row_sigma > 0.0:
-            raw = raw + rng.normal(0.0, row_sigma, (raw.shape[0], 1)).astype(
-                np.float32
+            row_corr = _sample_float(
+                self.config,
+                "row_banding_correlation_px",
+                48.0,
+                rng,
             )
+            row_bias = _smooth_random_bias(raw.shape[0], row_sigma, row_corr, rng)
+            raw = raw + row_bias[:, None] * banding_gain
 
         column_sigma = _sample_float(self.config, "column_noise_sigma", 0.0, rng)
         if column_sigma > 0.0:
-            raw = raw + rng.normal(0.0, column_sigma, (1, raw.shape[1])).astype(
-                np.float32
+            column_corr = _sample_float(
+                self.config,
+                "column_banding_correlation_px",
+                48.0,
+                rng,
             )
+            column_bias = _smooth_random_bias(
+                raw.shape[1],
+                column_sigma,
+                column_corr,
+                rng,
+            )
+            raw = raw + column_bias[None, :] * banding_gain
 
         raw = _apply_bad_pixels_np(
             raw,
@@ -798,6 +873,48 @@ def _context_intrinsics(context: CaptureContext) -> np.ndarray | None:
     return intrinsics
 
 
+def _context_float_map(value: Any, shape: tuple[int, int]) -> np.ndarray | None:
+    if value is None:
+        return None
+    if torch is not None and torch.is_tensor(value):
+        arr = value.detach().cpu().numpy()
+    else:
+        arr = np.asarray(value)
+    arr = arr.astype(np.float32, copy=False)
+    if arr.ndim == 0:
+        return np.full(shape, float(arr), dtype=np.float32)
+    if arr.ndim == 3 and arr.shape[-1] == 1:
+        arr = arr[..., 0]
+    if arr.ndim == 3 and arr.shape[0] == 1:
+        arr = arr[0]
+    if arr.ndim != 2:
+        return None
+    if arr.shape != shape:
+        arr = _resize_map_np(arr, shape)
+    return arr.astype(np.float32, copy=False)
+
+
+def _context_depth_map(context: CaptureContext, shape: tuple[int, int]) -> np.ndarray | None:
+    return _context_float_map(context.depth_m, shape)
+
+
+def _context_fog_opacity(
+    context: CaptureContext,
+    shape: tuple[int, int],
+) -> np.ndarray | None:
+    opacity = _context_float_map(context.fog_opacity, shape)
+    if opacity is not None:
+        return np.clip(opacity, 0.0, 1.0).astype(np.float32, copy=False)
+    depth = _context_depth_map(context, shape)
+    k_map = _context_float_map(context.k_map, shape)
+    if depth is None or k_map is None:
+        return None
+    return np.clip(1.0 - np.exp(-np.maximum(depth, 0.0) * np.maximum(k_map, 0.0)), 0.0, 1.0).astype(
+        np.float32,
+        copy=False,
+    )
+
+
 def _as_float_rgb(image) -> np.ndarray:
     arr = np.asarray(image)
     if arr.ndim != 3 or arr.shape[-1] != 3:
@@ -905,6 +1022,60 @@ def _resolve_electron_capacity(
     )
 
 
+def _sensor_noise_modulation(
+    signal: np.ndarray,
+    context: CaptureContext,
+    config: Mapping[str, Any],
+    rng: np.random.Generator,
+) -> np.ndarray:
+    cfg = _config_block(config, "noise_modulation")
+    if not _bool_value(cfg.get("enabled", False)):
+        return np.ones(signal.shape, dtype=np.float32)
+
+    gamma = max(_sample_float(cfg, "gamma", 1.0, rng), 1e-6)
+    modulation = np.ones(signal.shape, dtype=np.float32)
+
+    dark_gain = _sample_float(cfg, "dark_gain", 0.0, rng)
+    if dark_gain != 0.0:
+        dark = np.power(1.0 - np.clip(signal, 0.0, 1.0), gamma)
+        modulation += dark_gain * dark.astype(np.float32, copy=False)
+
+    depth_gain = _sample_float(cfg, "depth_gain", 0.0, rng)
+    if depth_gain != 0.0:
+        depth = _context_depth_map(context, signal.shape)
+        if depth is not None:
+            modulation += depth_gain * _normalize_context_map(depth)
+
+    fog_gain = _sample_float(cfg, "fog_gain", 0.0, rng)
+    if fog_gain != 0.0:
+        opacity = _context_fog_opacity(context, signal.shape)
+        if opacity is not None:
+            modulation += fog_gain * np.power(np.clip(opacity, 0.0, 1.0), gamma)
+
+    smooth_sigma = _sample_float(cfg, "smooth_sigma", 0.0, rng)
+    if smooth_sigma > 1e-4:
+        modulation = _gaussian_blur_np(modulation, smooth_sigma)
+
+    max_gain = max(_sample_float(cfg, "max_gain", 3.0, rng), 1.0)
+    return np.clip(modulation, 1.0, max_gain).astype(np.float32, copy=False)
+
+
+def _normalize_context_map(value: np.ndarray) -> np.ndarray:
+    finite = np.isfinite(value)
+    if not finite.any():
+        return np.zeros(value.shape, dtype=np.float32)
+    clipped = value.astype(np.float32, copy=True)
+    clipped[~finite] = 0.0
+    lo = float(np.percentile(clipped[finite], 2.0))
+    hi = float(np.percentile(clipped[finite], 98.0))
+    if hi <= lo:
+        return np.zeros(value.shape, dtype=np.float32)
+    return np.clip((clipped - lo) / (hi - lo), 0.0, 1.0).astype(
+        np.float32,
+        copy=False,
+    )
+
+
 def _bool_value(value: Any) -> bool:
     if isinstance(value, str):
         return value.strip().lower() not in {"0", "false", "no", "off"}
@@ -974,6 +1145,28 @@ def _gaussian_kernel1d(sigma: float) -> np.ndarray:
     kernel = np.exp(-(x * x) / (2.0 * sigma * sigma))
     kernel /= float(kernel.sum())
     return kernel.astype(np.float32)
+
+
+def _smooth_random_bias(
+    length: int,
+    sigma: float,
+    correlation_px: float,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    values = rng.normal(0.0, sigma, length).astype(np.float32)
+    if correlation_px <= 1.0 or length <= 2:
+        return values
+    kernel = _gaussian_kernel1d(max(float(correlation_px) / 3.0, 1e-4))
+    radius = len(kernel) // 2
+    padded = np.pad(values, (radius, radius), mode="reflect")
+    out = np.zeros_like(values, dtype=np.float32)
+    for offset, weight in enumerate(kernel):
+        out += float(weight) * padded[offset : offset + length]
+    original_std = float(values.std())
+    smoothed_std = float(out.std())
+    if smoothed_std > 1e-8 and original_std > 0.0:
+        out = out * (original_std / smoothed_std)
+    return out.astype(np.float32, copy=False)
 
 
 def _convolve1d_reflect(
@@ -1097,6 +1290,90 @@ def _chromatic_aberration_np(
     out[..., 0] = _sample_bilinear_np(image[..., 0], yy - uy * offset, xx - ux * offset)
     out[..., 2] = _sample_bilinear_np(image[..., 2], yy + uy * offset, xx + ux * offset)
     return out.astype(np.float32, copy=False)
+
+
+def _apply_depth_chromatic_fringing_np(
+    image: np.ndarray,
+    config: Mapping[str, Any],
+    context: CaptureContext,
+    intrinsics: np.ndarray | None,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    strength = _sample_float(config, "strength_px", 0.0, rng)
+    if strength <= 1e-5:
+        return image
+
+    height, width = image.shape[:2]
+    weight = _depth_fog_dark_weight_map(image, context, config, rng)
+    if not np.any(weight > 1e-5):
+        return image
+
+    yy, xx = _coordinate_grid(height, width)
+    _, _, cx, cy = _camera_geometry(height, width, intrinsics)
+    dx = xx - cx
+    dy = yy - cy
+    radius = np.sqrt(dx * dx + dy * dy)
+    max_radius = max(float(radius.max()), 1e-6)
+    ux = dx / np.maximum(radius, 1e-6)
+    uy = dy / np.maximum(radius, 1e-6)
+    offset = strength * (radius / max_radius) * weight
+
+    shifted = image.copy()
+    shifted[..., 0] = _sample_bilinear_np(
+        image[..., 0],
+        yy - uy * offset,
+        xx - ux * offset,
+    )
+    shifted[..., 2] = _sample_bilinear_np(
+        image[..., 2],
+        yy + uy * offset,
+        xx + ux * offset,
+    )
+    alpha = np.clip(
+        weight * _sample_float(config, "max_alpha", 0.8, rng),
+        0.0,
+        1.0,
+    )
+    return (
+        image * (1.0 - alpha[..., None]) + shifted * alpha[..., None]
+    ).astype(np.float32, copy=False)
+
+
+def _depth_fog_dark_weight_map(
+    image: np.ndarray,
+    context: CaptureContext,
+    config: Mapping[str, Any],
+    rng: np.random.Generator,
+) -> np.ndarray:
+    shape = image.shape[:2]
+    weight = np.zeros(shape, dtype=np.float32)
+
+    depth_weight = _sample_float(config, "depth_weight", 0.0, rng)
+    if depth_weight != 0.0:
+        depth = _context_depth_map(context, shape)
+        if depth is not None:
+            weight += depth_weight * _normalize_context_map(depth)
+
+    fog_weight = _sample_float(config, "fog_weight", 0.0, rng)
+    if fog_weight != 0.0:
+        opacity = _context_fog_opacity(context, shape)
+        if opacity is not None:
+            weight += fog_weight * np.clip(opacity, 0.0, 1.0)
+
+    dark_weight = _sample_float(config, "dark_weight", 0.0, rng)
+    if dark_weight != 0.0:
+        luma = np.sum(
+            image * np.array([0.2126, 0.7152, 0.0722], dtype=np.float32),
+            axis=-1,
+        )
+        weight += dark_weight * (1.0 - np.clip(luma, 0.0, 1.0))
+
+    gamma = max(_sample_float(config, "gamma", 1.0, rng), 1e-6)
+    weight = np.power(np.clip(weight, 0.0, 1.0), gamma)
+    blur_sigma = _sample_float(config, "blur_sigma", 0.0, rng)
+    if blur_sigma > 1e-4:
+        weight = _gaussian_blur_np(weight, blur_sigma)
+    return np.clip(weight, 0.0, 1.0).astype(np.float32, copy=False)
 
 
 def _motion_blur_np(image: np.ndarray, length_px: float, angle_deg: float) -> np.ndarray:
@@ -1393,6 +1670,14 @@ def _resize_np(
     pil = Image.fromarray(_to_uint8(image), mode="RGB")
     resized = pil.resize(size, resample=_pil_resampling(resample))
     return np.asarray(resized, dtype=np.float32) / 255.0
+
+
+def _resize_map_np(map_2d: np.ndarray, shape: tuple[int, int]) -> np.ndarray:
+    height, width = shape
+    yy = np.linspace(0.0, max(map_2d.shape[0] - 1, 0), height, dtype=np.float32)
+    xx = np.linspace(0.0, max(map_2d.shape[1] - 1, 0), width, dtype=np.float32)
+    grid_y, grid_x = np.meshgrid(yy, xx, indexing="ij")
+    return _sample_bilinear_np(map_2d.astype(np.float32, copy=False), grid_y, grid_x)
 
 
 def _pil_resampling(name: str):

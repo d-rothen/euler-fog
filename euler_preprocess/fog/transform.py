@@ -602,6 +602,7 @@ class FogTransform(Transform):
         torch_gen: "torch.Generator",
         sample_id: str | None = None,
         intrinsics: np.ndarray | None = None,
+        depth_m: Any | None = None,
     ) -> tuple[
         "torch.Tensor", float, "torch.Tensor", "torch.Tensor", "torch.Tensor"
     ]:
@@ -631,6 +632,7 @@ class FogTransform(Transform):
                 rng=rng,
                 sample_id=sample_id,
                 intrinsics=intrinsics,
+                depth_m=depth_m,
             )
 
         if model_name in ("heterogeneous_k", "heterogeneous_k_ls"):
@@ -692,6 +694,7 @@ class FogTransform(Transform):
             rng=rng,
             sample_id=sample_id,
             intrinsics=intrinsics,
+            depth_m=depth_m,
         )
 
     def _finalize_torch_pipeline_result(
@@ -705,6 +708,7 @@ class FogTransform(Transform):
         rng: np.random.Generator,
         sample_id: str | None,
         intrinsics: np.ndarray | None = None,
+        depth_m: Any | None = None,
     ) -> tuple[
         "torch.Tensor", float, "torch.Tensor", "torch.Tensor", "torch.Tensor"
     ]:
@@ -722,6 +726,8 @@ class FogTransform(Transform):
                 rng=rng,
                 device=self.torch_device,
                 intrinsics=intrinsics,
+                depth_m=depth_m,
+                k_map=k_map,
             ),
         )
         return result.rgb, result.beta, result.airlight, result.k_map, result.ls_map
@@ -871,8 +877,15 @@ class FogTransform(Transform):
                                     rng=item["rng"],
                                     device=device,
                                     intrinsics=item.get("intrinsics"),
+                                    depth_m=depth_tensors[idx],
+                                    k_map=torch.full(
+                                        depth_tensors[idx].shape,
+                                        float(k_means[idx]),
+                                        device=device,
+                                        dtype=depth_tensors[idx].dtype,
+                                    ),
                                 )
-                                for item in uniform_items
+                                for idx, item in enumerate(uniform_items)
                             ),
                         )
 
@@ -970,6 +983,7 @@ class FogTransform(Transform):
                                 torch_gen,
                                 sample_id=item["sample_id"],
                                 intrinsics=item.get("intrinsics"),
+                                depth_m=depth_t,
                             )
                         )
                         foggy_img = torch.clamp(foggy_t, 0.0, 1.0).cpu().numpy()
@@ -1090,6 +1104,7 @@ class FogTransform(Transform):
                             torch_gen,
                             sample_id=sample.get("id"),
                             intrinsics=intrinsics,
+                            depth_m=depth_t,
                         )
                     )
                     foggy_img = torch.clamp(foggy_t, 0.0, 1.0).cpu().numpy()

@@ -36,8 +36,22 @@
         "vignetting_radius": 1.05,
         "chromatic_aberration_px": {
           "dist": "uniform",
-          "min": 0.15,
-          "max": 0.65
+          "min": 0.05,
+          "max": 0.28
+        },
+        "depth_chromatic_fringing": {
+          "enabled": true,
+          "strength_px": {
+            "dist": "uniform",
+            "min": 0.15,
+            "max": 0.55
+          },
+          "depth_weight": 0.35,
+          "fog_weight": 0.5,
+          "dark_weight": 0.15,
+          "gamma": 1.35,
+          "max_alpha": 0.55,
+          "blur_sigma": 1.6
         },
         "lens_distortion": {
           "dist": "uniform",
@@ -125,13 +139,13 @@
         "iso": {
           "dist": "choice",
           "values": [
+            500.0,
             800.0,
-            1250.0,
-            1600.0
+            1250.0
           ],
           "weights": [
-            0.35,
-            0.4,
+            0.3,
+            0.45,
             0.25
           ]
         },
@@ -148,18 +162,38 @@
         },
         "fixed_pattern_sigma": {
           "dist": "uniform",
-          "min": 0.001,
-          "max": 0.006
+          "min": 0.0002,
+          "max": 0.0014
         },
         "row_noise_sigma": {
           "dist": "uniform",
-          "min": 0.002,
-          "max": 0.009
+          "min": 0.00015,
+          "max": 0.0011
         },
         "column_noise_sigma": {
           "dist": "uniform",
-          "min": 0.001,
-          "max": 0.004
+          "min": 0.00005,
+          "max": 0.00035
+        },
+        "row_banding_correlation_px": {
+          "dist": "uniform",
+          "min": 40.0,
+          "max": 160.0
+        },
+        "column_banding_correlation_px": {
+          "dist": "uniform",
+          "min": 36.0,
+          "max": 128.0
+        },
+        "banding_modulation": 0.22,
+        "noise_modulation": {
+          "enabled": true,
+          "dark_gain": 0.75,
+          "depth_gain": 0.28,
+          "fog_gain": 0.65,
+          "gamma": 1.25,
+          "max_gain": 2.4,
+          "smooth_sigma": 2.2
         },
         "black_level": [
           0.004,
@@ -183,8 +217,8 @@
         },
         "adc_bit_depth": 12,
         "post_demosaic_bit_depth": 12,
-        "hot_pixel_probability": 0.00004,
-        "dead_pixel_probability": 0.00002
+        "hot_pixel_probability": 0.000006,
+        "dead_pixel_probability": 0.000003
       },
       "isp": {
         "denoise_sigma": {
@@ -291,13 +325,13 @@
         "reference_visibility_m": 90.0,
         "min_factor": {
           "dist": "uniform",
-          "min": 0.26,
-          "max": 0.36
+          "min": 0.34,
+          "max": 0.44
         },
         "max_factor": {
           "dist": "uniform",
-          "min": 0.66,
-          "max": 0.82
+          "min": 0.74,
+          "max": 0.88
         },
         "strength": {
           "dist": "uniform",
