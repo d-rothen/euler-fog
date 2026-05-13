@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
+import re
 import shutil
 import sys
 from pathlib import Path
@@ -34,18 +36,33 @@ def main() -> None:
         shutil.rmtree(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    samples = list(
-        load_structured_samples(
-            input_root,
-            sky_class=args.sky_class,
-            camera_filter=args.camera,
-            depth_key=args.depth_key,
+    load_limit = args.limit
+    if args.sample_per_profile is not None:
+        load_limit = (
+            args.sample_per_profile
+            if load_limit is None
+            else min(load_limit, args.sample_per_profile)
         )
+    samples = load_structured_samples(
+        input_root,
+        sky_class=args.sky_class,
+        camera_filter=args.camera,
+        depth_key=args.depth_key,
+        max_samples=load_limit,
     )
     if args.limit is not None:
         samples = samples[: args.limit]
     if not samples:
         raise SystemExit(f"No samples found under {input_root}")
+
+    if args.sample_per_profile is not None:
+        run_profile_sweep(
+            samples,
+            config_path=config_path,
+            output_dir=output_dir,
+            args=args,
+        )
+        return
 
     effective_config = _write_effective_config(
         config_path,
@@ -81,12 +98,94 @@ def main() -> None:
         print(f"Wrote review panels to {output_dir / 'review'}")
 
 
+def run_profile_sweep(
+    samples: list[dict[str, Any]],
+    *,
+    config_path: Path,
+    output_dir: Path,
+    args: argparse.Namespace,
+) -> None:
+    if args.sample_per_profile <= 0:
+        raise SystemExit("--sample-per-profile must be > 0")
+    if len(samples) < args.sample_per_profile:
+        raise SystemExit(
+            f"--sample-per-profile requested {args.sample_per_profile} samples, "
+            f"but only {len(samples)} samples were found"
+        )
+
+    config = load_json(config_path)
+    profile_key, profiles = _scenario_profiles(config)
+    if not profiles:
+        raise SystemExit(
+            "--sample-per-profile requires scenario_profiles in the config"
+        )
+
+    profile_samples = samples[: args.sample_per_profile]
+    runs: list[dict[str, Any]] = []
+    all_saved_paths: list[Path] = []
+    for index, profile in enumerate(profiles):
+        profile_name = _scenario_profile_name(profile, index)
+        profile_slug = _slugify(profile_name)
+        profile_dir = output_dir / profile_slug
+        profile_dir.mkdir(parents=True, exist_ok=True)
+
+        effective_config = _write_effective_config(
+            config_path,
+            profile_dir,
+            device=args.device,
+            seed=args.seed,
+            depth_scale=args.depth_scale,
+            scenario_profile=profile,
+            scenario_profile_key=profile_key,
+        )
+        transform = FogTransform(
+            config_path=str(effective_config),
+            out_path=str(profile_dir / "fog_outputs"),
+        )
+        saved_paths = transform.run(profile_samples)
+        all_saved_paths.extend(saved_paths)
+
+        if args.review_panels:
+            write_review_panels(profile_samples, saved_paths, profile_dir / "review")
+
+        runs.append(
+            {
+                "profile": profile_name,
+                "profile_slug": profile_slug,
+                "effective_config_path": str(effective_config),
+                "output_paths": [str(path) for path in saved_paths],
+                "sample_ids": [str(sample["id"]) for sample in profile_samples],
+            }
+        )
+
+    manifest = {
+        "input_root": str(args.input_root.resolve()),
+        "config_path": str(config_path),
+        "profile_key": profile_key,
+        "sample_per_profile": args.sample_per_profile,
+        "sky_class": list(args.sky_class),
+        "profile_runs": runs,
+        "output_paths": [str(path) for path in all_saved_paths],
+    }
+    (output_dir / "qualitative_manifest.json").write_text(
+        json.dumps(manifest, indent=2),
+        encoding="utf-8",
+    )
+    print(
+        f"Wrote {len(all_saved_paths)} fog outputs across {len(runs)} profiles "
+        f"to {output_dir}"
+    )
+    if args.review_panels:
+        print(f"Wrote per-profile review panels under {output_dir}")
+
+
 def load_structured_samples(
     root: Path,
     *,
     sky_class: tuple[int, int, int] = DEFAULT_SKY_CLASS,
     camera_filter: str | None = None,
     depth_key: str | None = None,
+    max_samples: int | None = None,
 ) -> list[dict[str, Any]]:
     calibration = _load_calibration(root / "calibration.json")
     rgb_root = root / "rgb"
@@ -134,6 +233,8 @@ def load_structured_samples(
                 "meta": {"rgb": {"path": str(rgb_path)}},
             }
         )
+        if max_samples is not None and len(samples) >= max_samples:
+            break
     return samples
 
 
@@ -181,6 +282,17 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--camera", default="CS_FRONT")
     parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument(
+        "--sample-per-profile",
+        "--samples-per-profile",
+        dest="sample_per_profile",
+        type=int,
+        default=None,
+        help=(
+            "Run the first N loaded samples once for each configured "
+            "scenario_profile, writing one output subtree per profile."
+        ),
+    )
     parser.add_argument("--depth-key", default=None)
     parser.add_argument("--device", default=None, help="Override config device.")
     parser.add_argument("--seed", type=int, default=None, help="Override config seed.")
@@ -218,6 +330,8 @@ def _write_effective_config(
     device: str | None,
     seed: int | None,
     depth_scale: float | None,
+    scenario_profile: dict[str, Any] | None = None,
+    scenario_profile_key: str | None = None,
 ) -> Path:
     cfg = load_json(config_path)
     if device is not None:
@@ -226,10 +340,45 @@ def _write_effective_config(
         cfg["seed"] = seed
     if depth_scale is not None:
         cfg["depth_scale"] = depth_scale
+    if scenario_profile is not None:
+        key = scenario_profile_key or _scenario_profiles(cfg)[0] or "scenario_profiles"
+        forced_profile = copy.deepcopy(scenario_profile)
+        forced_profile["weight"] = 1.0
+        cfg[key] = [forced_profile]
 
     config_out = output_dir / "effective_fog_config.json"
     config_out.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
     return config_out
+
+
+def _scenario_profiles(config: dict[str, Any]) -> tuple[str | None, list[dict[str, Any]]]:
+    for key in ("scenario_profiles", "scene_condition_profiles", "condition_profiles"):
+        raw = config.get(key)
+        if raw is None:
+            continue
+        if not isinstance(raw, list):
+            raise ValueError(f"{key} must be a list")
+        profiles = []
+        for index, entry in enumerate(raw):
+            if not isinstance(entry, dict):
+                raise ValueError(f"{key}[{index}] must be an object")
+            profiles.append(entry)
+        return key, profiles
+    return None, []
+
+
+def _scenario_profile_name(profile: dict[str, Any], index: int) -> str:
+    name = profile.get("name", profile.get("id"))
+    if name is None and isinstance(profile.get("config"), dict):
+        config = profile["config"]
+        name = config.get("name", config.get("id"))
+    return str(name) if name is not None else f"profile_{index:02d}"
+
+
+def _slugify(value: str) -> str:
+    slug = re.sub(r"[^a-zA-Z0-9._-]+", "_", value.strip().lower())
+    slug = re.sub(r"_+", "_", slug).strip("._-")
+    return slug or "profile"
 
 
 def _load_calibration(path: Path) -> dict[str, np.ndarray]:
