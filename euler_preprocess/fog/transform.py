@@ -43,6 +43,7 @@ from euler_preprocess.fog.models import (
     DEFAULT_CONTRAST_THRESHOLD,
     DEFAULT_MODEL_CONFIGS,
     apply_fog_torch,
+    apply_ls_gradient_torch,
     modulate_with_noise_torch,
     prepare_noise_field_torch,
     resolve_model_config,
@@ -677,6 +678,14 @@ class FogTransform(Transform):
                 min_factor,
                 max_factor,
                 bool(ls_cfg.get("normalize_to_mean", False)),
+            )
+            ls_field = apply_ls_gradient_torch(
+                ls_field,
+                depth_t,
+                k_field,
+                model_cfg,
+                ls_cfg,
+                rng,
             )
             ls_field = torch.clamp(ls_field, 0.0, 1.0)
         else:

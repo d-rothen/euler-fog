@@ -699,6 +699,266 @@ def modulate_with_noise_torch(
     return mean_value * factors[..., None]
 
 
+def apply_ls_gradient(
+    ls_field: np.ndarray,
+    depth_m: np.ndarray,
+    k_field,
+    model_cfg: dict,
+    ls_cfg: dict,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    cfg = _resolve_ls_gradient_config(model_cfg, ls_cfg)
+    if not _gradient_enabled(cfg, rng, "ls_gradient"):
+        return ls_field.astype(np.float32, copy=False)
+
+    height, width = depth_m.shape
+    factors = _ls_gradient_factors_np(height, width, cfg, rng)
+    factors = _weight_ls_gradient_by_opacity_np(
+        factors,
+        depth_m,
+        k_field,
+        cfg,
+        rng,
+    )
+    if bool(cfg.get("normalize_to_mean", False)):
+        factors = _normalize_gradient_factors_np(factors)
+    if ls_field.shape == (3,):
+        ls_field = ls_field.reshape(1, 1, 3)
+    return (ls_field * factors[..., None]).astype(np.float32, copy=False)
+
+
+def apply_ls_gradient_torch(
+    ls_field: "torch.Tensor",
+    depth_m: "torch.Tensor",
+    k_field,
+    model_cfg: dict,
+    ls_cfg: dict,
+    rng: np.random.Generator,
+) -> "torch.Tensor":
+    cfg = _resolve_ls_gradient_config(model_cfg, ls_cfg)
+    if not _gradient_enabled(cfg, rng, "ls_gradient"):
+        return ls_field
+
+    height = int(depth_m.shape[-2])
+    width = int(depth_m.shape[-1])
+    factors = _ls_gradient_factors_torch(
+        height,
+        width,
+        cfg,
+        rng,
+        device=depth_m.device,
+        dtype=depth_m.dtype,
+    )
+    factors = _weight_ls_gradient_by_opacity_torch(
+        factors,
+        depth_m,
+        k_field,
+        cfg,
+        rng,
+    )
+    if bool(cfg.get("normalize_to_mean", False)):
+        factors = _normalize_gradient_factors_torch(factors)
+    if ls_field.ndim == 1:
+        ls_field = ls_field.view(1, 1, 3)
+    return ls_field * factors.unsqueeze(-1)
+
+
+def _resolve_ls_gradient_config(model_cfg: dict, ls_cfg: dict) -> dict:
+    raw = None
+    for source in (ls_cfg, model_cfg):
+        for key in (
+            "ls_gradient",
+            "light_gradient",
+            "airlight_gradient",
+            "illumination_gradient",
+        ):
+            if key in source:
+                raw = source[key]
+                break
+        if raw is not None:
+            break
+    if raw is None:
+        return {"enabled": False}
+    if isinstance(raw, bool):
+        return {"enabled": raw}
+    if not isinstance(raw, dict):
+        raise ValueError("ls_gradient must be a boolean or object")
+    return dict(raw)
+
+
+def _gradient_enabled(
+    cfg: dict,
+    rng: np.random.Generator,
+    name: str,
+) -> bool:
+    enabled = cfg.get("enabled", True)
+    if not isinstance(enabled, bool):
+        raise ValueError(f"{name}.enabled must be a boolean")
+    if not enabled:
+        return False
+    probability = _sample_float(
+        cfg.get("probability", 1.0),
+        rng,
+        f"{name}.probability",
+    )
+    if not 0.0 <= probability <= 1.0:
+        raise ValueError(f"{name}.probability must be in [0, 1], got {probability}")
+    return probability >= 1.0 or bool(rng.random() < probability)
+
+
+def _ls_gradient_factors_np(
+    height: int,
+    width: int,
+    cfg: dict,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    top = _sample_float(cfg.get("top_factor", 1.0), rng, "ls_gradient.top_factor")
+    bottom = _sample_float(
+        cfg.get("bottom_factor", 1.0),
+        rng,
+        "ls_gradient.bottom_factor",
+    )
+    if top < 0.0 or bottom < 0.0:
+        raise ValueError("ls_gradient top/bottom factors must be non-negative")
+    gamma = _sample_float(cfg.get("gamma", 1.0), rng, "ls_gradient.gamma")
+    if gamma <= 0.0:
+        raise ValueError(f"ls_gradient.gamma must be > 0, got {gamma}")
+
+    axis = str(cfg.get("axis", "vertical")).lower()
+    if axis in {"vertical", "y", "top_bottom", "top-to-bottom"}:
+        coord = np.linspace(0.0, 1.0, height, dtype=np.float32)[:, None]
+        factors = top + (bottom - top) * np.power(coord, gamma)
+        return np.broadcast_to(factors, (height, width)).astype(np.float32, copy=True)
+    if axis in {"horizontal", "x", "left_right", "left-to-right"}:
+        coord = np.linspace(0.0, 1.0, width, dtype=np.float32)[None, :]
+        factors = top + (bottom - top) * np.power(coord, gamma)
+        return np.broadcast_to(factors, (height, width)).astype(np.float32, copy=True)
+    raise ValueError("ls_gradient.axis must be 'vertical' or 'horizontal'")
+
+
+def _ls_gradient_factors_torch(
+    height: int,
+    width: int,
+    cfg: dict,
+    rng: np.random.Generator,
+    *,
+    device,
+    dtype,
+) -> "torch.Tensor":
+    top = _sample_float(cfg.get("top_factor", 1.0), rng, "ls_gradient.top_factor")
+    bottom = _sample_float(
+        cfg.get("bottom_factor", 1.0),
+        rng,
+        "ls_gradient.bottom_factor",
+    )
+    if top < 0.0 or bottom < 0.0:
+        raise ValueError("ls_gradient top/bottom factors must be non-negative")
+    gamma = _sample_float(cfg.get("gamma", 1.0), rng, "ls_gradient.gamma")
+    if gamma <= 0.0:
+        raise ValueError(f"ls_gradient.gamma must be > 0, got {gamma}")
+
+    axis = str(cfg.get("axis", "vertical")).lower()
+    if axis in {"vertical", "y", "top_bottom", "top-to-bottom"}:
+        coord = torch.linspace(0.0, 1.0, height, device=device, dtype=dtype).view(
+            height,
+            1,
+        )
+        return (top + (bottom - top) * torch.pow(coord, gamma)).expand(height, width)
+    if axis in {"horizontal", "x", "left_right", "left-to-right"}:
+        coord = torch.linspace(0.0, 1.0, width, device=device, dtype=dtype).view(
+            1,
+            width,
+        )
+        return (top + (bottom - top) * torch.pow(coord, gamma)).expand(height, width)
+    raise ValueError("ls_gradient.axis must be 'vertical' or 'horizontal'")
+
+
+def _weight_ls_gradient_by_opacity_np(
+    factors: np.ndarray,
+    depth_m: np.ndarray,
+    k_field,
+    cfg: dict,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    weight = _sample_float(
+        cfg.get("fog_opacity_weight", 0.0),
+        rng,
+        "ls_gradient.fog_opacity_weight",
+    )
+    if not 0.0 <= weight <= 1.0:
+        raise ValueError(
+            f"ls_gradient.fog_opacity_weight must be in [0, 1], got {weight}"
+        )
+    if weight <= 0.0:
+        return factors
+    gamma = _sample_float(
+        cfg.get("fog_opacity_gamma", 1.0),
+        rng,
+        "ls_gradient.fog_opacity_gamma",
+    )
+    if gamma <= 0.0:
+        raise ValueError(f"ls_gradient.fog_opacity_gamma must be > 0, got {gamma}")
+
+    k_map = broadcast_k_field(k_field, depth_m.shape[0], depth_m.shape[1])
+    opacity = 1.0 - np.exp(-np.maximum(k_map, 0.0) * np.maximum(depth_m, 0.0))
+    blend = (1.0 - weight) + weight * np.power(np.clip(opacity, 0.0, 1.0), gamma)
+    return 1.0 + (factors - 1.0) * blend.astype(np.float32, copy=False)
+
+
+def _weight_ls_gradient_by_opacity_torch(
+    factors: "torch.Tensor",
+    depth_m: "torch.Tensor",
+    k_field,
+    cfg: dict,
+    rng: np.random.Generator,
+) -> "torch.Tensor":
+    weight = _sample_float(
+        cfg.get("fog_opacity_weight", 0.0),
+        rng,
+        "ls_gradient.fog_opacity_weight",
+    )
+    if not 0.0 <= weight <= 1.0:
+        raise ValueError(
+            f"ls_gradient.fog_opacity_weight must be in [0, 1], got {weight}"
+        )
+    if weight <= 0.0:
+        return factors
+    gamma = _sample_float(
+        cfg.get("fog_opacity_gamma", 1.0),
+        rng,
+        "ls_gradient.fog_opacity_gamma",
+    )
+    if gamma <= 0.0:
+        raise ValueError(f"ls_gradient.fog_opacity_gamma must be > 0, got {gamma}")
+
+    if torch.is_tensor(k_field):
+        k_t = k_field.to(device=depth_m.device, dtype=depth_m.dtype)
+    else:
+        k_t = torch.tensor(k_field, device=depth_m.device, dtype=depth_m.dtype)
+    opacity = 1.0 - torch.exp(
+        -torch.clamp(k_t, min=0.0) * torch.clamp(depth_m, min=0.0)
+    )
+    blend = (1.0 - weight) + weight * torch.pow(
+        torch.clamp(opacity, 0.0, 1.0),
+        gamma,
+    )
+    return 1.0 + (factors - 1.0) * blend
+
+
+def _normalize_gradient_factors_np(factors: np.ndarray) -> np.ndarray:
+    mean_factor = float(np.mean(factors))
+    if mean_factor <= 0.0:
+        return factors.astype(np.float32, copy=False)
+    return (factors / mean_factor).astype(np.float32, copy=False)
+
+
+def _normalize_gradient_factors_torch(factors: "torch.Tensor") -> "torch.Tensor":
+    mean_factor = factors.mean()
+    if float(mean_factor.item()) <= 0.0:
+        return factors
+    return factors / mean_factor
+
+
 def apply_fog(
     rgb: np.ndarray, depth_m: np.ndarray, k_field: np.ndarray, ls_field: np.ndarray
 ) -> np.ndarray:
@@ -864,6 +1124,14 @@ def apply_model(
             min_factor,
             max_factor,
             bool(ls_cfg.get("normalize_to_mean", False)),
+        )
+        ls_field = apply_ls_gradient(
+            ls_field,
+            depth_m,
+            k_field,
+            model_cfg,
+            ls_cfg,
+            rng,
         )
         ls_field = np.clip(ls_field, 0.0, 1.0)
     else:

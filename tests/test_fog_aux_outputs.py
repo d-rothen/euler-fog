@@ -1046,6 +1046,47 @@ def test_heterogeneous_ls_uses_dampened_airlight_base() -> None:
     np.testing.assert_allclose(ls_map, np.broadcast_to(airlight, ls_map.shape))
 
 
+def test_heterogeneous_ls_gradient_brightens_top_airlight() -> None:
+    """Optional L_s gradients should act on the atmospheric-light field."""
+    from euler_preprocess.fog.models import apply_model
+
+    rng = np.random.default_rng(123)
+    rgb = np.zeros((20, 16, 3), dtype=np.float32)
+    depth = np.full((20, 16), 80.0, dtype=np.float32)
+    estimated = np.array([0.6, 0.65, 0.7], dtype=np.float32)
+    cfg = {
+        "scattering_coefficient": {"dist": "constant", "value": 0.08},
+        "atmospheric_light": "from_sky",
+        "airlight_dampening": {"enabled": False},
+        "ls_hetero": {
+            "scales": [4],
+            "min_factor": 1.0,
+            "max_factor": 1.0,
+            "normalize_to_mean": False,
+            "ls_gradient": {
+                "enabled": True,
+                "top_factor": 1.18,
+                "bottom_factor": 0.82,
+                "gamma": 1.0,
+                "normalize_to_mean": False,
+                "fog_opacity_weight": 0.0,
+            },
+        },
+    }
+
+    _, _, _, _, ls_map = apply_model(
+        rgb,
+        depth,
+        "heterogeneous_ls",
+        cfg,
+        rng,
+        contrast_threshold_default=0.05,
+        estimated_airlight=estimated,
+    )
+
+    assert float(ls_map[:4].mean()) > float(ls_map[-4:].mean()) * 1.3
+
+
 def test_apply_model_returns_spatial_fields_for_heterogeneous() -> None:
     """Heterogeneous models should return the actual non-constant maps used."""
     from euler_preprocess.fog.models import apply_model

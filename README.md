@@ -508,6 +508,25 @@ With `normalize_to_mean: true`, the arithmetic mean of the per-pixel `k` map
 equals `k_sampled`; the median is not forced to match. With
 `normalize_to_mean: false`, the map mean shifts by the mean of the factor field.
 
+For `heterogeneous_ls` / `heterogeneous_k_ls`, `ls_hetero` can also include a
+weak view-direction illumination prior. This modulates the atmospheric-light
+field itself, so the rendered effect is still gated by fog transmittance:
+
+```json
+"ls_hetero": {
+  "ls_gradient": {
+    "enabled": true,
+    "probability": 0.65,
+    "axis": "vertical",
+    "top_factor": {"dist": "uniform", "min": 1.03, "max": 1.14},
+    "bottom_factor": {"dist": "uniform", "min": 0.88, "max": 0.99},
+    "gamma": {"dist": "uniform", "min": 0.85, "max": 1.6},
+    "normalize_to_mean": true,
+    "fog_opacity_weight": 0.65
+  }
+}
+```
+
 | Parameter | Effect |
 |---|---|
 | `min_factor` / `max_factor` | Range of the multiplicative factor. |
@@ -517,6 +536,7 @@ equals `k_sampled`; the median is not forced to match. With
 | `octaves` / `lacunarity` / `max_scale` | Control how many increasingly broad Perlin components are mixed. |
 | `contrast` | Compress or expand the Perlin range before mapping to factors. Values below 1 are recommended. |
 | `smooth_sigma` / `smooth_sigma_fraction` | Optional final Gaussian blur in pixels or as a fraction of the shorter image side. |
+| `ls_gradient` | Optional `L_s` top-to-bottom or left-to-right factor field. Keep it weak and probabilistic to avoid a deterministic image-position shortcut. |
 
 ### Fog Output
 
