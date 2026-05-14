@@ -1652,6 +1652,95 @@ def _deterministic_sensor_pipeline(
     )
 
 
+def test_sensor_noise_adjustment_scales_authored_noise_groups() -> None:
+    config = {
+        "read_noise_sigma": {"dist": "uniform", "min": 0.01, "max": 0.02},
+        "fixed_pattern_sigma": 0.001,
+        "row_noise_sigma": 0.002,
+        "column_noise_sigma": 0.0015,
+        "banding_modulation": 0.2,
+        "noise_modulation": {
+            "dark_gain": 1.0,
+            "depth_gain": 0.4,
+            "fog_gain": 0.6,
+            "max_gain": 2.0,
+        },
+        "shadow_recovery_noise": {
+            "luma_sigma": 0.003,
+            "chroma_sigma": 0.004,
+            "red_chroma_gain": 0.8,
+            "blue_chroma_gain": 2.0,
+            "chroma_axis_correlation": 0.2,
+            "blotch_sigma": 0.005,
+        },
+        "hot_pixel_probability": 0.0002,
+        "dead_pixel_probability": 0.0001,
+    }
+
+    static = capture_module._apply_sensor_noise_adjustment(
+        {
+            **config,
+            "noise_adjustment": {
+                "level": 1.0,
+                "static_chroma_bias": -1.0,
+            },
+        },
+        np.random.default_rng(1),
+    )
+    chroma = capture_module._apply_sensor_noise_adjustment(
+        {
+            **config,
+            "noise_adjustment": {
+                "level": 1.0,
+                "static_chroma_bias": 1.0,
+            },
+        },
+        np.random.default_rng(1),
+    )
+
+    assert static["row_noise_sigma"] > chroma["row_noise_sigma"]
+    assert static["fixed_pattern_sigma"] > chroma["fixed_pattern_sigma"]
+    assert static["hot_pixel_probability"] > chroma["hot_pixel_probability"]
+    assert (
+        static["shadow_recovery_noise"]["chroma_sigma"]
+        < chroma["shadow_recovery_noise"]["chroma_sigma"]
+    )
+    assert (
+        static["shadow_recovery_noise"]["blue_chroma_gain"]
+        < chroma["shadow_recovery_noise"]["blue_chroma_gain"]
+    )
+    assert static["read_noise_sigma"]["min"] < chroma["read_noise_sigma"]["min"]
+    assert static["noise_modulation"]["max_gain"] == chroma["noise_modulation"]["max_gain"]
+
+
+def test_sensor_noise_adjustment_level_changes_output_noise() -> None:
+    base_overrides = {
+        "demosaic": False,
+        "read_noise_sigma": 0.01,
+    }
+    low = _deterministic_sensor_pipeline(
+        auto_exposure={"enabled": False},
+        sensor_overrides={
+            **base_overrides,
+            "noise_adjustment": {"level": 0.0, "static_chroma_bias": 0.0},
+        },
+    )
+    high = _deterministic_sensor_pipeline(
+        auto_exposure={"enabled": False},
+        sensor_overrides={
+            **base_overrides,
+            "noise_adjustment": {"level": 2.0, "static_chroma_bias": 0.0},
+        },
+    )
+    image = np.full((48, 64, 3), 0.5, dtype=np.float32)
+
+    low_result = low.apply_np(image, CaptureContext(rng=np.random.default_rng(7)))
+    high_result = high.apply_np(image, CaptureContext(rng=np.random.default_rng(7)))
+
+    assert float((low_result - image).std()) < 1e-6
+    assert float((high_result - image).std()) > 0.012
+
+
 def test_sensor_auto_exposure_meters_rendered_luminance() -> None:
     pipeline = _deterministic_sensor_pipeline(
         auto_exposure={

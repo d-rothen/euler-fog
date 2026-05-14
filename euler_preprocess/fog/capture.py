@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 import io
 import math
 from dataclasses import dataclass, field
@@ -522,6 +523,7 @@ class SensorStage(ConfiguredCaptureStage):
             rng,
             manual_exposure_gain=exposure,
         )
+        config = _apply_sensor_noise_adjustment(config, rng)
         wb = _sample_triplet(config.get("white_balance", [1.0, 1.0, 1.0]), rng)
         wb_jitter = _sample_float(config, "white_balance_jitter", 0.0, rng)
         if wb_jitter > 0.0:
@@ -717,6 +719,7 @@ class SensorStage(ConfiguredCaptureStage):
             rng,
             manual_exposure_gain=exposure,
         )
+        config = _apply_sensor_noise_adjustment(config, rng)
         wb = _sample_triplet(config.get("white_balance", [1.0, 1.0, 1.0]), rng)
         wb_jitter = _sample_float(config, "white_balance_jitter", 0.0, rng)
         if wb_jitter > 0.0:
@@ -2150,6 +2153,338 @@ def _resolve_electron_capacity_torch(
         torch.maximum(capacity, torch.ones_like(capacity)),
         torch.zeros_like(capacity),
     )
+
+
+def _apply_sensor_noise_adjustment(
+    config: Mapping[str, Any],
+    rng: np.random.Generator,
+) -> Mapping[str, Any]:
+    cfg = _config_block(config, "noise_adjustment")
+    if not cfg or not _bool_value(cfg.get("enabled", True)):
+        return config
+
+    level = max(
+        _sample_float_from_keys(
+            cfg,
+            ("level", "amount", "factor", "noise_level"),
+            1.0,
+            rng,
+        ),
+        0.0,
+    )
+    bias = float(
+        np.clip(
+            _sample_float_from_keys(
+                cfg,
+                ("static_chroma_bias", "character_bias", "chroma_bias"),
+                0.0,
+                rng,
+            ),
+            -1.0,
+            1.0,
+        )
+    )
+    groups = _config_block(cfg, "groups")
+    limits = _config_block(cfg, "limits")
+
+    min_factor = max(_sample_float(limits, "min_factor", 0.0, rng), 0.0)
+    max_factor = max(_sample_float(limits, "max_factor", 8.0, rng), min_factor)
+
+    def group_factor(name: str, base: float) -> float:
+        factor = base * max(_sample_float(groups, name, 1.0, rng), 0.0)
+        return float(np.clip(factor, min_factor, max_factor))
+
+    read_factor = group_factor("read", level * math.pow(2.0, 0.35 * bias))
+    static_factor = group_factor("static", level * math.pow(2.0, -bias))
+    banding_factor = group_factor("banding", static_factor)
+    bad_pixel_factor = group_factor("bad_pixels", static_factor)
+    chroma_factor = group_factor("chroma", level * math.pow(2.0, bias))
+    shadow_luma_factor = group_factor("shadow_luma", level)
+    modulation_factor = group_factor("modulation", 1.0 + (level - 1.0) * 0.75)
+
+    if (
+        abs(read_factor - 1.0) < 1e-9
+        and abs(static_factor - 1.0) < 1e-9
+        and abs(banding_factor - 1.0) < 1e-9
+        and abs(bad_pixel_factor - 1.0) < 1e-9
+        and abs(chroma_factor - 1.0) < 1e-9
+        and abs(shadow_luma_factor - 1.0) < 1e-9
+        and abs(modulation_factor - 1.0) < 1e-9
+    ):
+        return config
+
+    adjusted = deepcopy(dict(config))
+
+    _scale_config_path(adjusted, ("read_noise_electrons",), read_factor, min_value=0.0)
+    _scale_config_path(adjusted, ("read_noise_sigma",), read_factor, min_value=0.0)
+
+    _scale_config_path(adjusted, ("fixed_pattern_sigma",), static_factor, min_value=0.0)
+    _scale_config_path(adjusted, ("row_noise_sigma",), banding_factor, min_value=0.0)
+    _scale_config_path(adjusted, ("column_noise_sigma",), banding_factor, min_value=0.0)
+    _scale_config_path(
+        adjusted,
+        ("banding_modulation",),
+        banding_factor,
+        min_value=0.0,
+        max_value=1.0,
+    )
+
+    max_bad_pixel_probability = _sample_float(
+        limits,
+        "max_bad_pixel_probability",
+        0.05,
+        rng,
+    )
+    _scale_config_path(
+        adjusted,
+        ("hot_pixel_probability",),
+        bad_pixel_factor,
+        min_value=0.0,
+        max_value=max_bad_pixel_probability,
+    )
+    _scale_config_path(
+        adjusted,
+        ("dead_pixel_probability",),
+        bad_pixel_factor,
+        min_value=0.0,
+        max_value=max_bad_pixel_probability,
+    )
+
+    for key in ("dark_gain", "depth_gain", "fog_gain"):
+        _scale_config_path(
+            adjusted,
+            ("noise_modulation", key),
+            modulation_factor,
+            min_value=0.0,
+        )
+    _scale_config_path(
+        adjusted,
+        ("noise_modulation", "max_gain"),
+        modulation_factor,
+        anchor=1.0,
+        min_value=1.0,
+    )
+
+    _scale_config_path(
+        adjusted,
+        ("shadow_recovery_noise", "luma_sigma"),
+        shadow_luma_factor,
+        min_value=0.0,
+    )
+    _scale_config_path(
+        adjusted,
+        ("shadow_recovery_noise", "chroma_sigma"),
+        chroma_factor,
+        min_value=0.0,
+    )
+    _scale_config_path(
+        adjusted,
+        ("shadow_recovery_noise", "blotch_sigma"),
+        chroma_factor,
+        min_value=0.0,
+    )
+    _scale_config_path(
+        adjusted,
+        ("shadow_recovery_noise", "red_chroma_gain"),
+        chroma_factor,
+        anchor=1.0,
+        min_value=0.0,
+    )
+    _scale_config_path(
+        adjusted,
+        ("shadow_recovery_noise", "blue_chroma_gain"),
+        chroma_factor,
+        anchor=1.0,
+        min_value=0.0,
+    )
+    _scale_config_path(
+        adjusted,
+        ("shadow_recovery_noise", "chroma_axis_correlation"),
+        chroma_factor,
+        min_value=-0.95,
+        max_value=0.95,
+    )
+    return adjusted
+
+
+def _sample_float_from_keys(
+    config: Mapping[str, Any],
+    keys: tuple[str, ...],
+    default: float,
+    rng: np.random.Generator,
+) -> float:
+    for key in keys:
+        if config.get(key) is not None:
+            return _sample_float(config, key, default, rng)
+    return float(default)
+
+
+def _scale_config_path(
+    config: dict[str, Any],
+    path: tuple[str, ...],
+    factor: float,
+    *,
+    anchor: float = 0.0,
+    min_value: float | None = None,
+    max_value: float | None = None,
+) -> None:
+    parent: dict[str, Any] = config
+    for key in path[:-1]:
+        value = parent.get(key)
+        if not isinstance(value, dict):
+            return
+        parent = value
+    key = path[-1]
+    if key not in parent or parent[key] is None:
+        return
+    parent[key] = _scale_numeric_spec(
+        parent[key],
+        factor,
+        anchor=anchor,
+        min_value=min_value,
+        max_value=max_value,
+    )
+
+
+def _scale_numeric_spec(
+    spec: Any,
+    factor: float,
+    *,
+    anchor: float = 0.0,
+    min_value: float | None = None,
+    max_value: float | None = None,
+) -> Any:
+    if isinstance(spec, bool) or spec is None:
+        return spec
+    if isinstance(spec, (int, float)):
+        return _clamp_scaled_number(
+            anchor + (float(spec) - anchor) * factor,
+            min_value,
+            max_value,
+        )
+    if isinstance(spec, list):
+        return [
+            _scale_numeric_spec(
+                value,
+                factor,
+                anchor=anchor,
+                min_value=min_value,
+                max_value=max_value,
+            )
+            for value in spec
+        ]
+    if isinstance(spec, tuple):
+        return tuple(
+            _scale_numeric_spec(
+                value,
+                factor,
+                anchor=anchor,
+                min_value=min_value,
+                max_value=max_value,
+            )
+            for value in spec
+        )
+    if not isinstance(spec, dict):
+        return spec
+
+    scaled = dict(spec)
+    dist = scaled.get("dist")
+    if dist is None:
+        if "value" in scaled:
+            scaled["value"] = _scale_numeric_spec(
+                scaled["value"],
+                factor,
+                anchor=anchor,
+                min_value=min_value,
+                max_value=max_value,
+            )
+        return scaled
+
+    if dist == "constant":
+        scaled["value"] = _scale_numeric_spec(
+            scaled.get("value", 0.0),
+            factor,
+            anchor=anchor,
+            min_value=min_value,
+            max_value=max_value,
+        )
+    elif dist == "uniform":
+        scaled["min"] = _scale_numeric_spec(
+            scaled["min"],
+            factor,
+            anchor=anchor,
+            min_value=min_value,
+            max_value=max_value,
+        )
+        scaled["max"] = _scale_numeric_spec(
+            scaled["max"],
+            factor,
+            anchor=anchor,
+            min_value=min_value,
+            max_value=max_value,
+        )
+        if scaled["min"] > scaled["max"]:
+            scaled["min"], scaled["max"] = scaled["max"], scaled["min"]
+    elif dist == "normal":
+        scaled["mean"] = _scale_numeric_spec(
+            scaled["mean"],
+            factor,
+            anchor=anchor,
+            min_value=min_value,
+            max_value=max_value,
+        )
+        scaled["std"] = max(float(scaled.get("std", 0.0)) * abs(factor), 0.0)
+        for key in ("min", "max"):
+            if key in scaled and scaled[key] is not None:
+                scaled[key] = _scale_numeric_spec(
+                    scaled[key],
+                    factor,
+                    anchor=anchor,
+                    min_value=min_value,
+                    max_value=max_value,
+                )
+        if scaled.get("min") is not None and scaled.get("max") is not None:
+            if scaled["min"] > scaled["max"]:
+                scaled["min"], scaled["max"] = scaled["max"], scaled["min"]
+    elif dist == "lognormal":
+        if anchor == 0.0 and factor > 0.0:
+            scaled["mean"] = float(scaled.get("mean", 0.0)) + math.log(factor)
+        for key in ("min", "max"):
+            if key in scaled and scaled[key] is not None:
+                scaled[key] = _scale_numeric_spec(
+                    scaled[key],
+                    factor,
+                    anchor=anchor,
+                    min_value=min_value,
+                    max_value=max_value,
+                )
+        if scaled.get("min") is not None and scaled.get("max") is not None:
+            if scaled["min"] > scaled["max"]:
+                scaled["min"], scaled["max"] = scaled["max"], scaled["min"]
+    elif dist == "choice":
+        scaled["values"] = [
+            _scale_numeric_spec(
+                value,
+                factor,
+                anchor=anchor,
+                min_value=min_value,
+                max_value=max_value,
+            )
+            for value in scaled.get("values", [])
+        ]
+    return scaled
+
+
+def _clamp_scaled_number(
+    value: float,
+    min_value: float | None,
+    max_value: float | None,
+) -> float:
+    if min_value is not None:
+        value = max(float(min_value), value)
+    if max_value is not None:
+        value = min(float(max_value), value)
+    return float(value)
 
 
 def _sensor_noise_modulation(

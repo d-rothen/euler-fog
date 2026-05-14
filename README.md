@@ -309,6 +309,28 @@ noise is fine-grained rather than blocky. `black_noise_floor` with
 noise in near-clipped black regions, so the strongest visible noise sits in
 dim-but-readable shadows.
 
+Set `sensor.noise_adjustment` for relative, scenario-level noise controls on
+top of the selected camera/condition profile. `level: 1.0` leaves the authored
+profile unchanged; lower values suppress read/static/chroma noise and higher
+values amplify it. `static_chroma_bias` ranges from `-1.0` for more fixed
+pattern, row/column, banding, and bad-pixel noise to `1.0` for more
+chromatic/high-ISO-looking shadow noise:
+
+```json
+{
+  "capture_overrides": {
+    "sensor": {
+      "condition_profile": "nominal_gloom",
+      "noise_adjustment": {
+        "enabled": true,
+        "level": 1.25,
+        "static_chroma_bias": 0.35
+      }
+    }
+  }
+}
+```
+
 Any stage can define `condition_profiles` to sample coherent per-image settings
 before the stage runs. This is useful for exposure states where ISO, exposure
 gain, read noise, banding, and dark/fog noise modulation should move together:
