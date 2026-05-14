@@ -27,6 +27,7 @@ from euler_loading.loaders.cpu.generic import (
 from euler_preprocess.common.output import prepare_output_backends
 import euler_preprocess.fog.capture as capture_module
 from euler_preprocess.fog.capture import CaptureArtifactPipeline, CaptureContext
+from euler_preprocess.fog.inference import render_fog_image, render_fog_sample
 from euler_preprocess.fog.models import visibility_to_k
 from euler_preprocess.fog.transform import (
     ATMOSPHERIC_LIGHT_SLOT,
@@ -1423,6 +1424,89 @@ def test_capture_camera_profile_supplies_stage_defaults() -> None:
     assert pipeline.stages[0].config["iso"] == 400.0
     assert pipeline.stages[0].config["bayer_pattern"] == "RGGB"
     assert pipeline.stages[0].config["read_noise_electrons"] == 3.0
+
+
+def test_render_fog_sample_accepts_modalities_and_named_scenario() -> None:
+    config = {
+        "airlight": "from_sky",
+        "device": "cpu",
+        "seed": 17,
+        "capture": {
+            "stages": [
+                {
+                    "type": "exposure",
+                    "gain": 1.0,
+                    "condition_profiles": [
+                        {"name": "clean", "weight": 1.0, "gain": 1.0},
+                        {"name": "dark", "weight": 0.0, "gain": 0.25},
+                    ],
+                }
+            ]
+        },
+        "scenario_profiles": [
+            {
+                "name": "clean_reference",
+                "weight": 1.0,
+                "model": "uniform",
+                "models": {
+                    "uniform": {
+                        "visibility_m": 30.0,
+                        "atmospheric_light": [0.2, 0.2, 0.2],
+                    }
+                },
+                "capture_overrides": {"exposure": {"condition_profile": "clean"}},
+            },
+            {
+                "name": "dark_reference",
+                "weight": 1.0,
+                "model": "uniform",
+                "models": {
+                    "uniform": {
+                        "visibility_m": 30.0,
+                        "atmospheric_light": [0.2, 0.2, 0.2],
+                    }
+                },
+                "capture_overrides": {"exposure": {"condition_profile": "dark"}},
+            },
+        ],
+    }
+    rgb = np.full((4, 5, 3), 0.8, dtype=np.float32)
+    depth = np.zeros((4, 5), dtype=np.float32)
+    semantic = np.zeros((4, 5, 3), dtype=np.uint8)
+    semantic[:2, :, :] = np.array([29, 0, 0], dtype=np.uint8)
+    intrinsics = np.array(
+        [[100.0, 0.0, 2.0], [0.0, 100.0, 1.5], [0.0, 0.0, 1.0]],
+        dtype=np.float32,
+    )
+
+    result = render_fog_sample(
+        rgb=rgb,
+        depth=depth,
+        semantic_segmentation=semantic,
+        intrinsics=intrinsics,
+        config=config,
+        scenario_profile_name="dark_reference",
+        mode="cpu",
+    )
+    image = render_fog_image(
+        rgb=rgb,
+        depth=depth,
+        semantic_segmentation=semantic,
+        intrinsics={
+            "fx": 100.0,
+            "fy": 100.0,
+            "cx": 2.0,
+            "cy": 1.5,
+        },
+        config=config,
+        scenario_profile_name="dark_reference",
+        mode="cpu",
+    )
+
+    assert result.scenario_name == "dark_reference"
+    assert result.model_name == "uniform"
+    np.testing.assert_allclose(result.rgb, 0.2)
+    np.testing.assert_allclose(image, result.rgb)
 
 
 def test_optics_stage_uses_intrinsics_principal_point() -> None:
