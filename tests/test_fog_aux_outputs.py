@@ -25,6 +25,7 @@ from euler_loading.loaders.cpu.generic import (
 )
 
 from euler_preprocess.common.output import prepare_output_backends
+import euler_preprocess.fog.capture as capture_module
 from euler_preprocess.fog.capture import CaptureArtifactPipeline, CaptureContext
 from euler_preprocess.fog.models import visibility_to_k
 from euler_preprocess.fog.transform import (
@@ -569,6 +570,424 @@ def test_capture_custom_stage_chain_can_resize_and_quantize() -> None:
     assert result.shape == (6, 8, 3)
     assert result.dtype == np.float32
     np.testing.assert_allclose(result, np.round(result * 15.0) / 15.0)
+
+
+def test_capture_torch_stage_dispatch_keeps_deterministic_stages_on_torch(
+    monkeypatch,
+) -> None:
+    torch = pytest.importorskip("torch")
+
+    def fail_cpu_transfer(_image):
+        raise AssertionError("deterministic torch stages should not use NumPy fallback")
+
+    monkeypatch.setattr(capture_module, "_torch_to_numpy_image", fail_cpu_transfer)
+    pipeline = CaptureArtifactPipeline.from_config(
+        {
+            "capture": {
+                "stages": [
+                    {
+                        "type": "exposure",
+                        "gain": 0.5,
+                        "white_balance": [1.0, 1.0, 1.0],
+                        "white_balance_jitter": 0.0,
+                    },
+                    {
+                        "type": "isp",
+                        "denoise_sigma": 0.0,
+                        "color_matrix": [
+                            [1.0, 0.0, 0.0],
+                            [0.0, 1.0, 0.0],
+                            [0.0, 0.0, 1.0],
+                        ],
+                        "tone_map": "none",
+                        "gamma": "linear",
+                        "local_contrast_strength": 0.0,
+                        "sharpen_amount": 0.0,
+                        "saturation": 1.0,
+                    },
+                    {
+                        "type": "transport",
+                        "resize": [8, 6],
+                        "bit_depth": 4,
+                        "jpeg": {"enabled": False},
+                    },
+                ]
+            }
+        }
+    )
+    image = torch.full((12, 16, 3), 0.8, dtype=torch.float32)
+
+    result = pipeline.apply_torch(
+        image,
+        context=CaptureContext(rng=np.random.default_rng(7)),
+    )
+
+    assert torch.is_tensor(result)
+    assert result.device == image.device
+    assert result.dtype == image.dtype
+    assert result.shape == (6, 8, 3)
+    torch.testing.assert_close(result, torch.round(result * 15.0) / 15.0)
+
+
+def test_capture_torch_matches_numpy_for_deterministic_post_sensor_stack() -> None:
+    torch = pytest.importorskip("torch")
+    config = {
+        "capture": {
+            "stages": [
+                {
+                    "type": "exposure",
+                    "gain": 0.75,
+                    "white_balance": [1.05, 0.95, 1.0],
+                    "white_balance_jitter": 0.0,
+                },
+                {
+                    "type": "isp",
+                    "denoise_sigma": 0.0,
+                    "color_matrix": [
+                        [1.0, 0.02, 0.0],
+                        [0.0, 0.98, 0.01],
+                        [0.02, 0.0, 1.0],
+                    ],
+                    "tone_map": "reinhard",
+                    "tone_map_strength": 0.2,
+                    "gamma": "srgb",
+                    "local_contrast_strength": 0.0,
+                    "sharpen_amount": 0.0,
+                    "saturation": 0.85,
+                },
+                {
+                    "type": "transport",
+                    "bit_depth": 0,
+                    "jpeg": {"enabled": False},
+                },
+            ]
+        }
+    }
+    pipeline = CaptureArtifactPipeline.from_config(config)
+    x = np.linspace(0.05, 0.9, 9, dtype=np.float32)
+    y = np.linspace(0.1, 0.8, 7, dtype=np.float32)
+    image = np.dstack(
+        [
+            np.broadcast_to(x, (7, 9)),
+            np.broadcast_to(y[:, None], (7, 9)),
+            np.full((7, 9), 0.4, dtype=np.float32),
+        ]
+    )
+
+    expected = pipeline.apply_np(
+        image,
+        context=CaptureContext(rng=np.random.default_rng(12)),
+    )
+    actual_t = pipeline.apply_torch(
+        torch.from_numpy(image),
+        context=CaptureContext(rng=np.random.default_rng(12)),
+    )
+
+    assert torch.is_tensor(actual_t)
+    np.testing.assert_allclose(actual_t.detach().cpu().numpy(), expected, atol=1e-6)
+
+
+def test_optics_torch_stage_uses_torch_for_supported_effects(monkeypatch) -> None:
+    torch = pytest.importorskip("torch")
+
+    def fail_cpu_transfer(_image):
+        raise AssertionError("supported optics effects should not use NumPy fallback")
+
+    monkeypatch.setattr(capture_module, "_torch_to_numpy_image", fail_cpu_transfer)
+    pipeline = CaptureArtifactPipeline.from_config(
+        {
+            "capture": {
+                "stages": [
+                    {
+                        "type": "optics",
+                        "lens_distortion": 0.012,
+                        "lens_distortion_k2": 0.002,
+                        "chromatic_aberration_px": 0.35,
+                        "depth_chromatic_fringing": {
+                            "enabled": True,
+                            "strength_px": 0.8,
+                            "depth_weight": 0.4,
+                            "fog_weight": 0.4,
+                            "dark_weight": 0.2,
+                            "gamma": 1.0,
+                            "max_alpha": 0.6,
+                            "blur_sigma": 0.0,
+                        },
+                        "blur_sigma": 0.25,
+                        "motion_blur": {
+                            "enabled": True,
+                            "probability": 1.0,
+                            "length_px": 3.0,
+                            "angle_deg": 4.0,
+                        },
+                        "bloom": {
+                            "enabled": True,
+                            "threshold": 0.45,
+                            "strength": 0.05,
+                            "sigma": 1.2,
+                        },
+                        "veiling_glare_strength": 0.02,
+                        "vignetting_strength": 0.18,
+                        "vignetting_radius": 1.05,
+                        "windshield_haze": {
+                            "enabled": True,
+                            "probability": 1.0,
+                            "strength": 0.025,
+                            "blur_sigma": 2.0,
+                            "color": [0.82, 0.86, 0.88],
+                        },
+                        "droplets": {"enabled": False},
+                    }
+                ]
+            }
+        }
+    )
+    x = torch.linspace(0.05, 0.95, 48)
+    y = torch.linspace(0.1, 0.85, 32)
+    image = torch.stack(
+        [
+            x.view(1, -1).expand(32, 48),
+            y.view(-1, 1).expand(32, 48),
+            torch.full((32, 48), 0.65),
+        ],
+        dim=-1,
+    )
+    depth = torch.linspace(4.0, 80.0, 48).view(1, -1).expand(32, 48)
+    k_map = torch.full((32, 48), 0.08)
+    intrinsics = np.array(
+        [[42.0, 0.0, 24.0], [0.0, 40.0, 15.0], [0.0, 0.0, 1.0]],
+        dtype=np.float32,
+    )
+
+    result = pipeline.apply_torch(
+        image,
+        context=CaptureContext(
+            rng=np.random.default_rng(31),
+            depth_m=depth,
+            k_map=k_map,
+            intrinsics=intrinsics,
+        ),
+    )
+
+    assert torch.is_tensor(result)
+    assert result.device == image.device
+    assert result.shape == image.shape
+    assert 0.0 <= float(result.min()) <= float(result.max()) <= 1.0
+    assert not torch.allclose(result, image)
+
+
+def test_optics_torch_matches_numpy_for_intrinsics_vignetting() -> None:
+    torch = pytest.importorskip("torch")
+    pipeline = CaptureArtifactPipeline.from_config(
+        {
+            "capture": {
+                "stages": [
+                    {
+                        "type": "optics",
+                        "lens_distortion": 0.0,
+                        "chromatic_aberration_px": 0.0,
+                        "depth_chromatic_fringing": {"enabled": False},
+                        "blur_sigma": 0.0,
+                        "motion_blur": {"enabled": False},
+                        "bloom": {"enabled": False},
+                        "veiling_glare_strength": 0.0,
+                        "vignetting_strength": 0.2,
+                        "vignetting_radius": 1.1,
+                        "windshield_haze": {"enabled": False},
+                        "droplets": {"enabled": False},
+                    }
+                ]
+            }
+        }
+    )
+    image = np.full((12, 16, 3), 0.75, dtype=np.float32)
+    intrinsics = np.array(
+        [[14.0, 0.0, 8.0], [0.0, 13.0, 5.5], [0.0, 0.0, 1.0]],
+        dtype=np.float32,
+    )
+
+    expected = pipeline.apply_np(
+        image,
+        context=CaptureContext(
+            rng=np.random.default_rng(41),
+            intrinsics=intrinsics,
+        ),
+    )
+    actual_t = pipeline.apply_torch(
+        torch.from_numpy(image),
+        context=CaptureContext(
+            rng=np.random.default_rng(41),
+            intrinsics=intrinsics,
+        ),
+    )
+
+    np.testing.assert_allclose(actual_t.detach().cpu().numpy(), expected, atol=1e-6)
+
+
+def test_sensor_torch_matches_numpy_for_deterministic_bayer_path() -> None:
+    torch = pytest.importorskip("torch")
+    pipeline = CaptureArtifactPipeline.from_config(
+        {
+            "capture": {
+                "stages": [
+                    {
+                        "type": "sensor",
+                        "input_space": "linear",
+                        "exposure_gain": 1.0,
+                        "auto_exposure": {"enabled": False},
+                        "white_balance": [1.0, 1.0, 1.0],
+                        "white_balance_jitter": 0.0,
+                        "channel_gain_sigma": 0.0,
+                        "camera_matrix": [
+                            [1.0, 0.0, 0.0],
+                            [0.0, 1.0, 0.0],
+                            [0.0, 0.0, 1.0],
+                        ],
+                        "clip": 1.0,
+                        "bayer_pattern": "RGGB",
+                        "shot_noise_electrons": 0.0,
+                        "read_noise_sigma": 0.0,
+                        "fixed_pattern_sigma": 0.0,
+                        "row_noise_sigma": 0.0,
+                        "column_noise_sigma": 0.0,
+                        "black_level": [0.0, 0.0, 0.0],
+                        "black_level_jitter": 0.0,
+                        "white_level": [1.0, 1.0, 1.0],
+                        "white_level_jitter": 0.0,
+                        "adc_bit_depth": 0,
+                        "post_demosaic_bit_depth": 0,
+                        "hot_pixel_probability": 0.0,
+                        "dead_pixel_probability": 0.0,
+                        "demosaic": True,
+                        "shadow_recovery_noise": {"enabled": False},
+                    }
+                ]
+            }
+        }
+    )
+    x = np.linspace(0.05, 0.95, 18, dtype=np.float32)
+    y = np.linspace(0.1, 0.8, 14, dtype=np.float32)
+    image = np.dstack(
+        [
+            np.broadcast_to(x, (14, 18)),
+            np.broadcast_to(y[:, None], (14, 18)),
+            np.full((14, 18), 0.45, dtype=np.float32),
+        ]
+    )
+
+    expected = pipeline.apply_np(
+        image,
+        context=CaptureContext(rng=np.random.default_rng(51)),
+    )
+    actual_t = pipeline.apply_torch(
+        torch.from_numpy(image),
+        context=CaptureContext(rng=np.random.default_rng(51)),
+    )
+
+    np.testing.assert_allclose(actual_t.detach().cpu().numpy(), expected, atol=1e-6)
+
+
+def test_sensor_torch_stage_uses_torch_for_noise_and_shadow_path(
+    monkeypatch,
+) -> None:
+    torch = pytest.importorskip("torch")
+
+    def fail_cpu_transfer(_image):
+        raise AssertionError("sensor torch path should not use NumPy fallback")
+
+    monkeypatch.setattr(capture_module, "_torch_to_numpy_image", fail_cpu_transfer)
+    pipeline = CaptureArtifactPipeline.from_config(
+        {
+            "capture": {
+                "stages": [
+                    {
+                        "type": "sensor",
+                        "input_space": "linear",
+                        "exposure_gain": 1.0,
+                        "auto_exposure": {
+                            "enabled": True,
+                            "target_luminance": 0.2,
+                            "metering": "center_weighted",
+                            "resolve_iso": True,
+                            "max_iso": 800.0,
+                        },
+                        "white_balance": [1.0, 1.0, 1.0],
+                        "white_balance_jitter": 0.0,
+                        "channel_gain_sigma": 0.0,
+                        "camera_matrix": [
+                            [1.0, 0.0, 0.0],
+                            [0.0, 1.0, 0.0],
+                            [0.0, 0.0, 1.0],
+                        ],
+                        "bayer_pattern": "RGGB",
+                        "iso": 400.0,
+                        "base_iso": 100.0,
+                        "full_well_electrons": [8000.0, 9000.0, 8200.0],
+                        "read_noise_electrons": 2.5,
+                        "fixed_pattern_sigma": 0.0005,
+                        "row_noise_sigma": 0.0008,
+                        "row_banding_correlation_px": 16.0,
+                        "column_noise_sigma": 0.0005,
+                        "column_banding_correlation_px": 16.0,
+                        "black_level": [0.0, 0.0, 0.0],
+                        "black_level_jitter": 0.0,
+                        "white_level": [1.0, 1.0, 1.0],
+                        "white_level_jitter": 0.0,
+                        "adc_bit_depth": 12,
+                        "post_demosaic_bit_depth": 12,
+                        "hot_pixel_probability": 0.0005,
+                        "dead_pixel_probability": 0.0005,
+                        "demosaic": True,
+                        "noise_modulation": {
+                            "enabled": True,
+                            "dark_gain": 0.6,
+                            "depth_gain": 0.3,
+                            "fog_gain": 0.4,
+                            "max_gain": 2.0,
+                            "smooth_sigma": 0.4,
+                            "black_noise_floor": 0.3,
+                            "black_suppression_luminance": 0.02,
+                        },
+                        "shadow_recovery_noise": {
+                            "enabled": True,
+                            "luminance_threshold": 0.35,
+                            "luminance_softness": 0.2,
+                            "gamma": 1.0,
+                            "strength": 0.6,
+                            "luma_sigma": 0.002,
+                            "chroma_sigma": 0.006,
+                            "chroma_mode": "balanced",
+                            "red_chroma_gain": 0.8,
+                            "blue_chroma_gain": 1.4,
+                            "chroma_luminance_preservation": 1.0,
+                            "smooth_sigma": 0.2,
+                            "fog_weight": 0.2,
+                            "depth_weight": 0.2,
+                        },
+                    }
+                ]
+            }
+        }
+    )
+    image = torch.full((32, 40, 3), 0.32, dtype=torch.float32)
+    image[:, :12] = 0.08
+    depth = torch.linspace(3.0, 70.0, 40).view(1, -1).expand(32, 40)
+    k_map = torch.full((32, 40), 0.06)
+
+    result = pipeline.apply_torch(
+        image,
+        context=CaptureContext(
+            rng=np.random.default_rng(61),
+            depth_m=depth,
+            k_map=k_map,
+        ),
+    )
+
+    assert torch.is_tensor(result)
+    assert result.device == image.device
+    assert result.shape == image.shape
+    assert 0.0 <= float(result.min()) <= float(result.max()) <= 1.0
+    assert not torch.allclose(result, image)
 
 
 def test_capture_stage_condition_profiles_override_stage_config() -> None:
