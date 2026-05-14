@@ -990,6 +990,122 @@ def test_sensor_torch_stage_uses_torch_for_noise_and_shadow_path(
     assert not torch.allclose(result, image)
 
 
+def test_capture_torch_pipeline_runs_on_mps_without_image_fallback(
+    monkeypatch,
+) -> None:
+    torch = pytest.importorskip("torch")
+    if not torch.backends.mps.is_available():
+        pytest.skip("MPS backend is not available")
+
+    def fail_cpu_transfer(_image):
+        raise AssertionError("MPS capture path should not use image NumPy fallback")
+
+    monkeypatch.setattr(capture_module, "_torch_to_numpy_image", fail_cpu_transfer)
+    pipeline = CaptureArtifactPipeline.from_config(
+        {
+            "capture": {
+                "stages": [
+                    {
+                        "type": "optics",
+                        "lens_distortion": 0.002,
+                        "chromatic_aberration_px": 0.1,
+                        "depth_chromatic_fringing": {
+                            "enabled": True,
+                            "strength_px": 0.2,
+                            "depth_weight": 0.5,
+                            "fog_weight": 0.5,
+                            "dark_weight": 0.0,
+                            "blur_sigma": 0.0,
+                        },
+                        "blur_sigma": 0.1,
+                        "motion_blur": {
+                            "enabled": True,
+                            "probability": 1.0,
+                            "length_px": 2.0,
+                            "angle_deg": 2.0,
+                        },
+                        "bloom": {
+                            "enabled": True,
+                            "threshold": 0.6,
+                            "strength": 0.02,
+                            "sigma": 0.5,
+                        },
+                        "veiling_glare_strength": 0.0,
+                        "vignetting_strength": 0.05,
+                        "windshield_haze": {"enabled": False},
+                        "droplets": {"enabled": False},
+                    },
+                    {
+                        "type": "sensor",
+                        "input_space": "linear",
+                        "exposure_gain": 1.0,
+                        "auto_exposure": {
+                            "enabled": True,
+                            "resolve_iso": False,
+                        },
+                        "white_balance": [1.0, 1.0, 1.0],
+                        "white_balance_jitter": 0.0,
+                        "channel_gain_sigma": 0.0,
+                        "camera_matrix": [
+                            [1.0, 0.0, 0.0],
+                            [0.0, 1.0, 0.0],
+                            [0.0, 0.0, 1.0],
+                        ],
+                        "bayer_pattern": "RGGB",
+                        "shot_noise_electrons": 0.0,
+                        "read_noise_sigma": 0.0,
+                        "fixed_pattern_sigma": 0.0,
+                        "row_noise_sigma": 0.0,
+                        "column_noise_sigma": 0.0,
+                        "black_level": [0.0, 0.0, 0.0],
+                        "black_level_jitter": 0.0,
+                        "white_level": [1.0, 1.0, 1.0],
+                        "white_level_jitter": 0.0,
+                        "adc_bit_depth": 0,
+                        "post_demosaic_bit_depth": 0,
+                        "hot_pixel_probability": 0.0,
+                        "dead_pixel_probability": 0.0,
+                        "shadow_recovery_noise": {"enabled": False},
+                    },
+                    {
+                        "type": "isp",
+                        "denoise_sigma": 0.0,
+                        "tone_map": "none",
+                        "gamma": "linear",
+                        "local_contrast_strength": 0.0,
+                        "sharpen_amount": 0.0,
+                        "saturation": 1.0,
+                    },
+                    {
+                        "type": "transport",
+                        "bit_depth": 8,
+                        "jpeg": {"enabled": False},
+                    },
+                ]
+            }
+        }
+    )
+    device = torch.device("mps")
+    image = torch.rand((16, 20, 3), device=device, dtype=torch.float32)
+    depth = torch.full((16, 20), 20.0, device=device, dtype=torch.float32)
+    k_map = torch.full((16, 20), 0.04, device=device, dtype=torch.float32)
+
+    result = pipeline.apply_torch(
+        image,
+        context=CaptureContext(
+            rng=np.random.default_rng(71),
+            depth_m=depth,
+            k_map=k_map,
+        ),
+    )
+
+    result_cpu = result.detach().cpu()
+    assert torch.is_tensor(result)
+    assert result.device.type == "mps"
+    assert result.shape == image.shape
+    assert 0.0 <= float(result_cpu.min()) <= float(result_cpu.max()) <= 1.0
+
+
 def test_capture_stage_condition_profiles_override_stage_config() -> None:
     pipeline = CaptureArtifactPipeline.from_config(
         {
