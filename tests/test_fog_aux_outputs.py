@@ -1234,6 +1234,174 @@ def test_scenario_profile_correlates_model_and_capture_overrides(
     np.testing.assert_allclose(result.rgb, 0.2)
 
 
+def test_gpu_batching_freezes_batch_condition_parameters(
+    tmp_path: Path,
+) -> None:
+    cfg = {
+        "airlight": "from_sky",
+        "device": "cpu",
+        "seed": 11,
+        "gpu_batch_size": 2,
+        "gpu_batching": {"scenario_scope": "batch"},
+        "capture": {
+            "stages": [
+                {
+                    "type": "sensor",
+                    "enabled": True,
+                    "iso": {"dist": "uniform", "min": 800.0, "max": 1600.0},
+                    "shot_noise_scale": {
+                        "dist": "uniform",
+                        "min": 0.1,
+                        "max": 0.2,
+                    },
+                }
+            ]
+        },
+        "scenario_profiles": [
+            {
+                "name": "batch_dense",
+                "weight": 1.0,
+                "model": "uniform",
+                "models": {
+                    "uniform": {
+                        "visibility_m": {
+                            "dist": "uniform",
+                            "min": 20.0,
+                            "max": 40.0,
+                        },
+                        "atmospheric_light": [0.2, 0.2, 0.2],
+                    }
+                },
+                "capture_overrides": {
+                    "sensor": {
+                        "read_noise_electrons": {
+                            "dist": "uniform",
+                            "min": 2.0,
+                            "max": 4.0,
+                        }
+                    }
+                },
+            }
+        ],
+    }
+    config_path = tmp_path / "gpu_batching_config.json"
+    config_path.write_text(json.dumps(cfg))
+    transform = FogTransform(
+        config_path=str(config_path),
+        out_path=str(tmp_path / "out"),
+    )
+
+    plan = transform._resolve_gpu_batch_render_plan(0)
+
+    assert plan is not None
+    assert transform.gpu_scenario_scope == "batch"
+    assert transform.gpu_condition_parameter_scope == "batch"
+    assert plan.scenario_name == "batch_dense"
+    assert isinstance(plan.model_cfg["visibility_m"], float)
+    assert 20.0 <= plan.model_cfg["visibility_m"] <= 40.0
+    assert plan.capture_artifacts is not None
+    sensor_cfg = plan.capture_artifacts.stages[0].config
+    assert sensor_cfg["enabled"] is True
+    assert isinstance(sensor_cfg["iso"], float)
+    assert isinstance(sensor_cfg["shot_noise_scale"], float)
+    assert isinstance(sensor_cfg["read_noise_electrons"], float)
+
+
+def test_gpu_batch_scenario_keeps_uniform_batch_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    torch = pytest.importorskip("torch")
+    cfg = {
+        "airlight": "from_sky",
+        "device": "cpu",
+        "seed": 13,
+        "gpu_batch_size": 2,
+        "gpu_batching": {
+            "scenario_scope": "batch",
+            "condition_parameter_scope": "batch",
+        },
+        "scenario_profiles": [
+            {
+                "name": "batch_uniform",
+                "weight": 1.0,
+                "model": "uniform",
+                "airlight_method": "dcp_heuristic",
+                "models": {
+                    "uniform": {
+                        "visibility_m": 80.0,
+                        "atmospheric_light": [0.35, 0.35, 0.35],
+                    }
+                },
+                "capture": {"stages": []},
+            }
+        ],
+    }
+    config_path = tmp_path / "gpu_batch_uniform_config.json"
+    config_path.write_text(json.dumps(cfg))
+    transform = FogTransform(
+        config_path=str(config_path),
+        out_path=str(tmp_path / "out"),
+    )
+    transform.torch_device = torch.device("cpu")
+
+    calls = []
+    original = transform.pipeline.apply_capture_torch_batch
+    resolve_calls = []
+    original_resolve = transform.atmospheric_light.resolve_uniform_batch_torch
+
+    def spy_apply_capture_torch_batch(
+        rgb_batch,
+        *,
+        contexts,
+        capture_artifacts=None,
+    ):
+        calls.append((len(contexts), capture_artifacts))
+        return original(
+            rgb_batch,
+            contexts=contexts,
+            capture_artifacts=capture_artifacts,
+        )
+
+    def spy_resolve_uniform_batch_torch(**kwargs):
+        resolve_calls.append(kwargs.get("method"))
+        return original_resolve(**kwargs)
+
+    monkeypatch.setattr(
+        transform.pipeline,
+        "apply_capture_torch_batch",
+        spy_apply_capture_torch_batch,
+    )
+    monkeypatch.setattr(
+        transform.atmospheric_light,
+        "resolve_uniform_batch_torch",
+        spy_resolve_uniform_batch_torch,
+    )
+
+    samples = [
+        {
+            "id": "sample_a",
+            "rgb": np.full((4, 5, 3), 0.6, dtype=np.float32),
+            "depth": np.full((4, 5), 10.0, dtype=np.float32),
+            "semantic_segmentation": np.ones((4, 5), dtype=bool),
+        },
+        {
+            "id": "sample_b",
+            "rgb": np.full((4, 5, 3), 0.4, dtype=np.float32),
+            "depth": np.full((4, 5), 12.0, dtype=np.float32),
+            "semantic_segmentation": np.ones((4, 5), dtype=bool),
+        },
+    ]
+
+    saved = transform._generate_fog_gpu(samples)
+
+    assert len(saved) == 2
+    assert len(calls) == 1
+    assert calls[0][0] == 2
+    assert calls[0][1] is not None
+    assert resolve_calls == ["dcp_heuristic"]
+
+
 def test_capture_camera_profile_supplies_stage_defaults() -> None:
     pipeline = CaptureArtifactPipeline.from_config(
         {

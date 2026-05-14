@@ -116,6 +116,9 @@ _SCENARIO_CONTROL_KEYS = {
 }
 
 
+_GPU_BATCH_SCOPE_VALUES = {"sample", "batch"}
+
+
 @dataclass(frozen=True)
 class RenderPlan:
     model_name: str
@@ -123,6 +126,23 @@ class RenderPlan:
     airlight_method: str | None = None
     capture_artifacts: CaptureArtifactPipeline | None = None
     scenario_name: str | None = None
+
+
+def _freeze_distribution_specs(value: Any, rng: np.random.Generator) -> Any:
+    """Resolve distribution specs while preserving ordinary config structure."""
+    if isinstance(value, dict):
+        if "dist" in value:
+            return sample_value(value, rng)
+        return {
+            key: _freeze_distribution_specs(child, rng)
+            for key, child in value.items()
+        }
+    if isinstance(value, list):
+        return [_freeze_distribution_specs(child, rng) for child in value]
+    if isinstance(value, tuple):
+        return tuple(_freeze_distribution_specs(child, rng) for child in value)
+    return value
+
 
 # Use the canonical euler-loading ``generic.map_2d`` / ``map_3d`` modality
 # annotations.  Auxiliary outputs are written as ``.npy`` files in the
@@ -244,6 +264,10 @@ class FogTransform(Transform):
         )
         self.augmentation_specs = list(self.augmentation_config.specs)
         self.scenario_profiles = self._parse_scenario_profiles(self.config)
+        (
+            self.gpu_scenario_scope,
+            self.gpu_condition_parameter_scope,
+        ) = self._parse_gpu_batching_config(self.config)
         self._configure_output_layout_metadata()
         self._written_configs: set[str] = set()
         self.torch_device = None
@@ -317,6 +341,15 @@ class FogTransform(Transform):
             return np.random.default_rng(np.random.SeedSequence(seed_parts))
         return self.base_rng
 
+    def _rng_for_batch(self, batch_index: int):
+        if self.seed is not None:
+            return np.random.default_rng(
+                np.random.SeedSequence(
+                    [int(self.seed), int(batch_index), 1_000_003]
+                )
+            )
+        return self.base_rng
+
     def _get_airlight_estimator(self, method: str):
         return self.atmospheric_light.get_estimator(method)
 
@@ -379,6 +412,45 @@ class FogTransform(Transform):
                 profiles.append(dict(entry))
             return tuple(profiles)
         return ()
+
+    def _parse_gpu_batching_config(
+        self,
+        config: dict[str, Any],
+    ) -> tuple[str, str]:
+        raw = config.get("gpu_batching", {})
+        if raw is None or raw is False:
+            raw = {}
+        if raw is True:
+            raw = {"scenario_scope": "batch"}
+        if not isinstance(raw, dict):
+            raise ValueError("gpu_batching must be a boolean or object")
+
+        scenario_scope = str(
+            raw.get("scenario_scope", config.get("gpu_scenario_scope", "sample"))
+        ).lower()
+        if scenario_scope not in _GPU_BATCH_SCOPE_VALUES:
+            raise ValueError(
+                "gpu_batching.scenario_scope must be 'sample' or 'batch'"
+            )
+
+        if "condition_parameter_scope" in raw:
+            condition_scope = str(raw["condition_parameter_scope"]).lower()
+        elif "sample_condition_once_per_batch" in raw:
+            condition_scope = (
+                "batch" if bool(raw["sample_condition_once_per_batch"]) else "sample"
+            )
+        else:
+            condition_scope = "batch" if scenario_scope == "batch" else "sample"
+        if condition_scope not in _GPU_BATCH_SCOPE_VALUES:
+            raise ValueError(
+                "gpu_batching.condition_parameter_scope must be 'sample' or 'batch'"
+            )
+        if condition_scope == "batch" and scenario_scope != "batch":
+            raise ValueError(
+                "gpu_batching.condition_parameter_scope='batch' requires "
+                "scenario_scope='batch'"
+            )
+        return scenario_scope, condition_scope
 
     def _sample_scenario_profile(
         self,
@@ -466,25 +538,60 @@ class FogTransform(Transform):
         self,
         rng: np.random.Generator,
         augmentation: FogAugmentationSpec | None = None,
+        *,
+        scenario: dict[str, Any] | None = None,
+        sample_scenario: bool = True,
+        freeze_sampled_parameters: bool = False,
     ) -> RenderPlan:
-        scenario = self._sample_scenario_profile(rng)
+        if sample_scenario:
+            scenario = self._sample_scenario_profile(rng)
         if scenario is None:
+            effective_config = (
+                _freeze_distribution_specs(self.config, rng)
+                if freeze_sampled_parameters
+                else self.config
+            )
+            models_cfg = (
+                effective_config.get("models")
+                or effective_config.get("fog_models")
+                or {}
+            )
             if augmentation is not None:
-                model_name, model_cfg = self._resolve_augmented_model(augmentation)
+                base_cfg = resolve_model_config(augmentation.model_name, models_cfg)
+                model_cfg = deep_merge(base_cfg, augmentation.model_overrides)
+                if freeze_sampled_parameters:
+                    model_cfg = _freeze_distribution_specs(model_cfg, rng)
                 return RenderPlan(
-                    model_name=model_name,
+                    model_name=augmentation.model_name,
                     model_cfg=model_cfg,
                     airlight_method=augmentation.airlight_method,
-                )
-            model_name = select_model(self.config, rng)
-            model_cfg = resolve_model_config(model_name, self.models_cfg)
-            return RenderPlan(model_name=model_name, model_cfg=model_cfg)
+                    capture_artifacts=(
+                        CaptureArtifactPipeline.from_config(effective_config)
+                        if freeze_sampled_parameters
+                        else None
+                    ),
+            )
+            model_name = select_model(effective_config, rng)
+            model_cfg = resolve_model_config(model_name, models_cfg)
+            if freeze_sampled_parameters:
+                model_cfg = _freeze_distribution_specs(model_cfg, rng)
+            return RenderPlan(
+                model_name=model_name,
+                model_cfg=model_cfg,
+                capture_artifacts=(
+                    CaptureArtifactPipeline.from_config(effective_config)
+                    if freeze_sampled_parameters
+                    else None
+                ),
+            )
 
         payload = self._scenario_payload(scenario)
         effective_config = deep_merge(
             self.config,
             self._scenario_config_override(payload),
         )
+        if freeze_sampled_parameters:
+            effective_config = _freeze_distribution_specs(effective_config, rng)
         models_cfg = (
             effective_config.get("models")
             or effective_config.get("fog_models")
@@ -505,6 +612,8 @@ class FogTransform(Transform):
             model_cfg = resolve_model_config(model_name, models_cfg)
             model_cfg = deep_merge(model_cfg, scenario_overrides)
             airlight_method = self._scenario_airlight_method(payload)
+        if freeze_sampled_parameters:
+            model_cfg = _freeze_distribution_specs(model_cfg, rng)
 
         return RenderPlan(
             model_name=model_name,
@@ -512,6 +621,20 @@ class FogTransform(Transform):
             airlight_method=airlight_method,
             capture_artifacts=CaptureArtifactPipeline.from_config(effective_config),
             scenario_name=self._scenario_name(scenario),
+        )
+
+    def _resolve_gpu_batch_render_plan(self, batch_index: int) -> RenderPlan | None:
+        if self.gpu_scenario_scope != "batch":
+            return None
+        rng = self._rng_for_batch(batch_index)
+        scenario = self._sample_scenario_profile(rng)
+        return self._resolve_render_plan(
+            rng,
+            scenario=scenario,
+            sample_scenario=False,
+            freeze_sampled_parameters=(
+                self.gpu_condition_parameter_scope == "batch"
+            ),
         )
 
     def _source_extension(self, sample: dict, backend: Any | None = None) -> str:
@@ -977,7 +1100,10 @@ class FogTransform(Transform):
         saved_paths: list[Path] = []
 
         with progress_bar(total, "GPU", self.logger) as bar:
-            for batch in iter_batches(enumerate(samples), self.gpu_batch_size):
+            for batch_index, batch in enumerate(
+                iter_batches(enumerate(samples), self.gpu_batch_size)
+            ):
+                batch_plan = self._resolve_gpu_batch_render_plan(batch_index)
                 items: list[dict] = []
                 for global_index, sample in batch:
                     rgb = _to_numpy(sample["rgb"])
@@ -993,7 +1119,7 @@ class FogTransform(Transform):
                         )
                     else:
                         rng = self.base_rng
-                    plan = self._resolve_render_plan(rng)
+                    plan = batch_plan or self._resolve_render_plan(rng)
                     items.append(
                         {
                             "sample_id": sample["id"],
@@ -1022,22 +1148,19 @@ class FogTransform(Transform):
                     grouped.setdefault(shape, []).append(item)
 
                 for group_items in grouped.values():
-                    if self.scenario_profiles:
-                        uniform_items = []
-                        other_items = list(group_items)
-                    else:
-                        uniform_items = [
-                            item
-                            for item in group_items
-                            if item["model_name"] == "uniform"
-                        ]
-                        other_items = [
-                            item
-                            for item in group_items
-                            if item["model_name"] != "uniform"
-                        ]
+                    uniform_groups: dict[int, list[dict]] = {}
+                    other_items = []
+                    for item in group_items:
+                        if item["model_name"] != "uniform":
+                            other_items.append(item)
+                            continue
+                        capture_artifacts = item.get("capture_artifacts")
+                        capture_key = (
+                            0 if capture_artifacts is None else id(capture_artifacts)
+                        )
+                        uniform_groups.setdefault(capture_key, []).append(item)
 
-                    if uniform_items:
+                    for uniform_items in uniform_groups.values():
                         rgb_batch = torch.stack(
                             [
                                 normalize_rgb_torch(item["rgb"], device)
@@ -1073,6 +1196,7 @@ class FogTransform(Transform):
                                 contrast_threshold_default=(
                                     self.contrast_threshold_default
                                 ),
+                                method=uniform_items[0].get("airlight_method"),
                             )
                         )
                         k_tensor = torch.tensor(
@@ -1082,6 +1206,7 @@ class FogTransform(Transform):
                         foggy = rgb_batch * t[..., None] + ls_base[
                             :, None, None, :
                         ] * (1.0 - t[..., None])
+                        capture_artifacts = uniform_items[0].get("capture_artifacts")
                         foggy = self.pipeline.apply_capture_torch_batch(
                             foggy,
                             contexts=tuple(
@@ -1100,6 +1225,7 @@ class FogTransform(Transform):
                                 )
                                 for idx, item in enumerate(uniform_items)
                             ),
+                            capture_artifacts=capture_artifacts,
                         )
 
                         height = int(rgb_batch.shape[1])

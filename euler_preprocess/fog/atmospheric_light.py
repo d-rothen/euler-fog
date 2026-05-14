@@ -155,12 +155,13 @@ class AtmosphericLightResolver:
         items: list[dict],
         device: Any,
         contrast_threshold_default: float,
+        method: str | None = None,
     ) -> tuple[list[float], "torch.Tensor"]:
         """Resolve beta and dampened base L_s for a uniform-model torch batch."""
         al_spec = items[0]["model_cfg"].get("atmospheric_light", "from_sky")
         airlight_is_estimated = uses_estimated_airlight(al_spec)
         if airlight_is_estimated:
-            ls_base = self._estimate_batch_torch(rgb_batch, items, device)
+            ls_base = self._estimate_batch_torch(rgb_batch, items, device, method)
             ls_base = normalize_atmospheric_light_torch(ls_base)
         else:
             ls_values = []
@@ -209,17 +210,19 @@ class AtmosphericLightResolver:
         rgb_batch: "torch.Tensor",
         items: list[dict],
         device: Any,
+        method: str | None = None,
     ) -> "torch.Tensor":
-        if self.method == "from_sky":
+        resolved_method = method or self.method
+        if resolved_method == "from_sky":
             return self._estimate_from_sky_batch_torch(rgb_batch, items, device)
-        estimator = self._get_estimator_torch(self.method)
+        estimator = self._get_estimator_torch(resolved_method)
         if estimator is None:
             raise RuntimeError(
-                f"Torch airlight estimator unavailable for method '{self.method}'."
+                f"Torch airlight estimator unavailable for method '{resolved_method}'."
             )
         al_list = []
         for idx, item in enumerate(items):
-            if self.method == "dcp":
+            if resolved_method == "dcp":
                 al_list.append(estimator.compute(rgb_batch[idx]))
             else:
                 sky_mask_t = torch.from_numpy(item["sky_mask"]).to(
