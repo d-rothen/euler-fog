@@ -8,7 +8,7 @@ from typing import Any, Mapping
 import numpy as np
 from PIL import Image
 
-from euler_preprocess.common.noise import perlin_fbm
+from euler_preprocess.common.noise import perlin_fbm, perlin_fbm_torch
 from euler_preprocess.common.sampling import deep_merge, sample_value
 
 try:
@@ -82,6 +82,15 @@ class ConfiguredCaptureStage(CaptureArtifactStage):
             return image
         return self._apply_np(_as_float_rgb(image), context, rng, config)
 
+    def apply_torch(self, image, context: CaptureContext):
+        if torch is None or not torch.is_tensor(image):
+            return self.apply_np(image, context)
+        rng = _rng(context)
+        config = _conditioned_stage_config(self.config, rng)
+        if not self._should_apply(rng, config):
+            return image
+        return self._apply_torch(_as_float_rgb_torch(image), context, rng, config)
+
     def _apply_np(
         self,
         image: np.ndarray,
@@ -90,6 +99,17 @@ class ConfiguredCaptureStage(CaptureArtifactStage):
         config: Mapping[str, Any],
     ) -> np.ndarray:
         return image
+
+    def _apply_torch(
+        self,
+        image,
+        context: CaptureContext,
+        rng: np.random.Generator,
+        config: Mapping[str, Any],
+    ):
+        np_image = _torch_to_numpy_image(image)
+        processed = self._apply_np(np_image, context, rng, config)
+        return _numpy_to_torch_like(processed, image)
 
     def _should_apply(
         self,
@@ -233,6 +253,91 @@ class OpticsStage(ConfiguredCaptureStage):
 
         return _clip01(img)
 
+    def _apply_torch(
+        self,
+        image,
+        context: CaptureContext,
+        rng: np.random.Generator,
+        config: Mapping[str, Any],
+    ):
+        img = image
+        intrinsics = _context_intrinsics_torch(context, img.device, img.dtype)
+
+        distortion = _sample_float(config, "lens_distortion", 0.0, rng)
+        if abs(distortion) > 1e-5:
+            k2 = _sample_float(config, "lens_distortion_k2", 0.0, rng)
+            img = _lens_distort_torch(img, distortion, k2, intrinsics)
+
+        aberration_px = _sample_float(
+            config,
+            "chromatic_aberration_px",
+            0.0,
+            rng,
+        )
+        if aberration_px > 1e-4:
+            img = _chromatic_aberration_torch(img, aberration_px, intrinsics)
+
+        fringing_cfg = _config_block(config, "depth_chromatic_fringing")
+        if _block_enabled(fringing_cfg, rng):
+            img = _apply_depth_chromatic_fringing_torch(
+                img,
+                fringing_cfg,
+                context,
+                intrinsics,
+                rng,
+            )
+
+        blur_sigma = _sample_float(config, "blur_sigma", 0.0, rng)
+        if blur_sigma > 1e-4:
+            img = _gaussian_blur_torch(img, blur_sigma)
+
+        motion_cfg = _config_block(config, "motion_blur")
+        if _block_enabled(motion_cfg, rng):
+            length = _sample_float(motion_cfg, "length_px", 0.0, rng)
+            angle = _sample_float(motion_cfg, "angle_deg", 0.0, rng)
+            if length >= 2.0:
+                img = _motion_blur_torch(img, length, angle)
+
+        bloom_cfg = _config_block(config, "bloom")
+        if _bool_value(bloom_cfg.get("enabled", True)):
+            img = _apply_bloom_torch(img, bloom_cfg, rng)
+
+        glare = _sample_float(config, "veiling_glare_strength", 0.0, rng)
+        if glare > 1e-5:
+            veil = _low_frequency_field_torch(
+                int(img.shape[0]),
+                int(img.shape[1]),
+                rng,
+                img.device,
+                img.dtype,
+            )
+            img = img * (1.0 - float(glare)) + float(glare) * veil[..., None]
+
+        vignette = _sample_float(config, "vignetting_strength", 0.0, rng)
+        if vignette > 1e-5:
+            radius = _sample_float(config, "vignetting_radius", 1.15, rng)
+            mask = _vignette_mask_torch(
+                int(img.shape[0]),
+                int(img.shape[1]),
+                vignette,
+                radius,
+                intrinsics,
+                img.device,
+                img.dtype,
+            )
+            img = img * mask[..., None]
+
+        windshield_cfg = _config_block(config, "windshield_haze")
+        if _block_enabled(windshield_cfg, rng):
+            img = _apply_windshield_haze_torch(img, windshield_cfg, rng)
+
+        droplets_cfg = _config_block(config, "droplets")
+        if _block_enabled(droplets_cfg, rng):
+            img_np = _apply_droplets_np(_torch_to_numpy_image(img), droplets_cfg, rng)
+            img = _numpy_to_torch_like(img_np, img)
+
+        return _clip01_torch(img)
+
 
 class ExposureStage(ConfiguredCaptureStage):
     """Small standalone exposure/white-balance stage for simple configs."""
@@ -267,6 +372,29 @@ class ExposureStage(ConfiguredCaptureStage):
         if _bool_value(config.get("clip", True)):
             out = _clip01(out)
         return out.astype(np.float32, copy=False)
+
+    def _apply_torch(
+        self,
+        image,
+        context: CaptureContext,
+        rng: np.random.Generator,
+        config: Mapping[str, Any],
+    ):
+        gain_key = (
+            "exposure_gain"
+            if config.get("exposure_gain") is not None
+            else "gain"
+        )
+        gain = _sample_float(config, gain_key, 1.0, rng)
+        wb = _sample_triplet(config.get("white_balance", [1.0, 1.0, 1.0]), rng)
+        jitter = _sample_float(config, "white_balance_jitter", 0.0, rng)
+        if jitter > 0.0:
+            wb = wb * rng.lognormal(mean=0.0, sigma=jitter, size=3).astype(np.float32)
+        wb_t = torch.as_tensor(wb, device=image.device, dtype=image.dtype)
+        out = image * float(gain) * wb_t.view(1, 1, 3)
+        if _bool_value(config.get("clip", True)):
+            out = _clip01_torch(out)
+        return out
 
 
 class SensorStage(ConfiguredCaptureStage):
@@ -566,6 +694,230 @@ class SensorStage(ConfiguredCaptureStage):
             rng,
         )
 
+    def _apply_torch(
+        self,
+        image,
+        context: CaptureContext,
+        rng: np.random.Generator,
+        config: Mapping[str, Any],
+    ):
+        img = image
+        if str(config.get("input_space", "linear")).lower() == "srgb":
+            img = _srgb_to_linear_torch(img)
+
+        matrix = _sample_matrix(config.get("camera_matrix"), rng)
+        img = _apply_color_matrix_torch(img, matrix)
+        pre_exposure_luminance = _linear_luminance_torch(img)
+
+        exposure = _sample_float(config, "exposure_gain", 1.0, rng)
+        exposure, config = _resolve_auto_exposure_torch(
+            img,
+            context,
+            config,
+            rng,
+            manual_exposure_gain=exposure,
+        )
+        wb = _sample_triplet(config.get("white_balance", [1.0, 1.0, 1.0]), rng)
+        wb_jitter = _sample_float(config, "white_balance_jitter", 0.0, rng)
+        if wb_jitter > 0.0:
+            wb = wb * rng.lognormal(mean=0.0, sigma=wb_jitter, size=3).astype(
+                np.float32
+            )
+        gain_sigma = _sample_float(config, "channel_gain_sigma", 0.0, rng)
+        if gain_sigma > 0.0:
+            wb = wb * rng.lognormal(mean=0.0, sigma=gain_sigma, size=3).astype(
+                np.float32
+            )
+        wb_t = torch.as_tensor(wb, device=img.device, dtype=img.dtype)
+        img = img * float(exposure) * wb_t.view(1, 1, 3)
+
+        white_clip = _sample_float(config, "clip", 1.0, rng)
+        white_clip = max(float(white_clip), 1e-6)
+        img = torch.clamp(img, 0.0, white_clip) / white_clip
+
+        pattern = str(_sample_any(config.get("bayer_pattern", "RGGB"), rng)).upper()
+        raw_signal = _clip01_torch(_bayer_mosaic_torch(img, pattern))
+
+        black_levels = _sample_sensor_levels(config, "black_level", rng)
+        black_levels += rng.normal(
+            0.0,
+            _sample_float(config, "black_level_jitter", 0.0, rng),
+            size=3,
+        ).astype(np.float32)
+        black_levels = np.clip(black_levels, 0.0, 0.95)
+
+        white_levels = _sample_sensor_levels(config, "white_level", rng)
+        white_levels += rng.normal(
+            0.0,
+            _sample_float(config, "white_level_jitter", 0.0, rng),
+            size=3,
+        ).astype(np.float32)
+        white_levels = np.clip(white_levels, 0.05, 1.0)
+
+        black_map = _mosaic_channel_values_torch(
+            tuple(raw_signal.shape),
+            pattern,
+            black_levels,
+            raw_signal.device,
+            raw_signal.dtype,
+        )
+        white_map = _mosaic_channel_values_torch(
+            tuple(raw_signal.shape),
+            pattern,
+            white_levels,
+            raw_signal.device,
+            raw_signal.dtype,
+        )
+        white_map = torch.maximum(white_map, black_map + 1e-4)
+        raw_range = white_map - black_map
+
+        electron_capacity = _resolve_electron_capacity_torch(
+            tuple(raw_signal.shape),
+            pattern,
+            config,
+            rng,
+            raw_signal.device,
+            raw_signal.dtype,
+        )
+        noisy_signal = raw_signal
+        if bool(torch.any(electron_capacity > 0.0).detach().cpu()):
+            poisson_input = torch.clamp(raw_signal, min=0.0) * electron_capacity
+            noisy_signal = _poisson_torch(poisson_input, rng) / torch.clamp(
+                electron_capacity,
+                min=1e-6,
+            )
+
+        noise_modulation = _sensor_noise_modulation_torch(
+            raw_signal,
+            context,
+            config,
+            rng,
+        )
+
+        read_sigma_cfg = config.get("read_noise_sigma")
+        if read_sigma_cfg is not None:
+            read_sigma = _sample_float(config, "read_noise_sigma", 0.0, rng)
+        else:
+            read_electrons = _sample_float(
+                config,
+                "read_noise_electrons",
+                0.0,
+                rng,
+            )
+            read_sigma = torch.where(
+                electron_capacity > 0.0,
+                float(read_electrons) / torch.clamp(electron_capacity, min=1e-6),
+                torch.zeros_like(electron_capacity),
+            )
+        if _positive_torch_or_float(read_sigma):
+            noisy_signal = noisy_signal + (
+                _randn_torch(raw_signal.shape, rng, raw_signal.device, raw_signal.dtype)
+                * read_sigma
+                * noise_modulation
+            )
+
+        raw = black_map + noisy_signal * raw_range
+
+        fixed_sigma = _sample_float(config, "fixed_pattern_sigma", 0.0, rng)
+        if fixed_sigma > 0.0:
+            raw = raw + (
+                _randn_torch(raw.shape, rng, raw.device, raw.dtype)
+                * float(fixed_sigma)
+                * noise_modulation
+            )
+
+        banding_modulation = float(
+            np.clip(_sample_float(config, "banding_modulation", 0.35, rng), 0, 1)
+        )
+        banding_gain = 1.0 + banding_modulation * (noise_modulation - 1.0)
+        row_sigma = _sample_float(config, "row_noise_sigma", 0.0, rng)
+        if row_sigma > 0.0:
+            row_corr = _sample_float(
+                config,
+                "row_banding_correlation_px",
+                48.0,
+                rng,
+            )
+            row_bias = _smooth_random_bias_torch(
+                int(raw.shape[0]),
+                row_sigma,
+                row_corr,
+                rng,
+                raw.device,
+                raw.dtype,
+            )
+            raw = raw + row_bias[:, None] * banding_gain
+
+        column_sigma = _sample_float(config, "column_noise_sigma", 0.0, rng)
+        if column_sigma > 0.0:
+            column_corr = _sample_float(
+                config,
+                "column_banding_correlation_px",
+                48.0,
+                rng,
+            )
+            column_bias = _smooth_random_bias_torch(
+                int(raw.shape[1]),
+                column_sigma,
+                column_corr,
+                rng,
+                raw.device,
+                raw.dtype,
+            )
+            raw = raw + column_bias[None, :] * banding_gain
+
+        raw = _apply_bad_pixels_torch(
+            raw,
+            config,
+            rng,
+            hot_value=white_map,
+            dead_value=black_map,
+        )
+        raw = torch.maximum(torch.minimum(raw, white_map), black_map)
+
+        bit_depth_key = (
+            "raw_bit_depth"
+            if config.get("raw_bit_depth") is not None
+            else "adc_bit_depth"
+        )
+        adc_bit_depth = int(round(_sample_float(config, bit_depth_key, 12.0, rng)))
+        if adc_bit_depth > 0:
+            raw = _quantize_torch(raw, adc_bit_depth)
+
+        raw = (raw - black_map) / torch.clamp(raw_range, min=1e-6)
+        raw = _clip01_torch(raw)
+
+        if _bool_value(config.get("demosaic", True)):
+            demosaiced = _clip01_torch(_demosaic_bilinear_torch(raw, pattern))
+            post_bits = int(
+                round(
+                    _sample_float(
+                        config,
+                        "post_demosaic_bit_depth",
+                        0.0,
+                        rng,
+                    )
+                )
+            )
+            if post_bits > 0:
+                demosaiced = _quantize_torch(demosaiced, post_bits)
+            return _apply_shadow_recovery_noise_torch(
+                demosaiced,
+                pre_exposure_luminance,
+                context,
+                config,
+                rng,
+            )
+
+        raw_rgb = raw[..., None].repeat(1, 1, 3)
+        return _apply_shadow_recovery_noise_torch(
+            raw_rgb,
+            pre_exposure_luminance,
+            context,
+            config,
+            rng,
+        )
+
 
 class ISPStage(ConfiguredCaptureStage):
     """Demosaiced camera-space RGB to display RGB with ISP artifacts."""
@@ -633,6 +985,59 @@ class ISPStage(ConfiguredCaptureStage):
 
         return _clip01(img)
 
+    def _apply_torch(
+        self,
+        image,
+        context: CaptureContext,
+        rng: np.random.Generator,
+        config: Mapping[str, Any],
+    ):
+        img = image
+
+        denoise_sigma = _sample_float(config, "denoise_sigma", 0.0, rng)
+        if denoise_sigma > 1e-4:
+            img = _gaussian_blur_torch(img, denoise_sigma)
+
+        matrix = _sample_matrix(config.get("color_matrix"), rng)
+        img = _apply_color_matrix_torch(img, matrix)
+
+        tone_map = str(config.get("tone_map", "reinhard")).lower()
+        strength = _sample_float(config, "tone_map_strength", 1.0, rng)
+        if tone_map not in {"none", "false", "off"}:
+            img = _apply_tone_map_torch(img, tone_map, strength)
+
+        gamma = config.get("gamma", "srgb")
+        img = _apply_gamma_torch(img, gamma, rng)
+
+        local_strength = _sample_float(
+            config,
+            "local_contrast_strength",
+            0.0,
+            rng,
+        )
+        if local_strength > 1e-5:
+            sigma = _sample_float(config, "local_contrast_sigma", 12.0, rng)
+            base = _gaussian_blur_torch(img, sigma)
+            img = img + float(local_strength) * (img - base)
+
+        sharpen = _sample_float(config, "sharpen_amount", 0.0, rng)
+        if sharpen > 1e-5:
+            sigma = _sample_float(config, "sharpen_sigma", 0.8, rng)
+            blurred = _gaussian_blur_torch(img, sigma)
+            img = img + float(sharpen) * (img - blurred)
+
+        saturation = _sample_float(config, "saturation", 1.0, rng)
+        if abs(saturation - 1.0) > 1e-5:
+            weights = torch.tensor(
+                [0.2126, 0.7152, 0.0722],
+                device=img.device,
+                dtype=img.dtype,
+            )
+            luma = torch.sum(img * weights.view(1, 1, 3), dim=-1, keepdim=True)
+            img = luma + float(saturation) * (img - luma)
+
+        return _clip01_torch(img)
+
 
 class TransportStage(ConfiguredCaptureStage):
     """Final resize, quantization, and JPEG-like transport artifacts."""
@@ -686,6 +1091,50 @@ class TransportStage(ConfiguredCaptureStage):
             img = _jpeg_roundtrip_np(img, quality=quality, subsampling=subsampling)
 
         return _clip01(img)
+
+    def _apply_torch(
+        self,
+        image,
+        context: CaptureContext,
+        rng: np.random.Generator,
+        config: Mapping[str, Any],
+    ):
+        img = image
+
+        crop = config.get("crop")
+        if crop is not None:
+            img = _crop_torch(img, crop, rng)
+
+        target_size = _resolve_resize(config, tuple(img.shape), rng)
+        if target_size is not None:
+            img = _resize_torch(
+                img,
+                target_size,
+                str(config.get("resample", "bilinear")),
+            )
+
+        bit_depth = int(round(_sample_float(config, "bit_depth", 8.0, rng)))
+        if bit_depth > 0:
+            img = _quantize_torch(img, bit_depth)
+
+        jpeg_cfg = _config_block(config, "jpeg")
+        jpeg_quality = config.get("jpeg_quality")
+        if jpeg_quality is not None:
+            jpeg_cfg = dict(jpeg_cfg)
+            jpeg_cfg["enabled"] = True
+            jpeg_cfg["quality"] = jpeg_quality
+        if _bool_value(jpeg_cfg.get("enabled", True)):
+            quality = int(round(_sample_float(jpeg_cfg, "quality", 90.0, rng)))
+            quality = int(np.clip(quality, 1, 100))
+            subsampling = int(round(_sample_float(jpeg_cfg, "subsampling", 2.0, rng)))
+            img_np = _jpeg_roundtrip_np(
+                _torch_to_numpy_image(img),
+                quality=quality,
+                subsampling=subsampling,
+            )
+            img = _numpy_to_torch_like(img_np, img)
+
+        return _clip01_torch(img)
 
 
 class CaptureArtifactPipeline:
@@ -746,10 +1195,10 @@ class CaptureArtifactPipeline:
     def apply_torch(self, image, context: CaptureContext):
         if not self.stages:
             return image
-        np_image = _torch_to_numpy_image(image)
+        image_t = image
         for stage in self.stages:
-            np_image = stage.apply_np(np_image, context)
-        return _numpy_to_torch_like(np_image, image)
+            image_t = stage.apply_torch(image_t, context)
+        return image_t
 
     def apply_torch_batch(self, images, contexts: tuple[CaptureContext, ...]):
         if not self.stages:
@@ -1132,6 +1581,61 @@ def _context_fog_opacity(
     )
 
 
+def _context_float_map_torch(
+    value: Any,
+    shape: tuple[int, int],
+    device,
+    dtype,
+):
+    if value is None or torch is None:
+        return None
+    if torch.is_tensor(value):
+        arr = value.to(device=device, dtype=dtype)
+    else:
+        arr = torch.as_tensor(value, device=device, dtype=dtype)
+    if arr.ndim == 0:
+        return torch.full(shape, float(arr.detach().cpu()), device=device, dtype=dtype)
+    if arr.ndim == 3 and arr.shape[-1] == 1:
+        arr = arr[..., 0]
+    if arr.ndim == 3 and arr.shape[0] == 1:
+        arr = arr[0]
+    if arr.ndim != 2:
+        return None
+    arr = torch.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+    if tuple(arr.shape) != tuple(shape):
+        arr = _resize_map_torch(arr, shape)
+    return arr.to(device=device, dtype=dtype)
+
+
+def _context_depth_map_torch(
+    context: CaptureContext,
+    shape: tuple[int, int],
+    device,
+    dtype,
+):
+    return _context_float_map_torch(context.depth_m, shape, device, dtype)
+
+
+def _context_fog_opacity_torch(
+    context: CaptureContext,
+    shape: tuple[int, int],
+    device,
+    dtype,
+):
+    opacity = _context_float_map_torch(context.fog_opacity, shape, device, dtype)
+    if opacity is not None:
+        return torch.clamp(opacity, 0.0, 1.0)
+    depth = _context_depth_map_torch(context, shape, device, dtype)
+    k_map = _context_float_map_torch(context.k_map, shape, device, dtype)
+    if depth is None or k_map is None:
+        return None
+    return torch.clamp(
+        1.0 - torch.exp(-torch.clamp(depth, min=0.0) * torch.clamp(k_map, min=0.0)),
+        0.0,
+        1.0,
+    )
+
+
 def _as_float_rgb(image) -> np.ndarray:
     arr = np.asarray(image)
     if arr.ndim != 3 or arr.shape[-1] != 3:
@@ -1146,6 +1650,25 @@ def _as_float_rgb(image) -> np.ndarray:
 
 def _clip01(image: np.ndarray) -> np.ndarray:
     return np.clip(image, 0.0, 1.0).astype(np.float32, copy=False)
+
+
+def _clip01_torch(image):
+    return torch.clamp(image, 0.0, 1.0)
+
+
+def _as_float_rgb_torch(image):
+    if torch is None or not torch.is_tensor(image):
+        return _as_float_rgb(image)
+    if image.ndim != 3 or image.shape[-1] != 3:
+        raise ValueError(
+            f"Capture stages expect RGB HWC images, got {tuple(image.shape)}"
+        )
+    if image.is_floating_point():
+        arr = image.to(dtype=torch.float32)
+    else:
+        max_value = float(torch.iinfo(image.dtype).max)
+        arr = image.to(dtype=torch.float32) / max_value
+    return _clip01_torch(arr)
 
 
 def _torch_to_numpy_image(image) -> np.ndarray:
@@ -1282,6 +1805,77 @@ def _resolve_auto_exposure_np(
     return exposure, resolved_config
 
 
+def _resolve_auto_exposure_torch(
+    image,
+    context: CaptureContext,
+    config: Mapping[str, Any],
+    rng: np.random.Generator,
+    *,
+    manual_exposure_gain: float,
+) -> tuple[float, Mapping[str, Any]]:
+    cfg = _config_block(config, "auto_exposure")
+    if not _block_enabled(cfg, rng):
+        return float(manual_exposure_gain), config
+
+    metrics = _auto_exposure_metrics_torch(image, context, cfg, rng)
+    meter = max(float(metrics["meter_luminance"]), 1e-6)
+    target = max(_sample_float(cfg, "target_luminance", 0.18, rng), 1e-6)
+    auto_gain = target / meter
+
+    highlight = max(float(metrics["highlight_luminance"]), 1e-6)
+    highlight_target = max(_sample_float(cfg, "highlight_target", 0.92, rng), 1e-6)
+    highlight_gain = highlight_target / highlight
+    protection = float(
+        np.clip(_sample_float(cfg, "highlight_protection", 0.65, rng), 0.0, 1.0)
+    )
+    if protection > 0.0 and auto_gain > highlight_gain > 0.0:
+        log_auto = math.log(max(auto_gain, 1e-6))
+        log_highlight = math.log(max(highlight_gain, 1e-6))
+        auto_gain = math.exp(
+            (1.0 - protection) * log_auto + protection * log_highlight
+        )
+
+    compensation_ev = _sample_float(cfg, "exposure_compensation_ev", 0.0, rng)
+    auto_gain *= 2.0**compensation_ev
+
+    manual_weight = max(_sample_float(cfg, "manual_gain_weight", 1.0, rng), 0.0)
+    manual_gain = max(float(manual_exposure_gain), 1e-6)
+    exposure = auto_gain * (manual_gain**manual_weight)
+    min_gain = max(_sample_float(cfg, "min_gain", 0.0, rng), 0.0)
+    max_gain = max(_sample_float(cfg, "max_gain", 2.6, rng), max(min_gain, 1e-6))
+    exposure = float(np.clip(exposure, min_gain, max_gain))
+
+    if not _bool_value(cfg.get("resolve_iso", False)):
+        return exposure, config
+
+    resolved_config = dict(config)
+    base_iso = max(_sample_float(config, "base_iso", 100.0, rng), 1e-6)
+    configured_iso = max(_sample_float(config, "iso", base_iso, rng), 1e-6)
+    min_iso_cfg = cfg.get("min_iso")
+    min_iso = (
+        max(float(sample_value(min_iso_cfg, rng)), 1e-6)
+        if min_iso_cfg is not None
+        else base_iso
+    )
+    max_iso = max(_sample_float(cfg, "max_iso", 1600.0, rng), min_iso)
+    activation_gain = max(_sample_float(cfg, "iso_activation_gain", 1.2, rng), 1e-6)
+    iso_power = max(_sample_float(cfg, "iso_gain_power", 0.85, rng), 0.0)
+    iso_pressure = max(auto_gain / activation_gain, 1.0)
+    resolved_iso = configured_iso * (iso_pressure**iso_power)
+
+    dark_iso_boost = max(_sample_float(cfg, "dark_iso_boost", 0.0, rng), 0.0)
+    if dark_iso_boost > 0.0:
+        resolved_iso *= 1.0 + dark_iso_boost * float(metrics["dark_fraction"])
+
+    fog_iso_boost = max(_sample_float(cfg, "fog_iso_boost", 0.0, rng), 0.0)
+    if fog_iso_boost > 0.0:
+        resolved_iso *= 1.0 + fog_iso_boost * float(metrics["mean_fog_opacity"])
+
+    resolved_config["iso"] = float(np.clip(resolved_iso, min_iso, max_iso))
+    resolved_config["base_iso"] = float(base_iso)
+    return exposure, resolved_config
+
+
 def _auto_exposure_metrics_np(
     image: np.ndarray,
     context: CaptureContext,
@@ -1352,12 +1946,100 @@ def _auto_exposure_metrics_np(
     }
 
 
+def _auto_exposure_metrics_torch(
+    image,
+    context: CaptureContext,
+    config: Mapping[str, Any],
+    rng: np.random.Generator,
+) -> dict[str, float]:
+    luminance = _linear_luminance_torch(image)
+    finite = torch.isfinite(luminance)
+    if not bool(torch.any(finite).detach().cpu()):
+        return {
+            "meter_luminance": 0.18,
+            "mean_luminance": 0.18,
+            "center_luminance": 0.18,
+            "percentile_luminance": 0.18,
+            "highlight_luminance": 0.18,
+            "dark_fraction": 0.0,
+            "contrast": 0.0,
+            "mean_fog_opacity": 0.0,
+        }
+    luma = torch.clamp(luminance[finite], min=0.0)
+    mean_luma = float(torch.mean(luma).detach().cpu())
+    center_luma = _center_weighted_mean_torch(luminance, config, rng)
+    meter_percentile = float(
+        np.clip(_sample_float(config, "meter_percentile", 50.0, rng), 0.0, 100.0)
+    )
+    percentile_luma = float(torch.quantile(luma, meter_percentile / 100.0).detach().cpu())
+    highlight_percentile = float(
+        np.clip(_sample_float(config, "highlight_percentile", 98.5, rng), 0.0, 100.0)
+    )
+    highlight_luma = float(
+        torch.quantile(luma, highlight_percentile / 100.0).detach().cpu()
+    )
+    low_luma = float(torch.quantile(luma, 0.05).detach().cpu())
+    high_luma = float(torch.quantile(luma, 0.95).detach().cpu())
+    dark_threshold = max(
+        _sample_float(config, "dark_fraction_threshold", 0.12, rng),
+        0.0,
+    )
+    dark_fraction = float(torch.mean((luma < dark_threshold).to(luma.dtype)).detach().cpu())
+    opacity = _context_fog_opacity_torch(
+        context,
+        tuple(luminance.shape),
+        luminance.device,
+        luminance.dtype,
+    )
+    mean_fog_opacity = (
+        float(torch.mean(opacity).detach().cpu()) if opacity is not None else 0.0
+    )
+
+    metering = str(config.get("metering", "center_weighted")).strip().lower()
+    center_weight = float(
+        np.clip(_sample_float(config, "center_weight", 0.55, rng), 0.0, 1.0)
+    )
+    if metering in {"mean", "average"}:
+        meter_luma = mean_luma
+    elif metering in {"percentile", "median"}:
+        meter_luma = percentile_luma
+    elif metering in {"center_percentile", "centered_percentile"}:
+        meter_luma = (
+            (1.0 - center_weight) * percentile_luma
+            + center_weight * center_luma
+        )
+    elif metering in {"highlight", "highlight_protect", "highlight_protected"}:
+        meter_luma = max(center_luma, percentile_luma)
+    else:
+        meter_luma = (1.0 - center_weight) * mean_luma + center_weight * center_luma
+
+    return {
+        "meter_luminance": max(float(meter_luma), 1e-6),
+        "mean_luminance": mean_luma,
+        "center_luminance": center_luma,
+        "percentile_luminance": percentile_luma,
+        "highlight_luminance": highlight_luma,
+        "dark_fraction": dark_fraction,
+        "contrast": max(high_luma - low_luma, 0.0),
+        "mean_fog_opacity": mean_fog_opacity,
+    }
+
+
 def _linear_luminance_np(image: np.ndarray) -> np.ndarray:
     weights = np.array([0.2126, 0.7152, 0.0722], dtype=np.float32)
     return np.sum(np.clip(image, 0.0, None) * weights, axis=-1).astype(
         np.float32,
         copy=False,
     )
+
+
+def _linear_luminance_torch(image):
+    weights = torch.tensor(
+        [0.2126, 0.7152, 0.0722],
+        device=image.device,
+        dtype=image.dtype,
+    )
+    return torch.sum(torch.clamp(image, min=0.0) * weights.view(1, 1, 3), dim=-1)
 
 
 def _center_weighted_mean_np(
@@ -1378,6 +2060,31 @@ def _center_weighted_mean_np(
         return 0.18
     weighted = np.where(finite, np.clip(luminance, 0.0, None), 0.0) * weights
     return float(weighted.sum() / max(float(weights[finite].sum()), 1e-6))
+
+
+def _center_weighted_mean_torch(
+    luminance,
+    config: Mapping[str, Any],
+    rng: np.random.Generator,
+) -> float:
+    height, width = int(luminance.shape[0]), int(luminance.shape[1])
+    if height <= 0 or width <= 0:
+        return 0.18
+    sigma = max(_sample_float(config, "center_sigma", 0.35, rng), 1e-3)
+    yy, xx = _coordinate_grid_torch(height, width, luminance.device, luminance.dtype)
+    x = (xx - (width - 1) / 2.0) / max(width - 1, 1)
+    y = (yy - (height - 1) / 2.0) / max(height - 1, 1)
+    weights = torch.exp(-0.5 * (x * x + y * y) / (sigma * sigma))
+    finite = torch.isfinite(luminance)
+    if not bool(torch.any(finite).detach().cpu()):
+        return 0.18
+    weighted = torch.where(
+        finite,
+        torch.clamp(luminance, min=0.0),
+        torch.zeros_like(luminance),
+    ) * weights
+    denom = torch.clamp(torch.sum(weights[finite]), min=1e-6)
+    return float((torch.sum(weighted) / denom).detach().cpu())
 
 
 def _resolve_electron_capacity(
@@ -1405,6 +2112,43 @@ def _resolve_electron_capacity(
     return np.where(capacity > 0.0, np.maximum(capacity, 1.0), 0.0).astype(
         np.float32,
         copy=False,
+    )
+
+
+def _resolve_electron_capacity_torch(
+    shape: tuple[int, int],
+    pattern: str,
+    config: Mapping[str, Any],
+    rng: np.random.Generator,
+    device,
+    dtype,
+):
+    legacy = config.get("shot_noise_electrons")
+    if legacy is not None:
+        electrons = float(sample_value(legacy, rng))
+        if electrons <= 0.0:
+            return torch.zeros(shape, device=device, dtype=dtype)
+        return torch.full(shape, electrons, device=device, dtype=dtype)
+
+    iso = max(_sample_float(config, "iso", 100.0, rng), 1e-6)
+    base_iso = max(_sample_float(config, "base_iso", 100.0, rng), 1e-6)
+    iso_gain = max(iso / base_iso, 1e-6)
+    full_well = _sample_triplet(
+        config.get("full_well_electrons", [12000.0, 12000.0, 12000.0]),
+        rng,
+    )
+    full_well_map = _mosaic_channel_values_torch(
+        shape,
+        pattern,
+        full_well,
+        device,
+        dtype,
+    )
+    capacity = full_well_map / iso_gain
+    return torch.where(
+        capacity > 0.0,
+        torch.maximum(capacity, torch.ones_like(capacity)),
+        torch.zeros_like(capacity),
     )
 
 
@@ -1448,6 +2192,63 @@ def _sensor_noise_modulation(
 
     max_gain = max(_sample_float(cfg, "max_gain", 3.0, rng), 1.0)
     return np.clip(modulation, 1.0, max_gain).astype(np.float32, copy=False)
+
+
+def _sensor_noise_modulation_torch(
+    signal,
+    context: CaptureContext,
+    config: Mapping[str, Any],
+    rng: np.random.Generator,
+):
+    cfg = _config_block(config, "noise_modulation")
+    if not _bool_value(cfg.get("enabled", False)):
+        return torch.ones_like(signal)
+
+    gamma = max(_sample_float(cfg, "gamma", 1.0, rng), 1e-6)
+    modulation = torch.ones_like(signal)
+
+    dark_gain = _sample_float(cfg, "dark_gain", 0.0, rng)
+    if dark_gain != 0.0:
+        dark = torch.pow(1.0 - torch.clamp(signal, 0.0, 1.0), gamma)
+        modulation = modulation + float(dark_gain) * dark
+
+    depth_gain = _sample_float(cfg, "depth_gain", 0.0, rng)
+    if depth_gain != 0.0:
+        depth = _context_depth_map_torch(
+            context,
+            tuple(signal.shape),
+            signal.device,
+            signal.dtype,
+        )
+        if depth is not None:
+            modulation = modulation + float(depth_gain) * _normalize_context_map_torch(
+                depth
+            )
+
+    fog_gain = _sample_float(cfg, "fog_gain", 0.0, rng)
+    if fog_gain != 0.0:
+        opacity = _context_fog_opacity_torch(
+            context,
+            tuple(signal.shape),
+            signal.device,
+            signal.dtype,
+        )
+        if opacity is not None:
+            modulation = modulation + float(fog_gain) * torch.pow(
+                torch.clamp(opacity, 0.0, 1.0),
+                gamma,
+            )
+
+    black_gate = _black_suppression_gate_torch(signal, cfg, rng)
+    if black_gate is not None:
+        modulation = 1.0 + (modulation - 1.0) * black_gate
+
+    smooth_sigma = _sample_float(cfg, "smooth_sigma", 0.0, rng)
+    if smooth_sigma > 1e-4:
+        modulation = _gaussian_blur_torch(modulation, smooth_sigma)
+
+    max_gain = max(_sample_float(cfg, "max_gain", 3.0, rng), 1.0)
+    return torch.clamp(modulation, 1.0, max_gain)
 
 
 def _apply_shadow_recovery_noise_np(
@@ -1501,6 +2302,75 @@ def _apply_shadow_recovery_noise_np(
     return _clip01(out)
 
 
+def _apply_shadow_recovery_noise_torch(
+    image,
+    pre_exposure_luminance,
+    context: CaptureContext,
+    config: Mapping[str, Any],
+    rng: np.random.Generator,
+):
+    cfg = _config_block(config, "shadow_recovery_noise")
+    if not _block_enabled(cfg, rng):
+        return image
+
+    weight = _shadow_recovery_weight_torch(
+        pre_exposure_luminance,
+        context,
+        cfg,
+        rng,
+    )
+    if not bool(torch.any(weight > 1e-6).detach().cpu()):
+        return image
+
+    strength = max(_sample_float(cfg, "strength", 1.0, rng), 0.0)
+    if strength <= 0.0:
+        return image
+
+    out = image.clone()
+    luma_sigma = max(_sample_float(cfg, "luma_sigma", 0.0, rng), 0.0) * strength
+    if luma_sigma > 0.0:
+        luma_noise = _randn_torch(
+            image.shape[:2],
+            rng,
+            image.device,
+            image.dtype,
+        ) * float(luma_sigma)
+        out = out + luma_noise[..., None] * weight[..., None]
+
+    chroma_sigma = max(_sample_float(cfg, "chroma_sigma", 0.0, rng), 0.0) * strength
+    if chroma_sigma > 0.0:
+        chroma_preservation = float(
+            np.clip(
+                _sample_float(cfg, "chroma_luminance_preservation", 1.0, rng),
+                0.0,
+                1.0,
+            )
+        )
+        chroma_noise = _shadow_chroma_noise_torch(
+            tuple(image.shape),
+            chroma_sigma,
+            cfg,
+            rng,
+            chroma_preservation,
+            image.device,
+            image.dtype,
+        )
+        out = out + chroma_noise * weight[..., None]
+
+    blotch_sigma = max(_sample_float(cfg, "blotch_sigma", 0.0, rng), 0.0) * strength
+    if blotch_sigma > 0.0:
+        blotch = _low_frequency_field_torch(
+            int(image.shape[0]),
+            int(image.shape[1]),
+            rng,
+            image.device,
+            image.dtype,
+        ) - 0.5
+        out = out + blotch[..., None] * (2.0 * blotch_sigma) * weight[..., None]
+
+    return _clip01_torch(out)
+
+
 def _shadow_recovery_weight_np(
     pre_exposure_luminance: np.ndarray,
     context: CaptureContext,
@@ -1536,6 +2406,53 @@ def _shadow_recovery_weight_np(
 
     max_weight = max(_sample_float(config, "max_weight", 1.0, rng), 0.0)
     return np.clip(weight, 0.0, max_weight).astype(np.float32, copy=False)
+
+
+def _shadow_recovery_weight_torch(
+    pre_exposure_luminance,
+    context: CaptureContext,
+    config: Mapping[str, Any],
+    rng: np.random.Generator,
+):
+    luma = torch.clamp(pre_exposure_luminance, min=0.0)
+    threshold = max(_sample_float(config, "luminance_threshold", 0.18, rng), 1e-6)
+    softness = max(_sample_float(config, "luminance_softness", 0.08, rng), 1e-6)
+    shadow = torch.clamp((threshold + softness - luma) / softness, 0.0, 1.0)
+    gamma = max(_sample_float(config, "gamma", 1.4, rng), 1e-6)
+    weight = torch.pow(shadow, gamma)
+
+    fog_weight = _sample_float(config, "fog_weight", 0.0, rng)
+    if fog_weight != 0.0:
+        opacity = _context_fog_opacity_torch(
+            context,
+            tuple(luma.shape),
+            luma.device,
+            luma.dtype,
+        )
+        if opacity is not None:
+            weight = weight + float(fog_weight) * torch.clamp(opacity, 0.0, 1.0)
+
+    depth_weight = _sample_float(config, "depth_weight", 0.0, rng)
+    if depth_weight != 0.0:
+        depth = _context_depth_map_torch(
+            context,
+            tuple(luma.shape),
+            luma.device,
+            luma.dtype,
+        )
+        if depth is not None:
+            weight = weight + float(depth_weight) * _normalize_context_map_torch(depth)
+
+    black_gate = _black_suppression_gate_torch(luma, config, rng)
+    if black_gate is not None:
+        weight = weight * black_gate
+
+    smooth_sigma = _sample_float(config, "smooth_sigma", 1.0, rng)
+    if smooth_sigma > 1e-4:
+        weight = _gaussian_blur_torch(weight, smooth_sigma)
+
+    max_weight = max(_sample_float(config, "max_weight", 1.0, rng), 0.0)
+    return torch.clamp(weight, 0.0, max_weight)
 
 
 def _shadow_chroma_noise_np(
@@ -1622,6 +2539,98 @@ def _balanced_luminance_preserving_chroma_noise_np(
     return noise.astype(np.float32, copy=False)
 
 
+def _shadow_chroma_noise_torch(
+    shape: tuple[int, int, int],
+    sigma: float,
+    config: Mapping[str, Any],
+    rng: np.random.Generator,
+    luminance_preservation: float,
+    device,
+    dtype,
+):
+    raw = _randn_torch(shape, rng, device, dtype) * float(sigma)
+    if luminance_preservation <= 0.0:
+        return raw
+
+    mode = str(config.get("chroma_mode", "balanced")).strip().lower().replace("-", "_")
+    if mode in {"balanced", "balanced_luminance", "balanced_luminance_preserving"}:
+        preserved = _balanced_luminance_preserving_chroma_noise_torch(
+            shape,
+            sigma,
+            config,
+            rng,
+            device,
+            dtype,
+        )
+    else:
+        weights = torch.tensor([0.2126, 0.7152, 0.0722], device=device, dtype=dtype)
+        chroma_luma = torch.sum(raw * weights.view(1, 1, 3), dim=-1)
+        preserved = raw - chroma_luma[..., None]
+
+    if luminance_preservation >= 1.0:
+        return preserved
+    return (1.0 - luminance_preservation) * raw + luminance_preservation * preserved
+
+
+def _balanced_luminance_preserving_chroma_noise_torch(
+    shape: tuple[int, int, int],
+    sigma: float,
+    config: Mapping[str, Any],
+    rng: np.random.Generator,
+    device,
+    dtype,
+):
+    if len(shape) != 3 or shape[2] != 3:
+        return _randn_torch(shape, rng, device, dtype) * float(sigma)
+
+    red_axis = torch.tensor(
+        [1.0, -(0.2126 / 0.7152), 0.0],
+        device=device,
+        dtype=dtype,
+    )
+    blue_axis = torch.tensor(
+        [0.0, -(0.0722 / 0.7152), 1.0],
+        device=device,
+        dtype=dtype,
+    )
+
+    red_gain = max(_sample_float(config, "red_chroma_gain", 1.0, rng), 0.0)
+    blue_gain = max(_sample_float(config, "blue_chroma_gain", 1.0, rng), 0.0)
+    correlation = float(
+        np.clip(
+            _sample_float(config, "chroma_axis_correlation", 0.0, rng),
+            -0.95,
+            0.95,
+        )
+    )
+    red_unit = _randn_torch(shape[:2], rng, device, dtype)
+    blue_unit = _randn_torch(shape[:2], rng, device, dtype)
+    if abs(correlation) > 1e-6:
+        blue_unit = (
+            correlation * red_unit
+            + math.sqrt(max(1.0 - correlation * correlation, 0.0)) * blue_unit
+        )
+
+    red_noise = red_unit * (float(sigma) * red_gain)
+    blue_noise = blue_unit * (float(sigma) * blue_gain)
+    noise = red_noise[..., None] * red_axis.view(1, 1, 3)
+    noise = noise + blue_noise[..., None] * blue_axis.view(1, 1, 3)
+
+    spatial_sigma = _sample_float(config, "chroma_spatial_sigma", 0.0, rng)
+    if spatial_sigma > 1e-4:
+        fine_fraction = float(
+            np.clip(
+                _sample_float(config, "chroma_fine_fraction", 1.0, rng),
+                0.0,
+                1.0,
+            )
+        )
+        blurred = _gaussian_blur_torch(noise, spatial_sigma)
+        noise = fine_fraction * noise + (1.0 - fine_fraction) * blurred
+
+    return noise
+
+
 def _black_suppression_gate_np(
     luminance_or_signal: np.ndarray,
     config: Mapping[str, Any],
@@ -1646,6 +2655,30 @@ def _black_suppression_gate_np(
     return (floor + (1.0 - floor) * smooth).astype(np.float32, copy=False)
 
 
+def _black_suppression_gate_torch(
+    luminance_or_signal,
+    config: Mapping[str, Any],
+    rng: np.random.Generator,
+):
+    floor = float(
+        np.clip(_sample_float(config, "black_noise_floor", 1.0, rng), 0.0, 1.0)
+    )
+    if floor >= 1.0:
+        return None
+
+    threshold = max(
+        _sample_float(config, "black_suppression_luminance", 0.0, rng),
+        0.0,
+    )
+    softness = max(
+        _sample_float(config, "black_suppression_softness", 0.05, rng),
+        1e-6,
+    )
+    x = torch.clamp((luminance_or_signal - threshold) / softness, 0.0, 1.0)
+    smooth = x * x * (3.0 - 2.0 * x)
+    return floor + (1.0 - floor) * smooth
+
+
 def _normalize_context_map(value: np.ndarray) -> np.ndarray:
     finite = np.isfinite(value)
     if not finite.any():
@@ -1660,6 +2693,19 @@ def _normalize_context_map(value: np.ndarray) -> np.ndarray:
         np.float32,
         copy=False,
     )
+
+
+def _normalize_context_map_torch(value):
+    finite = torch.isfinite(value)
+    if not bool(torch.any(finite).detach().cpu()):
+        return torch.zeros_like(value)
+    clipped = torch.where(finite, value, torch.zeros_like(value))
+    valid = clipped[finite]
+    lo = torch.quantile(valid, 0.02)
+    hi = torch.quantile(valid, 0.98)
+    if not bool((hi > lo).detach().cpu()):
+        return torch.zeros_like(value)
+    return torch.clamp((clipped - lo) / (hi - lo), 0.0, 1.0)
 
 
 def _bool_value(value: Any) -> bool:
@@ -1699,6 +2745,15 @@ def _srgb_to_linear(image: np.ndarray) -> np.ndarray:
     ).astype(np.float32, copy=False)
 
 
+def _srgb_to_linear_torch(image):
+    img = _clip01_torch(image)
+    return torch.where(
+        img <= 0.04045,
+        img / 12.92,
+        torch.pow((img + 0.055) / 1.055, 2.4),
+    )
+
+
 def _linear_to_srgb(image: np.ndarray) -> np.ndarray:
     img = _clip01(image)
     return np.where(
@@ -1708,11 +2763,25 @@ def _linear_to_srgb(image: np.ndarray) -> np.ndarray:
     ).astype(np.float32, copy=False)
 
 
+def _linear_to_srgb_torch(image):
+    img = _clip01_torch(image)
+    return torch.where(
+        img <= 0.0031308,
+        img * 12.92,
+        1.055 * torch.pow(img, 1.0 / 2.4) - 0.055,
+    )
+
+
 def _apply_color_matrix(image: np.ndarray, matrix: np.ndarray) -> np.ndarray:
     return np.tensordot(image, matrix.T, axes=([-1], [0])).astype(
         np.float32,
         copy=False,
     )
+
+
+def _apply_color_matrix_torch(image, matrix: np.ndarray):
+    matrix_t = torch.as_tensor(matrix, device=image.device, dtype=image.dtype)
+    return image @ matrix_t.transpose(0, 1)
 
 
 def _gaussian_blur_np(image: np.ndarray, sigma: float) -> np.ndarray:
@@ -1731,6 +2800,49 @@ def _gaussian_kernel1d(sigma: float) -> np.ndarray:
     kernel = np.exp(-(x * x) / (2.0 * sigma * sigma))
     kernel /= float(kernel.sum())
     return kernel.astype(np.float32)
+
+
+def _gaussian_kernel1d_torch(sigma: float, *, device, dtype):
+    radius = max(1, int(math.ceil(3.0 * float(sigma))))
+    x = torch.arange(-radius, radius + 1, device=device, dtype=dtype)
+    kernel = torch.exp(-0.5 * (x / float(sigma)) ** 2)
+    return kernel / torch.clamp(kernel.sum(), min=torch.finfo(dtype).eps)
+
+
+def _gaussian_blur_torch(image, sigma: float):
+    sigma = float(sigma)
+    if sigma <= 1e-4:
+        return image
+    if image.ndim not in (2, 3):
+        raise ValueError(
+            f"Expected 2-D or HWC image tensor, got {tuple(image.shape)}"
+        )
+
+    is_2d = image.ndim == 2
+    if is_2d:
+        x = image.to(dtype=torch.float32).view(1, 1, image.shape[0], image.shape[1])
+    else:
+        if image.shape[-1] <= 0:
+            return image
+        x = image.to(dtype=torch.float32).permute(2, 0, 1).unsqueeze(0)
+
+    channels = int(x.shape[1])
+    dtype = x.dtype
+    device = x.device
+    kernel = _gaussian_kernel1d_torch(sigma, device=device, dtype=dtype)
+    radius = int(kernel.numel() // 2)
+    horizontal = kernel.view(1, 1, 1, -1).expand(channels, 1, 1, -1)
+    vertical = kernel.view(1, 1, -1, 1).expand(channels, 1, -1, 1)
+    horizontal_pad = "reflect" if radius < int(x.shape[-1]) else "replicate"
+    x = torch.nn.functional.pad(x, (radius, radius, 0, 0), mode=horizontal_pad)
+    x = torch.nn.functional.conv2d(x, horizontal, groups=channels)
+    vertical_pad = "reflect" if radius < int(x.shape[-2]) else "replicate"
+    x = torch.nn.functional.pad(x, (0, 0, radius, radius), mode=vertical_pad)
+    x = torch.nn.functional.conv2d(x, vertical, groups=channels)
+
+    if is_2d:
+        return x[0, 0].to(dtype=image.dtype)
+    return x[0].permute(1, 2, 0).to(dtype=image.dtype)
 
 
 def _smooth_random_bias(
@@ -1753,6 +2865,39 @@ def _smooth_random_bias(
     if smoothed_std > 1e-8 and original_std > 0.0:
         out = out * (original_std / smoothed_std)
     return out.astype(np.float32, copy=False)
+
+
+def _smooth_random_bias_torch(
+    length: int,
+    sigma: float,
+    correlation_px: float,
+    rng: np.random.Generator,
+    device,
+    dtype,
+):
+    values = _randn_torch((length,), rng, device, dtype) * float(sigma)
+    if correlation_px <= 1.0 or length <= 2:
+        return values
+    kernel = _gaussian_kernel1d_torch(
+        max(float(correlation_px) / 3.0, 1e-4),
+        device=device,
+        dtype=dtype,
+    )
+    radius = int(kernel.numel() // 2)
+    pad_mode = "reflect" if radius < length else "replicate"
+    x = values.to(dtype=torch.float32).view(1, 1, length)
+    padded = torch.nn.functional.pad(x, (radius, radius), mode=pad_mode)
+    out = torch.nn.functional.conv1d(
+        padded,
+        kernel.to(dtype=torch.float32).view(1, 1, -1),
+    )[0, 0].to(dtype=dtype)
+    original_std = torch.std(values, unbiased=False)
+    smoothed_std = torch.std(out, unbiased=False)
+    if bool((smoothed_std > 1e-8).detach().cpu()) and bool(
+        (original_std > 0.0).detach().cpu()
+    ):
+        out = out * (original_std / smoothed_std)
+    return out
 
 
 def _convolve1d_reflect(
@@ -1812,6 +2957,52 @@ def _camera_geometry(
     return fx, fy, cx, cy
 
 
+def _context_intrinsics_torch(context: CaptureContext, device, dtype):
+    if context.intrinsics is None or torch is None:
+        return None
+    if torch.is_tensor(context.intrinsics):
+        intrinsics = context.intrinsics.to(device=device, dtype=dtype)
+        if tuple(intrinsics.shape) != (3, 3):
+            return None
+        fx = float(intrinsics[0, 0].detach().cpu())
+        fy = float(intrinsics[1, 1].detach().cpu())
+        if abs(fx) < 1e-6 or abs(fy) < 1e-6:
+            return None
+        return intrinsics
+
+    intrinsics_np = _context_intrinsics(context)
+    if intrinsics_np is None:
+        return None
+    return torch.as_tensor(intrinsics_np, device=device, dtype=dtype)
+
+
+def _camera_geometry_torch(
+    height: int,
+    width: int,
+    intrinsics,
+    device,
+    dtype,
+) -> tuple[float, float, float, float]:
+    if intrinsics is not None:
+        fx = max(abs(float(intrinsics[0, 0].detach().cpu())), 1e-6)
+        fy = max(abs(float(intrinsics[1, 1].detach().cpu())), 1e-6)
+        cx = float(intrinsics[0, 2].detach().cpu())
+        cy = float(intrinsics[1, 2].detach().cpu())
+        return fx, fy, cx, cy
+    fx = max((width - 1) / 2.0, 1e-6)
+    fy = max((height - 1) / 2.0, 1e-6)
+    cx = (width - 1) / 2.0
+    cy = (height - 1) / 2.0
+    return fx, fy, cx, cy
+
+
+def _coordinate_grid_torch(height: int, width: int, device, dtype):
+    y = torch.arange(height, device=device, dtype=dtype)
+    x = torch.arange(width, device=device, dtype=dtype)
+    yy, xx = torch.meshgrid(y, x, indexing="ij")
+    return yy, xx
+
+
 def _sample_bilinear_np(
     image: np.ndarray,
     y: np.ndarray,
@@ -1839,6 +3030,43 @@ def _sample_bilinear_np(
     return (top * (1.0 - wy3) + bottom * wy3).astype(np.float32, copy=False)
 
 
+def _sample_bilinear_torch(image, y, x):
+    height = int(image.shape[0])
+    width = int(image.shape[1])
+    x = torch.clamp(x, 0.0, float(max(width - 1, 0)))
+    y = torch.clamp(y, 0.0, float(max(height - 1, 0)))
+    if width > 1:
+        grid_x = 2.0 * x / float(width - 1) - 1.0
+    else:
+        grid_x = torch.zeros_like(x)
+    if height > 1:
+        grid_y = 2.0 * y / float(height - 1) - 1.0
+    else:
+        grid_y = torch.zeros_like(y)
+    grid = torch.stack((grid_x, grid_y), dim=-1).unsqueeze(0)
+
+    if image.ndim == 2:
+        input_t = image.to(dtype=torch.float32).view(1, 1, height, width)
+        sampled = torch.nn.functional.grid_sample(
+            input_t,
+            grid,
+            mode="bilinear",
+            padding_mode="border",
+            align_corners=True,
+        )
+        return sampled[0, 0].to(dtype=image.dtype)
+
+    input_t = image.to(dtype=torch.float32).permute(2, 0, 1).unsqueeze(0)
+    sampled = torch.nn.functional.grid_sample(
+        input_t,
+        grid,
+        mode="bilinear",
+        padding_mode="border",
+        align_corners=True,
+    )
+    return sampled[0].permute(1, 2, 0).to(dtype=image.dtype)
+
+
 def _lens_distort_np(
     image: np.ndarray,
     k1: float,
@@ -1855,6 +3083,25 @@ def _lens_distort_np(
     src_x = cx + nx * scale * fx
     src_y = cy + ny * scale * fy
     return _sample_bilinear_np(image, src_y, src_x)
+
+
+def _lens_distort_torch(image, k1: float, k2: float, intrinsics=None):
+    height, width = int(image.shape[0]), int(image.shape[1])
+    yy, xx = _coordinate_grid_torch(height, width, image.device, image.dtype)
+    fx, fy, cx, cy = _camera_geometry_torch(
+        height,
+        width,
+        intrinsics,
+        image.device,
+        image.dtype,
+    )
+    nx = (xx - cx) / fx
+    ny = (yy - cy) / fy
+    r2 = nx * nx + ny * ny
+    scale = 1.0 + float(k1) * r2 + float(k2) * r2 * r2
+    src_x = cx + nx * scale * fx
+    src_y = cy + ny * scale * fy
+    return _sample_bilinear_torch(image, src_y, src_x)
 
 
 def _chromatic_aberration_np(
@@ -1876,6 +3123,29 @@ def _chromatic_aberration_np(
     out[..., 0] = _sample_bilinear_np(image[..., 0], yy - uy * offset, xx - ux * offset)
     out[..., 2] = _sample_bilinear_np(image[..., 2], yy + uy * offset, xx + ux * offset)
     return out.astype(np.float32, copy=False)
+
+
+def _chromatic_aberration_torch(image, amount_px: float, intrinsics=None):
+    height, width = int(image.shape[0]), int(image.shape[1])
+    yy, xx = _coordinate_grid_torch(height, width, image.device, image.dtype)
+    _, _, cx, cy = _camera_geometry_torch(
+        height,
+        width,
+        intrinsics,
+        image.device,
+        image.dtype,
+    )
+    dx = xx - cx
+    dy = yy - cy
+    radius = torch.sqrt(dx * dx + dy * dy)
+    max_radius = torch.clamp(radius.max(), min=1e-6)
+    safe_radius = torch.clamp(radius, min=1e-6)
+    ux = dx / safe_radius
+    uy = dy / safe_radius
+    offset = float(amount_px) * (radius / max_radius)
+    red = _sample_bilinear_torch(image[..., 0], yy - uy * offset, xx - ux * offset)
+    blue = _sample_bilinear_torch(image[..., 2], yy + uy * offset, xx + ux * offset)
+    return torch.stack((red, image[..., 1], blue), dim=-1).to(dtype=image.dtype)
 
 
 def _apply_depth_chromatic_fringing_np(
@@ -1925,6 +3195,50 @@ def _apply_depth_chromatic_fringing_np(
     ).astype(np.float32, copy=False)
 
 
+def _apply_depth_chromatic_fringing_torch(
+    image,
+    config: Mapping[str, Any],
+    context: CaptureContext,
+    intrinsics,
+    rng: np.random.Generator,
+):
+    strength = _sample_float(config, "strength_px", 0.0, rng)
+    if strength <= 1e-5:
+        return image
+
+    height, width = int(image.shape[0]), int(image.shape[1])
+    weight = _depth_fog_dark_weight_map_torch(image, context, config, rng)
+    if not bool(torch.any(weight > 1e-5).detach().cpu()):
+        return image
+
+    yy, xx = _coordinate_grid_torch(height, width, image.device, image.dtype)
+    _, _, cx, cy = _camera_geometry_torch(
+        height,
+        width,
+        intrinsics,
+        image.device,
+        image.dtype,
+    )
+    dx = xx - cx
+    dy = yy - cy
+    radius = torch.sqrt(dx * dx + dy * dy)
+    max_radius = torch.clamp(radius.max(), min=1e-6)
+    safe_radius = torch.clamp(radius, min=1e-6)
+    ux = dx / safe_radius
+    uy = dy / safe_radius
+    offset = float(strength) * (radius / max_radius) * weight
+
+    red = _sample_bilinear_torch(image[..., 0], yy - uy * offset, xx - ux * offset)
+    blue = _sample_bilinear_torch(image[..., 2], yy + uy * offset, xx + ux * offset)
+    shifted = torch.stack((red, image[..., 1], blue), dim=-1)
+    alpha = torch.clamp(
+        weight * _sample_float(config, "max_alpha", 0.8, rng),
+        0.0,
+        1.0,
+    )
+    return image * (1.0 - alpha[..., None]) + shifted * alpha[..., None]
+
+
 def _depth_fog_dark_weight_map(
     image: np.ndarray,
     context: CaptureContext,
@@ -1962,6 +3276,45 @@ def _depth_fog_dark_weight_map(
     return np.clip(weight, 0.0, 1.0).astype(np.float32, copy=False)
 
 
+def _depth_fog_dark_weight_map_torch(
+    image,
+    context: CaptureContext,
+    config: Mapping[str, Any],
+    rng: np.random.Generator,
+):
+    shape = (int(image.shape[0]), int(image.shape[1]))
+    weight = torch.zeros(shape, device=image.device, dtype=image.dtype)
+
+    depth_weight = _sample_float(config, "depth_weight", 0.0, rng)
+    if depth_weight != 0.0:
+        depth = _context_depth_map_torch(context, shape, image.device, image.dtype)
+        if depth is not None:
+            weight = weight + float(depth_weight) * _normalize_context_map_torch(depth)
+
+    fog_weight = _sample_float(config, "fog_weight", 0.0, rng)
+    if fog_weight != 0.0:
+        opacity = _context_fog_opacity_torch(context, shape, image.device, image.dtype)
+        if opacity is not None:
+            weight = weight + float(fog_weight) * torch.clamp(opacity, 0.0, 1.0)
+
+    dark_weight = _sample_float(config, "dark_weight", 0.0, rng)
+    if dark_weight != 0.0:
+        weights = torch.tensor(
+            [0.2126, 0.7152, 0.0722],
+            device=image.device,
+            dtype=image.dtype,
+        )
+        luma = torch.sum(image * weights.view(1, 1, 3), dim=-1)
+        weight = weight + float(dark_weight) * (1.0 - torch.clamp(luma, 0.0, 1.0))
+
+    gamma = max(_sample_float(config, "gamma", 1.0, rng), 1e-6)
+    weight = torch.pow(torch.clamp(weight, 0.0, 1.0), gamma)
+    blur_sigma = _sample_float(config, "blur_sigma", 0.0, rng)
+    if blur_sigma > 1e-4:
+        weight = _gaussian_blur_torch(weight, blur_sigma)
+    return torch.clamp(weight, 0.0, 1.0)
+
+
 def _motion_blur_np(image: np.ndarray, length_px: float, angle_deg: float) -> np.ndarray:
     length = max(2, int(round(length_px)))
     yy, xx = _coordinate_grid(image.shape[0], image.shape[1])
@@ -1973,6 +3326,30 @@ def _motion_blur_np(image: np.ndarray, length_px: float, angle_deg: float) -> np
             image,
             yy + math.sin(angle) * offset,
             xx + math.cos(angle) * offset,
+        )
+    return out / float(length)
+
+
+def _motion_blur_torch(image, length_px: float, angle_deg: float):
+    length = max(2, int(round(length_px)))
+    height, width = int(image.shape[0]), int(image.shape[1])
+    yy, xx = _coordinate_grid_torch(height, width, image.device, image.dtype)
+    angle = math.radians(float(angle_deg))
+    offsets = torch.linspace(
+        -(length - 1) / 2.0,
+        (length - 1) / 2.0,
+        length,
+        device=image.device,
+        dtype=image.dtype,
+    )
+    out = torch.zeros_like(image)
+    sin_angle = math.sin(angle)
+    cos_angle = math.cos(angle)
+    for offset in offsets:
+        out = out + _sample_bilinear_torch(
+            image,
+            yy + sin_angle * offset,
+            xx + cos_angle * offset,
         )
     return out / float(length)
 
@@ -1993,6 +3370,22 @@ def _apply_bloom_np(
     return image + strength * glow
 
 
+def _apply_bloom_torch(image, config: Mapping[str, Any], rng: np.random.Generator):
+    threshold = _sample_float(config, "threshold", 0.85, rng)
+    strength = _sample_float(config, "strength", 0.0, rng)
+    sigma = _sample_float(config, "sigma", 3.0, rng)
+    if strength <= 1e-5:
+        return image
+    luminance = image.amax(dim=-1, keepdim=True)
+    mask = torch.clamp(
+        (luminance - float(threshold)) / max(1.0 - float(threshold), 1e-6),
+        0.0,
+        1.0,
+    )
+    glow = _gaussian_blur_torch(image * mask, sigma)
+    return image + float(strength) * glow
+
+
 def _low_frequency_field(
     height: int,
     width: int,
@@ -2001,6 +3394,61 @@ def _low_frequency_field(
     largest = max(height, width)
     scales = [max(4, int(largest * fraction)) for fraction in (0.75, 0.38, 0.19)]
     return perlin_fbm(height, width, scales, rng)
+
+
+def _torch_generator_from_rng(rng: np.random.Generator, device):
+    seed = int(rng.integers(0, np.iinfo(np.int64).max))
+    try:
+        generator = torch.Generator(device=device)
+    except Exception:  # pragma: no cover - backend-specific fallback
+        generator = torch.Generator()
+    generator.manual_seed(seed)
+    return generator
+
+
+def _rand_torch(shape, rng: np.random.Generator, device, dtype):
+    return torch.rand(
+        tuple(shape),
+        generator=_torch_generator_from_rng(rng, device),
+        device=device,
+        dtype=dtype,
+    )
+
+
+def _randn_torch(shape, rng: np.random.Generator, device, dtype):
+    return torch.randn(
+        tuple(shape),
+        generator=_torch_generator_from_rng(rng, device),
+        device=device,
+        dtype=dtype,
+    )
+
+
+def _poisson_torch(values, rng: np.random.Generator):
+    return torch.poisson(
+        values,
+        generator=_torch_generator_from_rng(rng, values.device),
+    ).to(dtype=values.dtype)
+
+
+def _positive_torch_or_float(value: Any) -> bool:
+    if torch is not None and torch.is_tensor(value):
+        return bool(torch.any(value > 0.0).detach().cpu())
+    return float(value) > 0.0
+
+
+def _low_frequency_field_torch(
+    height: int,
+    width: int,
+    rng: np.random.Generator,
+    device,
+    dtype,
+):
+    largest = max(height, width)
+    scales = [max(4, int(largest * fraction)) for fraction in (0.75, 0.38, 0.19)]
+    generator = _torch_generator_from_rng(rng, device)
+    field = perlin_fbm_torch(height, width, scales, generator, device)
+    return field.to(device=device, dtype=dtype)
 
 
 def _vignette_mask(
@@ -2019,6 +3467,24 @@ def _vignette_mask(
     return np.clip(mask, 0.0, 1.0).astype(np.float32)
 
 
+def _vignette_mask_torch(
+    height: int,
+    width: int,
+    strength: float,
+    radius: float,
+    intrinsics,
+    device,
+    dtype,
+):
+    yy, xx = _coordinate_grid_torch(height, width, device, dtype)
+    fx, fy, cx, cy = _camera_geometry_torch(height, width, intrinsics, device, dtype)
+    nx = (xx - cx) / fx
+    ny = (yy - cy) / fy
+    r = torch.sqrt(nx * nx + ny * ny) / max(float(radius), 1e-6)
+    mask = 1.0 - float(strength) * torch.clamp(r * r, 0.0, 1.0)
+    return torch.clamp(mask, 0.0, 1.0)
+
+
 def _apply_windshield_haze_np(
     image: np.ndarray,
     config: Mapping[str, Any],
@@ -2033,6 +3499,26 @@ def _apply_windshield_haze_np(
     alpha = strength * (0.45 + 0.55 * field)
     blurred = _gaussian_blur_np(image, blur_sigma)
     veil = 0.7 * blurred + 0.3 * color.reshape(1, 1, 3)
+    return image * (1.0 - alpha[..., None]) + veil * alpha[..., None]
+
+
+def _apply_windshield_haze_torch(image, config: Mapping[str, Any], rng):
+    strength = _sample_float(config, "strength", 0.0, rng)
+    if strength <= 1e-5:
+        return image
+    blur_sigma = _sample_float(config, "blur_sigma", 8.0, rng)
+    color = _sample_triplet(config.get("color", [0.82, 0.86, 0.88]), rng)
+    field = _low_frequency_field_torch(
+        int(image.shape[0]),
+        int(image.shape[1]),
+        rng,
+        image.device,
+        image.dtype,
+    )
+    alpha = float(strength) * (0.45 + 0.55 * field)
+    blurred = _gaussian_blur_torch(image, blur_sigma)
+    color_t = torch.as_tensor(color, device=image.device, dtype=image.dtype)
+    veil = 0.7 * blurred + 0.3 * color_t.view(1, 1, 3)
     return image * (1.0 - alpha[..., None]) + veil * alpha[..., None]
 
 
@@ -2098,9 +3584,37 @@ def _bayer_masks(height: int, width: int, pattern: str) -> np.ndarray:
     return masks
 
 
+def _bayer_masks_torch(height: int, width: int, pattern: str, device):
+    pattern = pattern.upper()
+    tiles = {
+        "RGGB": ((0, 1), (1, 2)),
+        "BGGR": ((2, 1), (1, 0)),
+        "GRBG": ((1, 0), (2, 1)),
+        "GBRG": ((1, 2), (0, 1)),
+    }
+    if pattern not in tiles:
+        raise ValueError(f"Unsupported Bayer pattern: {pattern}")
+    tile = torch.tensor(tiles[pattern], device=device, dtype=torch.int64)
+    yy = torch.arange(height, device=device, dtype=torch.int64).view(-1, 1)
+    xx = torch.arange(width, device=device, dtype=torch.int64).view(1, -1)
+    channel_index = tile[yy % 2, xx % 2]
+    channels = torch.arange(3, device=device, dtype=torch.int64).view(1, 1, 3)
+    return channel_index[..., None] == channels
+
+
 def _bayer_mosaic_np(image: np.ndarray, pattern: str) -> np.ndarray:
     masks = _bayer_masks(image.shape[0], image.shape[1], pattern)
     return np.sum(image * masks.astype(np.float32), axis=-1).astype(np.float32)
+
+
+def _bayer_mosaic_torch(image, pattern: str):
+    masks = _bayer_masks_torch(
+        int(image.shape[0]),
+        int(image.shape[1]),
+        pattern,
+        image.device,
+    )
+    return torch.sum(image * masks.to(dtype=image.dtype), dim=-1)
 
 
 def _mosaic_channel_values(
@@ -2111,6 +3625,19 @@ def _mosaic_channel_values(
     height, width = shape
     masks = _bayer_masks(height, width, pattern)
     return np.sum(masks.astype(np.float32) * values.reshape(1, 1, 3), axis=-1)
+
+
+def _mosaic_channel_values_torch(
+    shape: tuple[int, int],
+    pattern: str,
+    values: np.ndarray,
+    device,
+    dtype,
+):
+    height, width = shape
+    masks = _bayer_masks_torch(height, width, pattern, device).to(dtype=dtype)
+    values_t = torch.as_tensor(values, device=device, dtype=dtype)
+    return torch.sum(masks * values_t.view(1, 1, 3), dim=-1)
 
 
 def _demosaic_bilinear_np(raw: np.ndarray, pattern: str) -> np.ndarray:
@@ -2126,6 +3653,51 @@ def _demosaic_bilinear_np(raw: np.ndarray, pattern: str) -> np.ndarray:
         denominator = _convolve2d_same(mask, kernel)
         rgb[..., channel] = numerator / np.maximum(denominator, 1e-6)
     return rgb
+
+
+def _convolve2d_same_torch(image, kernel):
+    pad_y = int(kernel.shape[0] // 2)
+    pad_x = int(kernel.shape[1] // 2)
+    x = image.to(dtype=torch.float32).view(
+        1,
+        1,
+        int(image.shape[0]),
+        int(image.shape[1]),
+    )
+    pad_mode = (
+        "reflect"
+        if pad_y < int(image.shape[0]) and pad_x < int(image.shape[1])
+        else "replicate"
+    )
+    x = torch.nn.functional.pad(x, (pad_x, pad_x, pad_y, pad_y), mode=pad_mode)
+    k = kernel.to(device=image.device, dtype=torch.float32).view(
+        1,
+        1,
+        int(kernel.shape[0]),
+        int(kernel.shape[1]),
+    )
+    return torch.nn.functional.conv2d(x, k)[0, 0].to(dtype=image.dtype)
+
+
+def _demosaic_bilinear_torch(raw, pattern: str):
+    masks = _bayer_masks_torch(
+        int(raw.shape[0]),
+        int(raw.shape[1]),
+        pattern,
+        raw.device,
+    ).to(dtype=raw.dtype)
+    kernel = torch.tensor(
+        [[1.0, 2.0, 1.0], [2.0, 4.0, 2.0], [1.0, 2.0, 1.0]],
+        device=raw.device,
+        dtype=raw.dtype,
+    )
+    channels = []
+    for channel in range(3):
+        mask = masks[..., channel]
+        numerator = _convolve2d_same_torch(raw * mask, kernel)
+        denominator = _convolve2d_same_torch(mask, kernel)
+        channels.append(numerator / torch.clamp(denominator, min=1e-6))
+    return torch.stack(channels, dim=-1)
 
 
 def _apply_bad_pixels_np(
@@ -2154,6 +3726,31 @@ def _apply_bad_pixels_np(
     return out
 
 
+def _apply_bad_pixels_torch(
+    raw,
+    config: Mapping[str, Any],
+    rng: np.random.Generator,
+    *,
+    hot_value: float | Any = 1.0,
+    dead_value: float | Any = 0.0,
+):
+    out = raw
+    hot_prob = _sample_float(config, "hot_pixel_probability", 0.0, rng)
+    if hot_prob > 0.0:
+        mask = _rand_torch(raw.shape, rng, raw.device, raw.dtype) < float(hot_prob)
+        if bool(torch.any(mask).detach().cpu()):
+            hot_t = torch.as_tensor(hot_value, device=raw.device, dtype=raw.dtype)
+            out = torch.where(mask, hot_t.expand_as(raw), out)
+
+    dead_prob = _sample_float(config, "dead_pixel_probability", 0.0, rng)
+    if dead_prob > 0.0:
+        mask = _rand_torch(raw.shape, rng, raw.device, raw.dtype) < float(dead_prob)
+        if bool(torch.any(mask).detach().cpu()):
+            dead_t = torch.as_tensor(dead_value, device=raw.device, dtype=raw.dtype)
+            out = torch.where(mask, dead_t.expand_as(raw), out)
+    return out
+
+
 def _apply_tone_map_np(image: np.ndarray, mode: str, strength: float) -> np.ndarray:
     img = np.clip(image, 0.0, None).astype(np.float32, copy=False)
     strength = max(float(strength), 0.0)
@@ -2169,6 +3766,24 @@ def _apply_tone_map_np(image: np.ndarray, mode: str, strength: float) -> np.ndar
         return img * (1.0 - strength) + mapped * strength
     if mode == "clip":
         return _clip01(img)
+    raise ValueError(f"Unsupported tone_map: {mode}")
+
+
+def _apply_tone_map_torch(image, mode: str, strength: float):
+    img = torch.clamp(image, min=0.0)
+    strength = max(float(strength), 0.0)
+    if mode == "reinhard":
+        return img / (1.0 + strength * img)
+    if mode == "aces":
+        a = 2.51
+        b = 0.03
+        c = 2.43
+        d = 0.59
+        e = 0.14
+        mapped = (img * (a * img + b)) / (img * (c * img + d) + e)
+        return img * (1.0 - strength) + mapped * strength
+    if mode == "clip":
+        return _clip01_torch(img)
     raise ValueError(f"Unsupported tone_map: {mode}")
 
 
@@ -2189,12 +3804,61 @@ def _apply_gamma_np(
     return np.power(_clip01(image), 1.0 / gamma).astype(np.float32, copy=False)
 
 
+def _apply_gamma_torch(
+    image,
+    gamma_spec: Any,
+    rng: np.random.Generator,
+):
+    if isinstance(gamma_spec, str):
+        mode = gamma_spec.lower()
+        if mode == "srgb":
+            return _linear_to_srgb_torch(image)
+        if mode in {"none", "false", "off", "linear"}:
+            return _clip01_torch(image)
+    gamma = float(sample_value(gamma_spec, rng))
+    if gamma <= 0.0:
+        raise ValueError("gamma must be > 0")
+    return torch.pow(_clip01_torch(image), 1.0 / gamma)
+
+
 def _crop_np(
     image: np.ndarray,
     crop: Any,
     rng: np.random.Generator,
 ) -> np.ndarray:
     height, width = image.shape[:2]
+    if isinstance(crop, dict):
+        if "center_fraction" in crop:
+            fraction = float(sample_value(crop["center_fraction"], rng))
+            fraction = float(np.clip(fraction, 1e-3, 1.0))
+            crop_w = max(1, int(round(width * fraction)))
+            crop_h = max(1, int(round(height * fraction)))
+            x0 = (width - crop_w) // 2
+            y0 = (height - crop_h) // 2
+        else:
+            x0 = int(round(_sample_float(crop, "x", 0.0, rng)))
+            y0 = int(round(_sample_float(crop, "y", 0.0, rng)))
+            crop_w = int(round(_sample_float(crop, "width", width, rng)))
+            crop_h = int(round(_sample_float(crop, "height", height, rng)))
+    elif isinstance(crop, (list, tuple)) and len(crop) == 4:
+        values = [int(round(float(sample_value(value, rng)))) for value in crop]
+        x0, y0, crop_w, crop_h = values
+    else:
+        raise ValueError("crop must be an object or [x, y, width, height]")
+
+    x0 = int(np.clip(x0, 0, max(width - 1, 0)))
+    y0 = int(np.clip(y0, 0, max(height - 1, 0)))
+    x1 = int(np.clip(x0 + max(crop_w, 1), x0 + 1, width))
+    y1 = int(np.clip(y0 + max(crop_h, 1), y0 + 1, height))
+    return image[y0:y1, x0:x1]
+
+
+def _crop_torch(
+    image,
+    crop: Any,
+    rng: np.random.Generator,
+):
+    height, width = int(image.shape[0]), int(image.shape[1])
     if isinstance(crop, dict):
         if "center_fraction" in crop:
             fraction = float(sample_value(crop["center_fraction"], rng))
@@ -2258,12 +3922,51 @@ def _resize_np(
     return np.asarray(resized, dtype=np.float32) / 255.0
 
 
+def _resize_torch(
+    image,
+    size: tuple[int, int],
+    resample: str,
+):
+    target_width, target_height = size
+    mode = {
+        "nearest": "nearest",
+        "bilinear": "bilinear",
+        "bicubic": "bicubic",
+        "lanczos": "bicubic",
+        "area": "area",
+        "box": "area",
+    }.get(resample.lower(), "bilinear")
+    x = image.permute(2, 0, 1).unsqueeze(0).to(dtype=torch.float32)
+    kwargs: dict[str, Any] = {"size": (target_height, target_width), "mode": mode}
+    if mode in {"bilinear", "bicubic"}:
+        kwargs["align_corners"] = False
+    resized = torch.nn.functional.interpolate(x, **kwargs)
+    return resized[0].permute(1, 2, 0).to(dtype=image.dtype)
+
+
 def _resize_map_np(map_2d: np.ndarray, shape: tuple[int, int]) -> np.ndarray:
     height, width = shape
     yy = np.linspace(0.0, max(map_2d.shape[0] - 1, 0), height, dtype=np.float32)
     xx = np.linspace(0.0, max(map_2d.shape[1] - 1, 0), width, dtype=np.float32)
     grid_y, grid_x = np.meshgrid(yy, xx, indexing="ij")
     return _sample_bilinear_np(map_2d.astype(np.float32, copy=False), grid_y, grid_x)
+
+
+def _resize_map_torch(map_2d, shape: tuple[int, int]):
+    height, width = shape
+    x = map_2d.to(dtype=torch.float32).view(
+        1,
+        1,
+        int(map_2d.shape[0]),
+        int(map_2d.shape[1]),
+    )
+    resized = torch.nn.functional.interpolate(
+        x,
+        size=(height, width),
+        mode="bilinear",
+        align_corners=True,
+    )
+    return resized[0, 0].to(dtype=map_2d.dtype)
 
 
 def _pil_resampling(name: str):
@@ -2283,6 +3986,13 @@ def _quantize_np(image: np.ndarray, bit_depth: int) -> np.ndarray:
         return _clip01(image)
     levels = max(2, 2**bit_depth - 1)
     return np.round(_clip01(image) * levels) / float(levels)
+
+
+def _quantize_torch(image, bit_depth: int):
+    if bit_depth >= 16:
+        return _clip01_torch(image)
+    levels = max(2, 2**bit_depth - 1)
+    return torch.round(_clip01_torch(image) * float(levels)) / float(levels)
 
 
 def _jpeg_roundtrip_np(
