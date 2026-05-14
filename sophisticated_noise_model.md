@@ -207,6 +207,25 @@ ISO respond to actual rendered luminance.
 The exact schema should follow existing configuration conventions, but the key
 idea is that one sampled scenario controls multiple downstream blocks.
 
+For GPU generation, scenario correlation can now be applied at batch scope:
+
+```json
+{
+  "gpu_batching": {
+    "scenario_scope": "batch",
+    "condition_parameter_scope": "batch"
+  }
+}
+```
+
+This creates two sampling levels. The batch level samples the coherent weather
+and camera condition: scenario choice, fog-model distribution values, airlight
+dampening settings, camera/capture profile distributions, and ISP/sensor
+strength parameters. The image level still samples effects that do not limit
+batch compatibility: heterogeneous fog fields, sensor noise realizations,
+stochastic stage application, auto-exposure response to rendered luminance, and
+other per-image random draws.
+
 ### Auto-Exposure Stage
 
 The exposure resolver runs between ideal fog rendering and raw sensor

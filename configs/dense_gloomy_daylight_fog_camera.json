@@ -6,6 +6,10 @@
   "contrast_threshold": 0.05,
   "device": "mps",
   "gpu_batch_size": 4,
+  "gpu_batching": {
+    "scenario_scope": "batch",
+    "condition_parameter_scope": "batch"
+  },
   "camera_profiles": {
     "dense_gloomy_daylight_dashcam": {
       "optics": {

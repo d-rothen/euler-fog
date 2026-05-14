@@ -69,6 +69,24 @@ Lower priority or partial substitutions:
 - Keep per-sample dispatch for stages that sample independently per image.
 - Avoid prematurely batching code that would make RNG order or profile selection hard to reason about.
 
+Batch-level condition sampling is controlled by:
+
+```json
+{
+  "gpu_batching": {
+    "scenario_scope": "batch",
+    "condition_parameter_scope": "batch"
+  }
+}
+```
+
+With this setting, the GPU path samples one top-level render/capture condition
+plan per batch. Distribution-valued scenario, fog-model, camera, and capture
+parameters are resolved once into that shared plan. Per-image RNG contexts are
+still passed through the render and capture stages, so spatial noise fields,
+sensor draws, stochastic stage application, auto-exposure metrics, and other
+image-dependent effects remain independently sampled.
+
 ### Phase 5: Optional Torch JPEG Approximation
 
 - Add an opt-in `jpeg.mode: "approx_torch"` or similar setting.
@@ -93,4 +111,7 @@ Start with Phase 1. This is the lowest-risk change because it only changes torch
 - Phase 2 is partially implemented: lens distortion, chromatic aberration, depth/fog-weighted fringing, gaussian blur, motion blur, bloom, veiling glare, vignetting, and windshield haze have torch paths. Droplet rendering remains a local CPU fallback when enabled.
 - Phase 3 is partially implemented: auto exposure metrics, Bayer mosaic/demosaic, raw quantization, shot/read/fixed/row/column noise, bad pixels, noise modulation, black suppression, and shadow-recovery chroma noise have torch paths.
 - Remaining CPU boundaries are exact JPEG roundtrip, final output encoding/writes, auxiliary `.npy` writes, and enabled droplet rendering.
-- Remaining optimization work is batch-aware capture execution and an optional torch JPEG approximation.
+- Phase 4 is partially implemented: the GPU path can sample one scenario/
+  condition parameter plan per batch and can use the uniform-model batch path
+  for scenario-profile batches when they share the same capture stack.
+- Remaining optimization work is fully batched capture stage kernels and an optional torch JPEG approximation.
