@@ -148,6 +148,32 @@ def _write_stepped_fog_config(path: Path) -> Path:
     return path
 
 
+def _write_progressive_scenario_fog_config(path: Path) -> Path:
+    cfg = {
+        "mode": "progressive",
+        "airlight": "from_sky",
+        "device": "cpu",
+        "seed": 7,
+        "contrast_threshold": 0.05,
+        "scenario_profiles": [
+            {
+                "name": "dense",
+                "steps": 2,
+                "weight": 1.0,
+                "model": "uniform",
+                "models": {
+                    "uniform": {
+                        "visibility_m": 20.0,
+                        "atmospheric_light": [0.4, 0.5, 0.6],
+                    }
+                },
+            }
+        ],
+    }
+    path.write_text(json.dumps(cfg))
+    return path
+
+
 def _build_pipeline_config(
     pipeline_root: Path,
     manifest_path: Path,
@@ -341,6 +367,99 @@ def test_stepped_augmentations_write_file_id_layout_and_attributes(
         (pipeline_root / "foggy_rgb" / ".ds_crawler" / "dataset-head.json").read_text()
     )
     assert output_head["addons"]["euler_layout"] == output_index["euler_layout"]
+
+
+def test_progressive_scenario_profiles_write_steps_and_attributes(
+    tmp_path: Path,
+) -> None:
+    dataset = _make_dataset(tmp_path)
+    pipeline_root = tmp_path / "pipeline_root_progressive"
+    manifest_path = pipeline_root / ".euler_pipeline" / "pipeline_outputs.json"
+    config = _build_pipeline_config(
+        pipeline_root,
+        manifest_path,
+        include_scattering=True,
+        include_airlight=True,
+    )
+
+    backends = prepare_output_backends(config, dataset, FogTransform)
+    transform = FogTransform(
+        config_path=str(
+            _write_progressive_scenario_fog_config(tmp_path / "fog_progressive.json")
+        ),
+        out_path=str(backends["rgb"].root),
+        output_backends=backends,
+    )
+
+    saved_paths = transform.run(dataset)
+
+    assert saved_paths == [
+        pipeline_root / "foggy_rgb" / "Scene01" / "Camera_0" / "00001" / "dense_w0.png",
+        pipeline_root
+        / "foggy_rgb"
+        / "Scene01"
+        / "Camera_0"
+        / "00001"
+        / "dense_w0.5.png",
+        pipeline_root / "foggy_rgb" / "Scene01" / "Camera_0" / "00001" / "dense_w1.png",
+    ]
+    for path in saved_paths:
+        assert path.exists()
+
+    k0 = load_map_2d(
+        str(
+            pipeline_root
+            / "scattering"
+            / "Scene01"
+            / "Camera_0"
+            / "00001"
+            / "dense_w0.npy"
+        )
+    )
+    k_half = load_map_2d(
+        str(
+            pipeline_root
+            / "scattering"
+            / "Scene01"
+            / "Camera_0"
+            / "00001"
+            / "dense_w0.5.npy"
+        )
+    )
+    k1 = load_map_2d(
+        str(
+            pipeline_root
+            / "scattering"
+            / "Scene01"
+            / "Camera_0"
+            / "00001"
+            / "dense_w1.npy"
+        )
+    )
+    base_k = visibility_to_k(80.0, 0.05)
+    scenario_k = visibility_to_k(20.0, 0.05)
+    np.testing.assert_allclose(k0, base_k, atol=1e-6)
+    np.testing.assert_allclose(k_half, base_k + (scenario_k - base_k) * 0.5, atol=1e-6)
+    np.testing.assert_allclose(k1, scenario_k, atol=1e-6)
+
+    output_index = json.loads(
+        (pipeline_root / "foggy_rgb" / ".ds_crawler" / "index.json").read_text()
+    )
+    node = output_index["dataset"]["children"]["Scene01"]["children"]["Camera_0"]
+    file_id_node = node["children"]["file_id:00001"]
+    entries = {entry["id"]: entry for entry in file_id_node["files"]}
+    assert set(entries) == {"dense_w0", "dense_w0.5", "dense_w1"}
+    attrs = entries["dense_w1"]["attributes"]["fog_progression"]
+    assert attrs["scenario"] == "dense"
+    assert attrs["step"] == 2
+    assert attrs["steps"] == 2
+    assert attrs["weight"] == 1.0
+    assert attrs["source_id"] == "00001"
+    assert attrs["model"] == "uniform"
+    assert output_index["euler_layout"]["variant_axis"] == {
+        "name": "fog_progression",
+        "location": "file_id",
+    }
 
 
 def test_only_scattering_target_writes_only_scattering(tmp_path: Path) -> None:

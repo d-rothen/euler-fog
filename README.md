@@ -134,6 +134,7 @@ Controls the fog simulation.
   "depth_scale": 1.0,
   "resize_depth": true,
   "contrast_threshold": 0.05,
+  "mode": "sample",
   "device": "cpu",
   "gpu_batch_size": 4,
   "capture": { "preset": "camera" },
@@ -151,6 +152,7 @@ Controls the fog simulation.
 | `depth_scale` | Multiplier applied to depth values after loading. |
 | `resize_depth` | Resize the depth map to match the RGB resolution (bilinear). |
 | `contrast_threshold` | Threshold *C_t* used in the visibility-to-attenuation conversion (default `0.05`). |
+| `mode` | Optional scenario mode. Omit it or use `"sample"` for current one-scenario-per-image behavior; use `"progressive"` to render every scenario step for every image. |
 | `device` | `"cpu"`, `"cuda"`, `"mps"`, or `"gpu"` (alias for cuda). |
 | `gpu_batch_size` | Batch size when running on GPU. Uniform-model samples are batched; heterogeneous samples are processed individually. |
 | `capture` / `capture_artifacts` | Optional post-fog camera artifact pipeline. Omit it or set `{"stages": []}` for the legacy no-op path. Set `true`, `{"preset": "camera"}`, or a custom `stages` list to enable optics, raw sensor, ISP, and compression artifacts. |
@@ -389,6 +391,15 @@ compression together:
 `condition_profile` to force one named profile from a stage's
 `condition_profiles`; if omitted, the stage continues sampling its own profile
 weights locally.
+
+Set top-level `"mode": "progressive"` to emit every configured scenario for
+every input image instead of sampling one scenario. Each scenario accepts
+`"steps"` and `"weight"`; the transform writes steps from weight `0` through
+the scenario's configured weight, and weight `1` matches the original scenario.
+Fog density is progressed in scattering-coefficient space, while numeric
+camera/config values blend from the base config toward the scenario config.
+Source-backed outputs are written as `fog_progression` variants under each
+source file id.
 
 ### Fog Model
 

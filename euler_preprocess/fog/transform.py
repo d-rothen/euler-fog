@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import copy
+import re
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
@@ -47,6 +49,7 @@ from euler_preprocess.fog.models import (
     apply_ls_gradient_torch,
     modulate_with_noise_torch,
     prepare_noise_field_torch,
+    resolve_scattering_coefficient,
     resolve_model_config,
     resolve_scales,
     select_model,
@@ -104,6 +107,12 @@ _SCENARIO_PROFILE_METADATA_KEYS = {
     "probability",
     "profile_weight",
     "config",
+    "steps",
+    "step_count",
+    "progressive_weight",
+    "max_weight",
+    "attribute_key",
+    "file_id_hierarchy_name",
 }
 _SCENARIO_CONTROL_KEYS = {
     "model",
@@ -117,6 +126,9 @@ _SCENARIO_CONTROL_KEYS = {
 
 
 _GPU_BATCH_SCOPE_VALUES = {"sample", "batch"}
+_CONFIG_MODE_VALUES = {"sample", "sampled", "random", "default", "legacy"}
+_PROGRESSIVE_ATTRIBUTE_KEY = "fog_progression"
+_PROGRESSIVE_FILE_ID_HIERARCHY_NAME = "file_id"
 
 
 @dataclass(frozen=True)
@@ -126,6 +138,26 @@ class RenderPlan:
     airlight_method: str | None = None
     capture_artifacts: CaptureArtifactPipeline | None = None
     scenario_name: str | None = None
+
+
+@dataclass(frozen=True)
+class ProgressiveScenarioStep:
+    profile: dict[str, Any]
+    scenario_index: int
+    scenario_name: str
+    id: str
+    step_index: int
+    steps: int
+    weight: float
+    max_weight: float
+
+
+@dataclass(frozen=True)
+class OutputVariantSpec:
+    id: str
+    attribute_key: str
+    file_id_hierarchy_name: str | None
+    attributes: dict[str, Any]
 
 
 def _freeze_distribution_specs(value: Any, rng: np.random.Generator) -> Any:
@@ -142,6 +174,26 @@ def _freeze_distribution_specs(value: Any, rng: np.random.Generator) -> Any:
     if isinstance(value, tuple):
         return tuple(_freeze_distribution_specs(child, rng) for child in value)
     return value
+
+
+def _sanitize_variant_identifier(value: str) -> str:
+    value = value.strip()
+    value = re.sub(r"[^A-Za-z0-9_.-]+", "_", value)
+    value = value.strip("._-")
+    return value or "variant"
+
+
+def _is_progressive_number(value: Any) -> bool:
+    return isinstance(value, (int, float, np.integer, np.floating)) and not isinstance(
+        value,
+        bool,
+    )
+
+
+def _is_numeric_sequence(value: Any) -> bool:
+    return isinstance(value, (list, tuple)) and all(
+        _is_progressive_number(item) for item in value
+    )
 
 
 # Use the canonical euler-loading ``generic.map_2d`` / ``map_3d`` modality
@@ -264,6 +316,16 @@ class FogTransform(Transform):
         )
         self.augmentation_specs = list(self.augmentation_config.specs)
         self.scenario_profiles = self._parse_scenario_profiles(self.config)
+        self.mode = self._parse_mode(self.config)
+        self.progressive_scenario_steps = self._build_progressive_scenario_steps(
+            self.config,
+            self.scenario_profiles,
+        )
+        if self.mode == "progressive" and self.augmentation_specs:
+            raise ValueError(
+                "mode='progressive' cannot be combined with augmentations; "
+                "progressive scenario profiles already emit variant outputs"
+            )
         (
             self.gpu_scenario_scope,
             self.gpu_condition_parameter_scope,
@@ -328,6 +390,8 @@ class FogTransform(Transform):
         """
         if self.use_gpu:
             return self._generate_fog_gpu(samples)
+        if self.mode == "progressive":
+            return self._generate_fog_cpu_progressive(samples)
         return self._generate_fog_cpu(samples)
 
     def _configure_device(self) -> None:
@@ -346,6 +410,26 @@ class FogTransform(Transform):
             return np.random.default_rng(
                 np.random.SeedSequence(
                     [int(self.seed), int(batch_index), 1_000_003]
+                )
+            )
+        return self.base_rng
+
+    def _rng_for_progressive(
+        self,
+        sample_index: int,
+        scenario_index: int,
+        step_index: int,
+    ):
+        if self.seed is not None:
+            return np.random.default_rng(
+                np.random.SeedSequence(
+                    [
+                        int(self.seed),
+                        int(sample_index),
+                        2_000_003,
+                        int(scenario_index),
+                        int(step_index),
+                    ]
                 )
             )
         return self.base_rng
@@ -412,6 +496,88 @@ class FogTransform(Transform):
                 profiles.append(dict(entry))
             return tuple(profiles)
         return ()
+
+    def _parse_mode(self, config: dict[str, Any]) -> str:
+        raw = config.get("mode", config.get("scenario_mode", "sample"))
+        if raw is None:
+            return "sample"
+        if not isinstance(raw, str):
+            raise ValueError("mode must be a string")
+        mode = raw.strip().lower().replace("-", "_")
+        if mode == "progressive":
+            return mode
+        if mode in _CONFIG_MODE_VALUES:
+            return "sample"
+        raise ValueError("mode must be 'progressive' or omitted")
+
+    def _build_progressive_scenario_steps(
+        self,
+        config: dict[str, Any],
+        profiles: tuple[dict[str, Any], ...],
+    ) -> tuple[ProgressiveScenarioStep, ...]:
+        if self.mode != "progressive":
+            return ()
+        if not profiles:
+            raise ValueError("mode='progressive' requires scenario_profiles")
+
+        default_steps = int(config.get("progressive_steps", config.get("steps", 1)))
+        if default_steps < 1:
+            raise ValueError("progressive_steps must be >= 1")
+
+        steps: list[ProgressiveScenarioStep] = []
+        seen_ids: set[str] = set()
+        for scenario_index, profile in enumerate(profiles):
+            raw_steps = profile.get(
+                "steps",
+                profile.get("step_count", default_steps),
+            )
+            step_count = int(raw_steps)
+            if step_count < 1:
+                raise ValueError(
+                    f"scenario_profiles[{scenario_index}].steps must be >= 1"
+                )
+
+            max_weight = float(
+                profile.get(
+                    "progressive_weight",
+                    profile.get("max_weight", profile.get("weight", 1.0)),
+                )
+            )
+            if not np.isfinite(max_weight) or max_weight < 0.0:
+                raise ValueError(
+                    f"scenario_profiles[{scenario_index}].weight must be "
+                    "a finite non-negative number in progressive mode"
+                )
+
+            scenario_name = self._scenario_name(profile) or f"scenario_{scenario_index:03d}"
+            scenario_id = _sanitize_variant_identifier(scenario_name)
+            for step_index in range(step_count + 1):
+                weight = (
+                    0.0
+                    if step_count == 0
+                    else max_weight * (float(step_index) / float(step_count))
+                )
+                step_id = _sanitize_variant_identifier(
+                    f"{scenario_id}_w{format_value(weight)}"
+                )
+                if step_id in seen_ids:
+                    step_id = _sanitize_variant_identifier(
+                        f"{scenario_index:03d}_{scenario_id}_step_{step_index:03d}"
+                    )
+                seen_ids.add(step_id)
+                steps.append(
+                    ProgressiveScenarioStep(
+                        profile=dict(profile),
+                        scenario_index=scenario_index,
+                        scenario_name=scenario_name,
+                        id=step_id,
+                        step_index=step_index,
+                        steps=step_count,
+                        weight=weight,
+                        max_weight=max_weight,
+                    )
+                )
+        return tuple(steps)
 
     def _parse_gpu_batching_config(
         self,
@@ -623,6 +789,211 @@ class FogTransform(Transform):
             scenario_name=self._scenario_name(scenario),
         )
 
+    def _resolve_progressive_render_plan(
+        self,
+        rng: np.random.Generator,
+        step: ProgressiveScenarioStep,
+    ) -> RenderPlan:
+        payload = self._scenario_payload(step.profile)
+        base_effective_config = _freeze_distribution_specs(self.config, rng)
+        frozen_payload = _freeze_distribution_specs(payload, rng)
+        target_effective_config = deep_merge(
+            base_effective_config,
+            self._scenario_config_override(frozen_payload),
+        )
+
+        model_name = self._scenario_model_name(
+            frozen_payload,
+            target_effective_config,
+            rng,
+        )
+        base_models_cfg = (
+            base_effective_config.get("models")
+            or base_effective_config.get("fog_models")
+            or {}
+        )
+        target_models_cfg = (
+            target_effective_config.get("models")
+            or target_effective_config.get("fog_models")
+            or {}
+        )
+        base_model_cfg = resolve_model_config(model_name, base_models_cfg)
+        target_model_cfg = resolve_model_config(model_name, target_models_cfg)
+        target_model_cfg = deep_merge(
+            target_model_cfg,
+            self._scenario_model_overrides(frozen_payload),
+        )
+        base_model_cfg = _freeze_distribution_specs(base_model_cfg, rng)
+        target_model_cfg = _freeze_distribution_specs(target_model_cfg, rng)
+
+        step_effective_config = self._progressive_blend_value(
+            base_effective_config,
+            target_effective_config,
+            step.weight,
+        )
+        model_cfg = self._progressive_model_config(
+            base_model_cfg,
+            target_model_cfg,
+            step.weight,
+            rng,
+        )
+        airlight_method = (
+            None
+            if step.weight <= 0.0
+            else self._scenario_airlight_method(frozen_payload)
+        )
+
+        return RenderPlan(
+            model_name=model_name,
+            model_cfg=model_cfg,
+            airlight_method=airlight_method,
+            capture_artifacts=CaptureArtifactPipeline.from_config(
+                step_effective_config
+            ),
+            scenario_name=step.scenario_name,
+        )
+
+    def _progressive_model_config(
+        self,
+        base_cfg: dict[str, Any],
+        target_cfg: dict[str, Any],
+        weight: float,
+        rng: np.random.Generator,
+    ) -> dict[str, Any]:
+        if weight <= 0.0:
+            return copy.deepcopy(base_cfg)
+        if np.isclose(weight, 1.0):
+            return copy.deepcopy(target_cfg)
+
+        cfg = self._progressive_blend_value(base_cfg, target_cfg, weight)
+        base_beta, _base_visibility, _base_contrast = resolve_scattering_coefficient(
+            base_cfg,
+            rng,
+            self.contrast_threshold_default,
+        )
+        target_beta, _target_visibility, _target_contrast = resolve_scattering_coefficient(
+            target_cfg,
+            rng,
+            self.contrast_threshold_default,
+        )
+        beta = max(0.0, float(base_beta + (target_beta - base_beta) * weight))
+        cfg.pop("visibility_m", None)
+        cfg.pop("beta", None)
+        cfg["scattering_coefficient"] = beta
+        return cfg
+
+    def _progressive_blend_value(
+        self,
+        base: Any,
+        target: Any,
+        weight: float,
+        *,
+        key: str | None = None,
+    ) -> Any:
+        if weight <= 0.0:
+            return copy.deepcopy(base)
+        if np.isclose(weight, 1.0):
+            return copy.deepcopy(target)
+
+        if _is_progressive_number(base) and _is_progressive_number(target):
+            return float(base) + (float(target) - float(base)) * weight
+
+        if _is_numeric_sequence(base) and _is_numeric_sequence(target):
+            if len(base) == len(target):
+                return [
+                    self._progressive_blend_value(
+                        base_item,
+                        target_item,
+                        weight,
+                        key=key,
+                    )
+                    for base_item, target_item in zip(base, target)
+                ]
+
+        if isinstance(base, dict) and isinstance(target, dict):
+            merged: dict[str, Any] = {}
+            for child_key in sorted(set(base) | set(target)):
+                if child_key not in target:
+                    merged[child_key] = copy.deepcopy(base[child_key])
+                    continue
+                if child_key not in base:
+                    neutral = self._progressive_neutral_value(
+                        child_key,
+                        target[child_key],
+                    )
+                    merged[child_key] = self._progressive_blend_value(
+                        neutral,
+                        target[child_key],
+                        weight,
+                        key=child_key,
+                    )
+                    continue
+                merged[child_key] = self._progressive_blend_value(
+                    base[child_key],
+                    target[child_key],
+                    weight,
+                    key=child_key,
+                )
+            return merged
+
+        if _is_progressive_number(target):
+            neutral = self._progressive_neutral_number(key, float(target))
+            return neutral + (float(target) - neutral) * weight
+
+        if _is_numeric_sequence(target):
+            return [
+                self._progressive_blend_value(
+                    self._progressive_neutral_number(key, float(item)),
+                    item,
+                    weight,
+                    key=key,
+                )
+                for item in target
+            ]
+
+        return copy.deepcopy(target)
+
+    def _progressive_neutral_value(self, key: str | None, target: Any) -> Any:
+        if _is_progressive_number(target):
+            return self._progressive_neutral_number(key, float(target))
+        if _is_numeric_sequence(target):
+            return [
+                self._progressive_neutral_number(key, float(item))
+                for item in target
+            ]
+        if isinstance(target, dict):
+            return {
+                child_key: self._progressive_neutral_value(child_key, child)
+                for child_key, child in target.items()
+            }
+        return None
+
+    def _progressive_neutral_number(
+        self,
+        key: str | None,
+        target: float,
+    ) -> float:
+        del target
+        if key in {
+            "gain",
+            "exposure_gain",
+            "red_chroma_gain",
+            "blue_chroma_gain",
+            "min_factor",
+            "max_factor",
+            "top_factor",
+            "bottom_factor",
+            "gamma",
+            "max_gain",
+            "manual_gain_weight",
+        }:
+            return 1.0
+        if key == "quality":
+            return 100.0
+        if key == "iso":
+            return 100.0
+        return 0.0
+
     def _resolve_gpu_batch_render_plan(self, batch_index: int) -> RenderPlan | None:
         if self.gpu_scenario_scope != "batch":
             return None
@@ -660,12 +1031,26 @@ class FogTransform(Transform):
             return separator
         return ":"
 
+    def _variant_layout_config(self) -> tuple[str | None, str] | None:
+        if self.augmentation_specs:
+            return (
+                self.augmentation_config.file_id_hierarchy_name,
+                self.augmentation_config.attribute_key,
+            )
+        if self.progressive_scenario_steps:
+            return (
+                _PROGRESSIVE_FILE_ID_HIERARCHY_NAME,
+                _PROGRESSIVE_ATTRIBUTE_KEY,
+            )
+        return None
+
     def _configure_output_layout_metadata(self) -> None:
         """Declare fog outputs as variants grouped by source sample id."""
-        if not self.augmentation_specs:
+        layout_config = self._variant_layout_config()
+        if layout_config is None:
             return
 
-        sample_axis_name = self.augmentation_config.file_id_hierarchy_name
+        sample_axis_name, attribute_key = layout_config
         if not sample_axis_name:
             return
 
@@ -682,46 +1067,52 @@ class FogTransform(Transform):
                 family=self._layout_family(),
                 sample_axis_name=sample_axis_name,
                 sample_axis_location="hierarchy",
-                variant_axis_name=self.augmentation_config.attribute_key,
+                variant_axis_name=attribute_key,
                 variant_axis_location="file_id",
                 derived_from={
                     "source_modality": getattr(backend, "source_modality", "rgb"),
-                    "source_id_attribute": (
-                        f"{self.augmentation_config.attribute_key}.source_id"
-                    ),
-                    "source_full_id_attribute": (
-                        f"{self.augmentation_config.attribute_key}.source_full_id"
-                    ),
+                    "source_id_attribute": f"{attribute_key}.source_id",
+                    "source_full_id_attribute": f"{attribute_key}.source_full_id",
                 },
             )
             add_head_addon = getattr(backend, "add_head_addon", None)
             if callable(add_head_addon):
                 add_head_addon(EULER_LAYOUT_ADDON, layout)
 
-    def _file_id_hierarchy_key(self, sample_id: str, backend: Any) -> str:
-        name = self.augmentation_config.file_id_hierarchy_name
+    def _file_id_hierarchy_key(
+        self,
+        sample_id: str,
+        backend: Any,
+        hierarchy_name: str | None,
+    ) -> str:
+        name = hierarchy_name
         separator = self._augmentation_hierarchy_separator(backend)
         if name and separator:
             return f"{name}{separator}{sample_id}"
         return sample_id
 
-    def _augmentation_full_id(
+    def _variant_full_id(
         self,
         sample: dict,
-        augmentation_id: str,
+        variant_id: str,
         backend: Any,
+        hierarchy_name: str | None,
     ) -> str:
         sample_id = str(sample.get("id", "?"))
         full_id = str(sample.get("full_id") or f"/{sample_id}")
         parts = [part for part in full_id.split("/") if part]
         parent_parts = parts[:-1] if parts else []
-        file_id_key = self._file_id_hierarchy_key(sample_id, backend)
-        return "/" + "/".join(parent_parts + [file_id_key, augmentation_id])
+        file_id_key = self._file_id_hierarchy_key(
+            sample_id,
+            backend,
+            hierarchy_name,
+        )
+        return "/" + "/".join(parent_parts + [file_id_key, variant_id])
 
-    def _augmentation_attributes(
+    def _output_variant_attributes(
         self,
         sample: dict,
-        augmentation: FogAugmentationSpec,
+        variant: OutputVariantSpec,
         *,
         model_name: str,
         beta: float,
@@ -729,7 +1120,7 @@ class FogTransform(Transform):
     ) -> dict[str, Any]:
         source_id = str(sample.get("id", "?"))
         payload = {
-            "id": augmentation.id,
+            "id": variant.id,
             "source_id": source_id,
             "source_full_id": str(sample.get("full_id") or f"/{source_id}"),
             "model": model_name,
@@ -737,9 +1128,38 @@ class FogTransform(Transform):
             "atmospheric_light": [
                 float(v) for v in np.asarray(airlight, dtype=np.float32).reshape(-1)[:3]
             ],
-            **augmentation.attributes,
+            **variant.attributes,
         }
-        return {self.augmentation_config.attribute_key: payload}
+        return {variant.attribute_key: payload}
+
+    def _augmentation_output_variant(
+        self,
+        augmentation: FogAugmentationSpec,
+    ) -> OutputVariantSpec:
+        return OutputVariantSpec(
+            id=augmentation.id,
+            attribute_key=self.augmentation_config.attribute_key,
+            file_id_hierarchy_name=self.augmentation_config.file_id_hierarchy_name,
+            attributes=dict(augmentation.attributes),
+        )
+
+    def _progressive_output_variant(
+        self,
+        step: ProgressiveScenarioStep,
+    ) -> OutputVariantSpec:
+        return OutputVariantSpec(
+            id=step.id,
+            attribute_key=_PROGRESSIVE_ATTRIBUTE_KEY,
+            file_id_hierarchy_name=_PROGRESSIVE_FILE_ID_HIERARCHY_NAME,
+            attributes={
+                "scenario": step.scenario_name,
+                "scenario_index": step.scenario_index,
+                "step": step.step_index,
+                "steps": step.steps,
+                "weight": float(step.weight),
+                "max_weight": float(step.max_weight),
+            },
+        )
 
     def _write_primary_output(
         self,
@@ -751,22 +1171,23 @@ class FogTransform(Transform):
         beta: float,
         airlight: np.ndarray,
         full_id: str | None,
-        augmentation: FogAugmentationSpec | None = None,
+        variant: OutputVariantSpec | None = None,
     ) -> Path:
         if self.output_backend.is_source_backed:
-            if augmentation is None:
+            if variant is None:
                 return self.output_backend.write(sample, foggy)
-            output_full_id = self._augmentation_full_id(
+            output_full_id = self._variant_full_id(
                 sample,
-                augmentation.id,
+                variant.id,
                 self.output_backend,
+                variant.file_id_hierarchy_name,
             )
             output_basename = (
-                f"{augmentation.id}{self._source_extension(sample, self.output_backend)}"
+                f"{variant.id}{self._source_extension(sample, self.output_backend)}"
             )
-            attributes = self._augmentation_attributes(
+            attributes = self._output_variant_attributes(
                 sample,
-                augmentation,
+                variant,
                 model_name=model_name,
                 beta=beta,
                 airlight=airlight,
@@ -785,13 +1206,92 @@ class FogTransform(Transform):
             beta,
             airlight,
             full_id=full_id,
-            augmentation_id=augmentation.id if augmentation else None,
+            variant_id=variant.id if variant else None,
         )
         return self.output_backend.write(
             sample,
             foggy,
             default_path=output_path,
         )
+
+    def _generate_fog_cpu_progressive(self, samples: Iterable[dict]) -> list[Path]:
+        try:
+            total = len(samples)  # type: ignore[arg-type]
+        except TypeError:
+            samples = list(samples)
+            total = len(samples)
+        saved_paths: list[Path] = []
+
+        with progress_bar(total, "CPU", self.logger) as bar:
+            for index, sample in enumerate(samples):
+                rgb = normalize_rgb(sample["rgb"])
+
+                depth = normalize_depth(
+                    sample["depth"], rgb.shape[:2], self.resize_depth_flag
+                )
+                depth = depth * self.depth_scale
+                depth = np.maximum(depth, 0.0)
+
+                intrinsics = extract_intrinsics(sample)
+                if intrinsics is not None:
+                    depth = planar_to_radial_depth(depth, intrinsics)
+
+                sky_mask = normalize_sky_mask(sample["semantic_segmentation"])
+
+                for step in self.progressive_scenario_steps:
+                    rng = self._rng_for_progressive(
+                        index,
+                        step.scenario_index,
+                        step.step_index,
+                    )
+                    plan = self._resolve_progressive_render_plan(rng, step)
+                    variant = self._progressive_output_variant(step)
+                    result = self.pipeline.process_np(
+                        rgb=rgb,
+                        depth_m=depth,
+                        sky_mask=sky_mask,
+                        model_name=plan.model_name,
+                        model_cfg=plan.model_cfg,
+                        rng=rng,
+                        sample_id=sample.get("id"),
+                        intrinsics=intrinsics,
+                        airlight_method=plan.airlight_method,
+                        capture_artifacts=plan.capture_artifacts,
+                    )
+                    saved_paths.append(
+                        self._write_primary_output(
+                            sample,
+                            result.rgb,
+                            sample_id=sample["id"],
+                            model_name=plan.model_name,
+                            beta=result.beta,
+                            airlight=result.airlight,
+                            full_id=sample.get("full_id"),
+                            variant=variant,
+                        )
+                    )
+                    if not self.output_backend.is_source_backed:
+                        self._write_model_config(
+                            plan.model_name,
+                            plan.model_cfg,
+                            saved_paths,
+                        )
+                    self._write_auxiliary(
+                        sample,
+                        k_map=result.k_map,
+                        ls_map=result.ls_map,
+                        sample_id=sample["id"],
+                        model_name=plan.model_name,
+                        full_id=sample.get("full_id"),
+                        beta=result.beta,
+                        airlight=result.airlight,
+                        variant=variant,
+                    )
+
+                if bar is not None:
+                    bar.update(1)
+        self._finalize_backends()
+        return saved_paths
 
     def _generate_fog_cpu(self, samples: Iterable[dict]) -> list[Path]:
         try:
@@ -821,6 +1321,7 @@ class FogTransform(Transform):
                     for aug_index, augmentation in enumerate(self.augmentation_specs):
                         rng = self._rng_for(index, aug_index)
                         plan = self._resolve_render_plan(rng, augmentation)
+                        variant = self._augmentation_output_variant(augmentation)
                         result = self.pipeline.process_np(
                             rgb=rgb,
                             depth_m=depth,
@@ -842,7 +1343,7 @@ class FogTransform(Transform):
                                 beta=result.beta,
                                 airlight=result.airlight,
                                 full_id=sample.get("full_id"),
-                                augmentation=augmentation,
+                                variant=variant,
                             )
                         )
                         if not self.output_backend.is_source_backed:
@@ -860,7 +1361,7 @@ class FogTransform(Transform):
                             full_id=sample.get("full_id"),
                             beta=result.beta,
                             airlight=result.airlight,
-                            augmentation=augmentation,
+                            variant=variant,
                         )
                 else:
                     rng = self._rng_for(index)
@@ -1089,6 +1590,8 @@ class FogTransform(Transform):
     def _generate_fog_gpu(self, samples: Iterable[dict]) -> list[Path]:
         if torch is None or self.torch_device is None:
             raise RuntimeError("Torch device not configured for GPU execution.")
+        if self.mode == "progressive":
+            return self._generate_fog_gpu_progressive(samples)
         if self.augmentation_specs:
             return self._generate_fog_gpu_augmented(samples)
         device = self.torch_device
@@ -1378,6 +1881,123 @@ class FogTransform(Transform):
         self._finalize_backends()
         return saved_paths
 
+    def _generate_fog_gpu_progressive(self, samples: Iterable[dict]) -> list[Path]:
+        if torch is None or self.torch_device is None:
+            raise RuntimeError("Torch device not configured for GPU execution.")
+        device = self.torch_device
+        try:
+            total = len(samples)  # type: ignore[arg-type]
+        except TypeError:
+            samples = list(samples)
+            total = len(samples)
+        saved_paths: list[Path] = []
+
+        with progress_bar(total, "GPU", self.logger) as bar:
+            for index, sample in enumerate(samples):
+                rgb_np = _to_numpy(sample["rgb"])
+                if _is_chw(rgb_np):
+                    rgb_np = np.transpose(rgb_np, (1, 2, 0))
+                depth_np = normalize_depth(
+                    sample["depth"], rgb_np.shape[:2], self.resize_depth_flag
+                )
+                rgb_t = normalize_rgb_torch(rgb_np, device)
+                depth_t = torch.from_numpy(depth_np).to(
+                    device=device,
+                    dtype=torch.float32,
+                )
+                depth_t = torch.clamp(depth_t * self.depth_scale, min=0.0)
+                intrinsics = extract_intrinsics(sample)
+                if intrinsics is not None:
+                    K_t = torch.from_numpy(intrinsics).to(
+                        device=device,
+                        dtype=torch.float32,
+                    )
+                    depth_t = planar_to_radial_depth_torch(depth_t, K_t)
+
+                sky_mask_np = normalize_sky_mask(sample["semantic_segmentation"])
+                sky_mask_t = torch.from_numpy(sky_mask_np).to(
+                    device=device,
+                    dtype=torch.bool,
+                )
+
+                for variant_index, step in enumerate(self.progressive_scenario_steps):
+                    rng = self._rng_for_progressive(
+                        index,
+                        step.scenario_index,
+                        step.step_index,
+                    )
+                    plan = self._resolve_progressive_render_plan(rng, step)
+                    variant = self._progressive_output_variant(step)
+                    estimated_airlight = self._estimate_airlight_torch(
+                        rgb_t,
+                        sky_mask_t,
+                        sample_id=sample.get("id"),
+                        method=plan.airlight_method,
+                    )
+                    torch_gen = torch_generator_for_index(
+                        self.torch_device,
+                        self.seed,
+                        self.base_rng,
+                        index * 1_000_000 + variant_index,
+                    )
+                    foggy_t, beta, airlight_t, k_map_t, ls_map_t = (
+                        self._apply_model_torch(
+                            rgb_t,
+                            depth_t,
+                            plan.model_name,
+                            plan.model_cfg,
+                            rng,
+                            estimated_airlight,
+                            torch_gen,
+                            sample_id=sample.get("id"),
+                            intrinsics=intrinsics,
+                            depth_m=depth_t,
+                            capture_artifacts=plan.capture_artifacts,
+                        )
+                    )
+                    foggy_img = torch.clamp(foggy_t, 0.0, 1.0).cpu().numpy()
+                    airlight_np = airlight_t.detach().cpu().numpy()
+                    saved_paths.append(
+                        self._write_primary_output(
+                            sample,
+                            foggy_img,
+                            sample_id=sample["id"],
+                            model_name=plan.model_name,
+                            beta=beta,
+                            airlight=airlight_np,
+                            full_id=sample.get("full_id"),
+                            variant=variant,
+                        )
+                    )
+                    if not self.output_backend.is_source_backed:
+                        self._write_model_config(
+                            plan.model_name,
+                            plan.model_cfg,
+                            saved_paths,
+                        )
+
+                    if (
+                        SCATTERING_COEFFICIENT_SLOT in self.output_backends
+                        or ATMOSPHERIC_LIGHT_SLOT in self.output_backends
+                    ):
+                        self._write_auxiliary(
+                            sample,
+                            k_map=k_map_t.detach().cpu().numpy(),
+                            ls_map=ls_map_t.detach().cpu().numpy(),
+                            sample_id=sample["id"],
+                            model_name=plan.model_name,
+                            full_id=sample.get("full_id"),
+                            beta=beta,
+                            airlight=airlight_np,
+                            variant=variant,
+                        )
+
+                if bar is not None:
+                    bar.update(1)
+
+        self._finalize_backends()
+        return saved_paths
+
     def _generate_fog_gpu_augmented(self, samples: Iterable[dict]) -> list[Path]:
         if torch is None or self.torch_device is None:
             raise RuntimeError("Torch device not configured for GPU execution.")
@@ -1420,6 +2040,7 @@ class FogTransform(Transform):
                 for aug_index, augmentation in enumerate(self.augmentation_specs):
                     rng = self._rng_for(index, aug_index)
                     plan = self._resolve_render_plan(rng, augmentation)
+                    variant = self._augmentation_output_variant(augmentation)
                     estimated_airlight = self._estimate_airlight_torch(
                         rgb_t,
                         sky_mask_t,
@@ -1458,7 +2079,7 @@ class FogTransform(Transform):
                             beta=beta,
                             airlight=airlight_np,
                             full_id=sample.get("full_id"),
-                            augmentation=augmentation,
+                            variant=variant,
                         )
                     )
                     if not self.output_backend.is_source_backed:
@@ -1481,7 +2102,7 @@ class FogTransform(Transform):
                             full_id=sample.get("full_id"),
                             beta=beta,
                             airlight=airlight_np,
-                            augmentation=augmentation,
+                            variant=variant,
                         )
 
                 if bar is not None:
@@ -1497,10 +2118,10 @@ class FogTransform(Transform):
         beta: float,
         airlight: np.ndarray,
         full_id: str | None = None,
-        augmentation_id: str | None = None,
+        variant_id: str | None = None,
     ) -> Path:
-        if augmentation_id is not None:
-            filename = f"{augmentation_id}.png"
+        if variant_id is not None:
+            filename = f"{variant_id}.png"
         elif self.suffix:
             filename = f"{sample_id}_{self.suffix}.png"
         else:
@@ -1516,7 +2137,7 @@ class FogTransform(Transform):
             parts = [p for p in full_id.split("/") if p]
             if len(parts) > 1:
                 base = base.joinpath(*parts[:-1])
-        if augmentation_id is not None:
+        if variant_id is not None:
             base = base / sample_id
         return base / filename
 
@@ -1545,7 +2166,7 @@ class FogTransform(Transform):
         full_id: str | None,
         beta: float | None = None,
         airlight: np.ndarray | None = None,
-        augmentation: FogAugmentationSpec | None = None,
+        variant: OutputVariantSpec | None = None,
     ) -> None:
         """Write the per-pixel β / L_s maps to their slots, if active."""
         scattering_backend = self.output_backends.get(SCATTERING_COEFFICIENT_SLOT)
@@ -1559,7 +2180,7 @@ class FogTransform(Transform):
                 full_id=full_id,
                 beta=beta,
                 airlight=airlight,
-                augmentation=augmentation,
+                variant=variant,
             )
         airlight_backend = self.output_backends.get(ATMOSPHERIC_LIGHT_SLOT)
         if airlight_backend is not None:
@@ -1572,7 +2193,7 @@ class FogTransform(Transform):
                 full_id=full_id,
                 beta=beta,
                 airlight=airlight,
-                augmentation=augmentation,
+                variant=variant,
             )
 
     def _write_aux_to_backend(
@@ -1586,22 +2207,23 @@ class FogTransform(Transform):
         full_id: str | None,
         beta: float | None = None,
         airlight: np.ndarray | None = None,
-        augmentation: FogAugmentationSpec | None = None,
+        variant: OutputVariantSpec | None = None,
     ) -> None:
         if backend.is_source_backed:
-            if augmentation is None:
+            if variant is None:
                 backend.write(sample, value)
                 return
-            output_full_id = self._augmentation_full_id(
+            output_full_id = self._variant_full_id(
                 sample,
-                augmentation.id,
+                variant.id,
                 backend,
+                variant.file_id_hierarchy_name,
             )
-            output_basename = f"{augmentation.id}{backend.output_extension or '.npy'}"
+            output_basename = f"{variant.id}{backend.output_extension or '.npy'}"
             attributes = (
-                self._augmentation_attributes(
+                self._output_variant_attributes(
                     sample,
-                    augmentation,
+                    variant,
                     model_name=model_name,
                     beta=float(beta) if beta is not None else float(np.mean(value)),
                     airlight=(
@@ -1625,9 +2247,9 @@ class FogTransform(Transform):
             parts = [p for p in full_id.split("/") if p]
             if len(parts) > 1:
                 base = base.joinpath(*parts[:-1])
-        if augmentation is not None:
+        if variant is not None:
             base = base / sample_id
-            target = base / f"{augmentation.id}.npy"
+            target = base / f"{variant.id}.npy"
             backend.write(sample, value, default_path=target)
             return
         target = base / f"{sample_id}.npy"
