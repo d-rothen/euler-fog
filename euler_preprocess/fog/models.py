@@ -100,8 +100,12 @@ DEFAULT_MODEL_CONFIGS = {
 
 
 def visibility_to_k(visibility_m: float, contrast_threshold: float) -> float:
-    if visibility_m <= 0:
+    if not math.isfinite(visibility_m) or visibility_m <= 0:
         raise ValueError(f"Visibility must be > 0, got {visibility_m}")
+    if not math.isfinite(contrast_threshold) or not 0.0 < contrast_threshold < 1.0:
+        raise ValueError(
+            f"Contrast threshold must be in (0, 1), got {contrast_threshold}"
+        )
     return -math.log(contrast_threshold) / visibility_m
 
 
@@ -132,7 +136,7 @@ def resolve_scattering_coefficient(
     beta_spec = model_cfg.get("scattering_coefficient", model_cfg.get("beta"))
     if beta_spec is not None:
         beta = float(sample_value(beta_spec, rng))
-        if beta < 0:
+        if not math.isfinite(beta) or beta < 0:
             raise ValueError(f"Scattering coefficient must be >= 0, got {beta}")
         return beta, None, contrast_threshold
 
@@ -222,13 +226,13 @@ def resolve_airlight_dampening_config(
         rng,
         "airlight_dampening.strength",
     )
-    if not 0.0 <= min_factor <= 1.0:
+    if min_factor < 0.0:
         raise ValueError(
-            f"airlight_dampening.min_factor must be in [0, 1], got {min_factor}"
+            f"airlight_dampening.min_factor must be >= 0, got {min_factor}"
         )
-    if not 0.0 <= max_factor <= 1.0:
+    if max_factor < 0.0:
         raise ValueError(
-            f"airlight_dampening.max_factor must be in [0, 1], got {max_factor}"
+            f"airlight_dampening.max_factor must be >= 0, got {max_factor}"
         )
     if min_factor > max_factor:
         raise ValueError("airlight_dampening.min_factor must be <= max_factor")
@@ -504,9 +508,12 @@ def _scale_pixels(value, rng: np.random.Generator, name: str) -> int:
 def _sample_float(value, rng: np.random.Generator, name: str) -> float:
     sampled = sample_value(value, rng)
     try:
-        return float(sampled)
+        resolved = float(sampled)
     except (TypeError, ValueError) as exc:
         raise ValueError(f"{name} must resolve to a number, got {sampled!r}") from exc
+    if not math.isfinite(resolved):
+        raise ValueError(f"{name} must be finite, got {resolved}")
+    return resolved
 
 
 def _unique_positive_scales(scales: list[int]) -> list[int]:
@@ -801,9 +808,11 @@ def _gradient_enabled(
         rng,
         f"{name}.probability",
     )
-    if not 0.0 <= probability <= 1.0:
-        raise ValueError(f"{name}.probability must be in [0, 1], got {probability}")
-    return probability >= 1.0 or bool(rng.random() < probability)
+    if probability <= 0.0:
+        return False
+    if probability >= 1.0:
+        return True
+    return bool(rng.random() < probability)
 
 
 def _ls_gradient_factors_np(
@@ -885,10 +894,7 @@ def _weight_ls_gradient_by_opacity_np(
         rng,
         "ls_gradient.fog_opacity_weight",
     )
-    if not 0.0 <= weight <= 1.0:
-        raise ValueError(
-            f"ls_gradient.fog_opacity_weight must be in [0, 1], got {weight}"
-        )
+    weight = float(np.clip(weight, 0.0, 1.0))
     if weight <= 0.0:
         return factors
     gamma = _sample_float(
@@ -917,10 +923,7 @@ def _weight_ls_gradient_by_opacity_torch(
         rng,
         "ls_gradient.fog_opacity_weight",
     )
-    if not 0.0 <= weight <= 1.0:
-        raise ValueError(
-            f"ls_gradient.fog_opacity_weight must be in [0, 1], got {weight}"
-        )
+    weight = float(np.clip(weight, 0.0, 1.0))
     if weight <= 0.0:
         return factors
     gamma = _sample_float(

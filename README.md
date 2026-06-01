@@ -394,10 +394,14 @@ weights locally.
 
 Set top-level `"mode": "progressive"` to emit every configured scenario for
 every input image instead of sampling one scenario. Each scenario accepts
-`"steps"` and `"weight"`; the transform writes steps from weight `0` through
-the scenario's configured weight, and weight `1` matches the original scenario.
-Fog density is progressed in scattering-coefficient space, while numeric
-camera/config values blend from the base config toward the scenario config.
+`"steps"` and `"progressive_weight"` (or `"max_weight"` / `"weight"` as
+aliases); the transform writes steps from weight `0` through the scenario's
+configured weight, and weight `1` matches the original scenario. Fog density is
+progressed in scattering-coefficient space, while numeric camera/config values
+blend from the base config toward the scenario config. Progressive blends clamp
+probability-like values and non-negative physical factors back into valid
+mathematical domains so extrapolated weights above `1` do not create invalid
+render parameters.
 Source-backed outputs are written as `fog_progression` variants under each
 source file id.
 
@@ -479,6 +483,10 @@ Each fog model can override the dampening curve:
 
 The factor is:
 `min_factor + (max_factor - min_factor) / (1 + strength * beta / reference_beta)`.
+`min_factor` and `max_factor` must be finite and non-negative. Values above
+`1.0` are allowed when you intentionally want to brighten estimated airlight;
+the final RGB output is still clamped to the valid image range. `strength`
+must remain finite and non-negative.
 `reference_beta` is either `reference_scattering_coefficient` /
 `reference_beta`, or it is derived from `reference_visibility_m` using the
 model's contrast threshold. The default applies only when `atmospheric_light`
