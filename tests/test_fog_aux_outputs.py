@@ -462,6 +462,70 @@ def test_progressive_scenario_profiles_write_steps_and_attributes(
     }
 
 
+def test_progressive_scenario_profiles_accept_extrapolated_airlight_dampening(
+    tmp_path: Path,
+) -> None:
+    dataset = _make_dataset(tmp_path)
+    pipeline_root = tmp_path / "pipeline_root_progressive_airlight"
+    manifest_path = pipeline_root / ".euler_pipeline" / "pipeline_outputs.json"
+    config = _build_pipeline_config(
+        pipeline_root,
+        manifest_path,
+        include_scattering=False,
+        include_airlight=True,
+    )
+    fog_config_path = tmp_path / "fog_progressive_airlight.json"
+    fog_config_path.write_text(
+        json.dumps(
+            {
+                "mode": "progressive",
+                "airlight": "from_sky",
+                "device": "cpu",
+                "seed": 7,
+                "contrast_threshold": 0.05,
+                "scenario_profiles": [
+                    {
+                        "name": "bright-airlight",
+                        "steps": 1,
+                        "progressive_weight": 1.5,
+                        "model": "uniform",
+                        "models": {
+                            "uniform": {
+                                "visibility_m": 20.0,
+                                "atmospheric_light": "from_sky",
+                                "airlight_dampening": {
+                                    "min_factor": 0.8,
+                                    "max_factor": 1.1,
+                                    "strength": 0.0,
+                                },
+                            }
+                        },
+                    }
+                ],
+            }
+        )
+    )
+
+    backends = prepare_output_backends(config, dataset, FogTransform)
+    transform = FogTransform(
+        config_path=str(fog_config_path),
+        out_path=str(backends["rgb"].root),
+        output_backends=backends,
+    )
+
+    saved_paths = transform.run(dataset)
+
+    assert saved_paths[-1] == (
+        pipeline_root
+        / "foggy_rgb"
+        / "Scene01"
+        / "Camera_0"
+        / "00001"
+        / "bright-airlight_w1.5.png"
+    )
+    assert saved_paths[-1].exists()
+
+
 def test_only_scattering_target_writes_only_scattering(tmp_path: Path) -> None:
     dataset = _make_dataset(tmp_path)
     pipeline_root = tmp_path / "pipeline_root_scat_only"
@@ -2422,6 +2486,76 @@ def test_airlight_dampening_alias_can_disable_default() -> None:
     )
 
     np.testing.assert_allclose(airlight, estimated, atol=1e-6)
+
+
+def test_airlight_dampening_accepts_brightening_factors() -> None:
+    from euler_preprocess.fog.models import apply_model
+
+    rgb = np.full((4, 5, 3), 0.35, dtype=np.float32)
+    depth = np.full((4, 5), 30.0, dtype=np.float32)
+    estimated = np.array([0.35, 0.4, 0.45], dtype=np.float32)
+    cfg = {
+        "scattering_coefficient": 0.1,
+        "atmospheric_light": "from_sky",
+        "airlight_dampening": {
+            "min_factor": 1.1,
+            "max_factor": 1.25,
+            "strength": 0.0,
+        },
+    }
+
+    _, _, airlight, _, _ = apply_model(
+        rgb,
+        depth,
+        "uniform",
+        cfg,
+        np.random.default_rng(0),
+        contrast_threshold_default=0.05,
+        estimated_airlight=estimated,
+    )
+
+    np.testing.assert_allclose(airlight, estimated * 1.25, atol=1e-6)
+
+
+def test_ls_gradient_probability_and_opacity_weight_saturate() -> None:
+    from euler_preprocess.fog.models import apply_model
+
+    rng = np.random.default_rng(123)
+    rgb = np.zeros((20, 16, 3), dtype=np.float32)
+    depth = np.full((20, 16), 80.0, dtype=np.float32)
+    estimated = np.array([0.6, 0.65, 0.7], dtype=np.float32)
+    cfg = {
+        "scattering_coefficient": 0.08,
+        "atmospheric_light": "from_sky",
+        "airlight_dampening": {"enabled": False},
+        "ls_hetero": {
+            "scales": [4],
+            "min_factor": 1.0,
+            "max_factor": 1.0,
+            "normalize_to_mean": False,
+            "ls_gradient": {
+                "enabled": True,
+                "probability": 1.4,
+                "top_factor": 1.18,
+                "bottom_factor": 0.82,
+                "gamma": 1.0,
+                "normalize_to_mean": False,
+                "fog_opacity_weight": 1.5,
+            },
+        },
+    }
+
+    _, _, _, _, ls_map = apply_model(
+        rgb,
+        depth,
+        "heterogeneous_ls",
+        cfg,
+        rng,
+        contrast_threshold_default=0.05,
+        estimated_airlight=estimated,
+    )
+
+    assert np.isfinite(ls_map).all()
 
 
 def test_heterogeneous_ls_uses_dampened_airlight_base() -> None:

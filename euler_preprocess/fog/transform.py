@@ -129,6 +129,53 @@ _GPU_BATCH_SCOPE_VALUES = {"sample", "batch"}
 _CONFIG_MODE_VALUES = {"sample", "sampled", "random", "default", "legacy"}
 _PROGRESSIVE_ATTRIBUTE_KEY = "fog_progression"
 _PROGRESSIVE_FILE_ID_HIERARCHY_NAME = "file_id"
+_PROGRESSIVE_EPSILON = 1e-6
+_PROGRESSIVE_UNIT_INTERVAL_KEYS = {
+    "probability",
+    "fog_opacity_weight",
+    "highlight_protection",
+    "center_weight",
+    "black_noise_floor",
+}
+_PROGRESSIVE_NON_NEGATIVE_KEYS = {
+    "beta",
+    "scattering_coefficient",
+    "strength",
+    "min_factor",
+    "max_factor",
+    "top_factor",
+    "bottom_factor",
+    "contrast",
+    "noise_contrast",
+    "smooth_sigma",
+    "smoothing_sigma",
+    "blur_sigma",
+    "smooth_sigma_fraction",
+    "smoothing_sigma_fraction",
+    "blur_sigma_fraction",
+    "read_noise_electrons",
+    "read_noise_sigma",
+    "fixed_pattern_sigma",
+    "row_noise_sigma",
+    "column_noise_sigma",
+    "hot_pixel_probability",
+    "dead_pixel_probability",
+}
+_PROGRESSIVE_POSITIVE_KEYS = {
+    "visibility_m",
+    "reference_visibility_m",
+    "reference_beta",
+    "reference_scattering_coefficient",
+    "gamma",
+    "fog_opacity_gamma",
+    "correlation_length_fraction",
+    "min_scale_fraction",
+    "max_scale_fraction",
+    "iso",
+    "base_iso",
+    "resize_scale",
+}
+_PROGRESSIVE_MIN_MAX_PAIRS = (("min_factor", "max_factor"),)
 
 
 @dataclass(frozen=True)
@@ -826,16 +873,20 @@ class FogTransform(Transform):
         base_model_cfg = _freeze_distribution_specs(base_model_cfg, rng)
         target_model_cfg = _freeze_distribution_specs(target_model_cfg, rng)
 
-        step_effective_config = self._progressive_blend_value(
-            base_effective_config,
-            target_effective_config,
-            step.weight,
+        step_effective_config = self._sanitize_progressive_blended_config(
+            self._progressive_blend_value(
+                base_effective_config,
+                target_effective_config,
+                step.weight,
+            )
         )
-        model_cfg = self._progressive_model_config(
-            base_model_cfg,
-            target_model_cfg,
-            step.weight,
-            rng,
+        model_cfg = self._sanitize_progressive_blended_config(
+            self._progressive_model_config(
+                base_model_cfg,
+                target_model_cfg,
+                step.weight,
+                rng,
+            )
         )
         airlight_method = (
             None
@@ -952,6 +1003,57 @@ class FogTransform(Transform):
             ]
 
         return copy.deepcopy(target)
+
+    def _sanitize_progressive_blended_config(
+        self,
+        value: Any,
+        *,
+        key: str | None = None,
+    ) -> Any:
+        if isinstance(value, dict):
+            sanitized = {
+                child_key: self._sanitize_progressive_blended_config(
+                    child,
+                    key=child_key,
+                )
+                for child_key, child in value.items()
+            }
+            for min_key, max_key in _PROGRESSIVE_MIN_MAX_PAIRS:
+                min_value = sanitized.get(min_key)
+                max_value = sanitized.get(max_key)
+                if (
+                    _is_progressive_number(min_value)
+                    and _is_progressive_number(max_value)
+                    and float(max_value) < float(min_value)
+                ):
+                    sanitized[max_key] = float(min_value)
+            return sanitized
+
+        if isinstance(value, list):
+            return [
+                self._sanitize_progressive_blended_config(item, key=key)
+                for item in value
+            ]
+        if isinstance(value, tuple):
+            return tuple(
+                self._sanitize_progressive_blended_config(item, key=key)
+                for item in value
+            )
+
+        if not _is_progressive_number(value):
+            return copy.deepcopy(value)
+
+        numeric = float(value)
+        if not np.isfinite(numeric):
+            label = key or "value"
+            raise ValueError(f"progressive blended {label} must be finite")
+        if key in _PROGRESSIVE_UNIT_INTERVAL_KEYS:
+            return float(np.clip(numeric, 0.0, 1.0))
+        if key in _PROGRESSIVE_POSITIVE_KEYS:
+            return max(numeric, _PROGRESSIVE_EPSILON)
+        if key in _PROGRESSIVE_NON_NEGATIVE_KEYS:
+            return max(numeric, 0.0)
+        return copy.deepcopy(value)
 
     def _progressive_neutral_value(self, key: str | None, target: Any) -> Any:
         if _is_progressive_number(target):
