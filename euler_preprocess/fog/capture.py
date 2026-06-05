@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import hashlib
 import io
 import math
 from dataclasses import dataclass, field
@@ -9,6 +10,12 @@ from typing import Any, Mapping
 import numpy as np
 from PIL import Image
 
+from euler_preprocess.common.color import (
+    linear_to_srgb,
+    linear_to_srgb_torch,
+    srgb_to_linear,
+    srgb_to_linear_torch,
+)
 from euler_preprocess.common.noise import perlin_fbm, perlin_fbm_torch
 from euler_preprocess.common.sampling import deep_merge, sample_value
 
@@ -160,6 +167,16 @@ class OpticsStage(ConfiguredCaptureStage):
             "sigma": {"dist": "uniform", "min": 2.0, "max": 6.0},
         },
         "veiling_glare_strength": {"dist": "uniform", "min": 0.0, "max": 0.04},
+        "fog_coupled_glare": {
+            "enabled": False,
+            "base_strength": 0.0,
+            "fog_strength": 0.0,
+            "highlight_strength": 0.0,
+            "airlight_strength": 0.0,
+            "highlight_threshold": 0.72,
+            "smooth_sigma": 12.0,
+            "color": [0.92, 0.95, 1.0],
+        },
         "windshield_haze": {
             "enabled": True,
             "probability": 0.35,
@@ -231,6 +248,10 @@ class OpticsStage(ConfiguredCaptureStage):
         if glare > 1e-5:
             veil = _low_frequency_field(img.shape[0], img.shape[1], rng)
             img = img * (1.0 - glare) + glare * veil[..., None]
+
+        fog_glare_cfg = _config_block(config, "fog_coupled_glare")
+        if _block_enabled(fog_glare_cfg, rng):
+            img = _apply_fog_coupled_glare_np(img, fog_glare_cfg, context, rng)
 
         vignette = _sample_float(config, "vignetting_strength", 0.0, rng)
         if vignette > 1e-5:
@@ -314,6 +335,10 @@ class OpticsStage(ConfiguredCaptureStage):
             )
             img = img * (1.0 - float(glare)) + float(glare) * veil[..., None]
 
+        fog_glare_cfg = _config_block(config, "fog_coupled_glare")
+        if _block_enabled(fog_glare_cfg, rng):
+            img = _apply_fog_coupled_glare_torch(img, fog_glare_cfg, context, rng)
+
         vignette = _sample_float(config, "vignetting_strength", 0.0, rng)
         if vignette > 1e-5:
             radius = _sample_float(config, "vignetting_radius", 1.15, rng)
@@ -360,9 +385,7 @@ class ExposureStage(ConfiguredCaptureStage):
         config: Mapping[str, Any],
     ) -> np.ndarray:
         gain_key = (
-            "exposure_gain"
-            if config.get("exposure_gain") is not None
-            else "gain"
+            "exposure_gain" if config.get("exposure_gain") is not None else "gain"
         )
         gain = _sample_float(config, gain_key, 1.0, rng)
         wb = _sample_triplet(config.get("white_balance", [1.0, 1.0, 1.0]), rng)
@@ -382,9 +405,7 @@ class ExposureStage(ConfiguredCaptureStage):
         config: Mapping[str, Any],
     ):
         gain_key = (
-            "exposure_gain"
-            if config.get("exposure_gain") is not None
-            else "gain"
+            "exposure_gain" if config.get("exposure_gain") is not None else "gain"
         )
         gain = _sample_float(config, gain_key, 1.0, rng)
         wb = _sample_triplet(config.get("white_balance", [1.0, 1.0, 1.0]), rng)
@@ -497,8 +518,23 @@ class SensorStage(ConfiguredCaptureStage):
         "post_demosaic_bit_depth": 12,
         "hot_pixel_probability": 0.00002,
         "dead_pixel_probability": 0.00001,
+        "sensor_identity": {
+            "enabled": False,
+            "sensor_id": "default",
+            "seed": 0,
+            "prnu_sigma": 0.0,
+            "dsnu_sigma": 0.0,
+            "persistent_hot_pixel_probability": 0.0,
+            "persistent_dead_pixel_probability": 0.0,
+            "persistent_row_sigma": 0.0,
+            "persistent_column_sigma": 0.0,
+        },
         "demosaic": True,
     }
+
+    def __init__(self, config: Mapping[str, Any] | None = None) -> None:
+        super().__init__(config)
+        self._sensor_identity_cache: dict[tuple[Any, ...], dict[str, Any]] = {}
 
     def _apply_np(
         self,
@@ -542,6 +578,9 @@ class SensorStage(ConfiguredCaptureStage):
 
         pattern = str(_sample_any(config.get("bayer_pattern", "RGGB"), rng)).upper()
         raw_signal = _clip01(_bayer_mosaic_np(img, pattern))
+        identity_maps = self._sensor_identity_maps_np(raw_signal.shape, pattern, config)
+        if identity_maps is not None:
+            raw_signal = _clip01(raw_signal * identity_maps["prnu"])
 
         black_levels = _sample_sensor_levels(config, "black_level", rng)
         black_levels += rng.normal(
@@ -598,13 +637,22 @@ class SensorStage(ConfiguredCaptureStage):
                 0.0,
             )
         if np.any(np.asarray(read_sigma) > 0.0):
-            noisy_signal = noisy_signal + rng.normal(
-                0.0,
-                1.0,
-                raw_signal.shape,
-            ).astype(np.float32) * read_sigma * noise_modulation
+            noisy_signal = (
+                noisy_signal
+                + rng.normal(
+                    0.0,
+                    1.0,
+                    raw_signal.shape,
+                ).astype(np.float32)
+                * read_sigma
+                * noise_modulation
+            )
 
         raw = black_map + noisy_signal * raw_range
+        if identity_maps is not None:
+            raw = raw + identity_maps["dsnu"]
+            raw = raw + identity_maps["row_bias"][:, None]
+            raw = raw + identity_maps["column_bias"][None, :]
 
         fixed_sigma = _sample_float(config, "fixed_pattern_sigma", 0.0, rng)
         if fixed_sigma > 0.0:
@@ -644,6 +692,13 @@ class SensorStage(ConfiguredCaptureStage):
             )
             raw = raw + column_bias[None, :] * banding_gain
 
+        if identity_maps is not None:
+            raw = _apply_persistent_bad_pixels_np(
+                raw,
+                identity_maps,
+                hot_value=white_map,
+                dead_value=black_map,
+            )
         raw = _apply_bad_pixels_np(
             raw,
             config,
@@ -740,6 +795,15 @@ class SensorStage(ConfiguredCaptureStage):
 
         pattern = str(_sample_any(config.get("bayer_pattern", "RGGB"), rng)).upper()
         raw_signal = _clip01_torch(_bayer_mosaic_torch(img, pattern))
+        identity_maps = self._sensor_identity_maps_torch(
+            tuple(raw_signal.shape),
+            pattern,
+            config,
+            raw_signal.device,
+            raw_signal.dtype,
+        )
+        if identity_maps is not None:
+            raw_signal = _clip01_torch(raw_signal * identity_maps["prnu"])
 
         black_levels = _sample_sensor_levels(config, "black_level", rng)
         black_levels += rng.normal(
@@ -820,6 +884,10 @@ class SensorStage(ConfiguredCaptureStage):
             )
 
         raw = black_map + noisy_signal * raw_range
+        if identity_maps is not None:
+            raw = raw + identity_maps["dsnu"]
+            raw = raw + identity_maps["row_bias"][:, None]
+            raw = raw + identity_maps["column_bias"][None, :]
 
         fixed_sigma = _sample_float(config, "fixed_pattern_sigma", 0.0, rng)
         if fixed_sigma > 0.0:
@@ -869,6 +937,13 @@ class SensorStage(ConfiguredCaptureStage):
             )
             raw = raw + column_bias[None, :] * banding_gain
 
+        if identity_maps is not None:
+            raw = _apply_persistent_bad_pixels_torch(
+                raw,
+                identity_maps,
+                hot_value=white_map,
+                dead_value=black_map,
+            )
         raw = _apply_bad_pixels_torch(
             raw,
             config,
@@ -921,6 +996,47 @@ class SensorStage(ConfiguredCaptureStage):
             rng,
         )
 
+    def _sensor_identity_maps_np(
+        self,
+        shape: tuple[int, int],
+        pattern: str,
+        config: Mapping[str, Any],
+    ) -> dict[str, Any] | None:
+        cfg = _config_block(config, "sensor_identity")
+        if not _bool_value(cfg.get("enabled", False)):
+            return None
+        key, resolved_cfg = _sensor_identity_cache_key(cfg, shape, pattern)
+        if key not in self._sensor_identity_cache:
+            self._sensor_identity_cache[key] = _build_sensor_identity_maps_np(
+                shape,
+                resolved_cfg,
+            )
+        return self._sensor_identity_cache[key]
+
+    def _sensor_identity_maps_torch(
+        self,
+        shape: tuple[int, int],
+        pattern: str,
+        config: Mapping[str, Any],
+        device,
+        dtype,
+    ) -> dict[str, Any] | None:
+        maps = self._sensor_identity_maps_np(shape, pattern, config)
+        if maps is None:
+            return None
+        return {
+            "prnu": torch.as_tensor(maps["prnu"], device=device, dtype=dtype),
+            "dsnu": torch.as_tensor(maps["dsnu"], device=device, dtype=dtype),
+            "row_bias": torch.as_tensor(maps["row_bias"], device=device, dtype=dtype),
+            "column_bias": torch.as_tensor(
+                maps["column_bias"],
+                device=device,
+                dtype=dtype,
+            ),
+            "hot_mask": torch.as_tensor(maps["hot_mask"], device=device),
+            "dead_mask": torch.as_tensor(maps["dead_mask"], device=device),
+        }
+
 
 class ISPStage(ConfiguredCaptureStage):
     """Demosaiced camera-space RGB to display RGB with ISP artifacts."""
@@ -931,6 +1047,8 @@ class ISPStage(ConfiguredCaptureStage):
         "color_matrix": [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
         "tone_map": "reinhard",
         "tone_map_strength": {"dist": "uniform", "min": 0.05, "max": 0.25},
+        "tone_map_lut": None,
+        "tone_map_lut_domain": "linear",
         "gamma": "srgb",
         "local_contrast_strength": {"dist": "uniform", "min": 0.0, "max": 0.12},
         "local_contrast_sigma": {"dist": "uniform", "min": 8.0, "max": 18.0},
@@ -958,7 +1076,7 @@ class ISPStage(ConfiguredCaptureStage):
         tone_map = str(config.get("tone_map", "reinhard")).lower()
         strength = _sample_float(config, "tone_map_strength", 1.0, rng)
         if tone_map not in {"none", "false", "off"}:
-            img = _apply_tone_map_np(img, tone_map, strength)
+            img = _apply_tone_map_np(img, tone_map, strength, config)
 
         gamma = config.get("gamma", "srgb")
         img = _apply_gamma_np(img, gamma, rng)
@@ -1007,7 +1125,7 @@ class ISPStage(ConfiguredCaptureStage):
         tone_map = str(config.get("tone_map", "reinhard")).lower()
         strength = _sample_float(config, "tone_map_strength", 1.0, rng)
         if tone_map not in {"none", "false", "off"}:
-            img = _apply_tone_map_torch(img, tone_map, strength)
+            img = _apply_tone_map_torch(img, tone_map, strength, config)
 
         gamma = config.get("gamma", "srgb")
         img = _apply_gamma_torch(img, gamma, rng)
@@ -1265,15 +1383,73 @@ _BUILTIN_CAMERA_PROFILES: dict[str, dict[str, Any]] = {
         "optics": {
             "bloom": {"strength": {"dist": "uniform", "min": 0.08, "max": 0.22}},
             "veiling_glare_strength": {"dist": "uniform", "min": 0.02, "max": 0.08},
+            "fog_coupled_glare": {
+                "enabled": True,
+                "fog_strength": {"dist": "uniform", "min": 0.015, "max": 0.055},
+                "highlight_strength": {"dist": "uniform", "min": 0.02, "max": 0.08},
+                "airlight_strength": {"dist": "uniform", "min": 0.0, "max": 0.035},
+                "smooth_sigma": {"dist": "uniform", "min": 10.0, "max": 22.0},
+            },
         },
         "sensor": {
             "iso": {"dist": "choice", "values": [800.0, 1600.0, 3200.0]},
+            "auto_exposure": {
+                "enabled": True,
+                "metering": "fog_aware_center_weighted",
+                "target_luminance": {"dist": "uniform", "min": 0.13, "max": 0.21},
+                "highlight_protection": 0.78,
+                "manual_gain_weight": 0.0,
+                "sky_suppression": 0.85,
+                "fog_meter_suppression": 0.65,
+                "depth_meter_decay_m": 35.0,
+                "min_meter_weight": 0.05,
+                "resolve_iso": True,
+                "fog_iso_boost": 0.25,
+            },
             "read_noise_electrons": {"dist": "uniform", "min": 3.0, "max": 10.0},
             "row_noise_sigma": {"dist": "uniform", "min": 0.002, "max": 0.009},
+            "sensor_identity": {
+                "enabled": True,
+                "sensor_id": "low_light_fog",
+                "seed": 2207,
+                "prnu_sigma": {"dist": "uniform", "min": 0.001, "max": 0.004},
+                "dsnu_sigma": {"dist": "uniform", "min": 0.00003, "max": 0.00018},
+                "persistent_hot_pixel_probability": 0.00001,
+                "persistent_dead_pixel_probability": 0.000005,
+                "persistent_row_sigma": 0.00025,
+                "persistent_column_sigma": 0.00016,
+            },
         },
         "isp": {
             "denoise_sigma": {"dist": "uniform", "min": 0.25, "max": 0.8},
             "sharpen_amount": {"dist": "uniform", "min": 0.08, "max": 0.28},
+            "tone_map": "lut",
+            "tone_map_strength": 1.0,
+            "tone_map_lut": [
+                0.0,
+                0.006,
+                0.014,
+                0.028,
+                0.052,
+                0.090,
+                0.145,
+                0.220,
+                0.320,
+                0.450,
+                0.610,
+                0.780,
+                0.900,
+                0.965,
+                0.995,
+                1.0,
+            ],
+        },
+        "transport": {
+            "jpeg": {
+                "enabled": True,
+                "quality": {"dist": "uniform", "min": 58.0, "max": 86.0},
+            },
+            "bit_depth": 8,
         },
     },
 }
@@ -1358,8 +1534,7 @@ def _resolve_camera_profile(
     capture_config: Mapping[str, Any],
 ) -> dict[str, Any]:
     profiles = {
-        name: dict(profile)
-        for name, profile in _BUILTIN_CAMERA_PROFILES.items()
+        name: dict(profile) for name, profile in _BUILTIN_CAMERA_PROFILES.items()
     }
     configured_profiles = config.get("camera_profiles", {})
     if configured_profiles is not None:
@@ -1563,7 +1738,9 @@ def _context_float_map(value: Any, shape: tuple[int, int]) -> np.ndarray | None:
     return arr.astype(np.float32, copy=False)
 
 
-def _context_depth_map(context: CaptureContext, shape: tuple[int, int]) -> np.ndarray | None:
+def _context_depth_map(
+    context: CaptureContext, shape: tuple[int, int]
+) -> np.ndarray | None:
     return _context_float_map(context.depth_m, shape)
 
 
@@ -1578,7 +1755,9 @@ def _context_fog_opacity(
     k_map = _context_float_map(context.k_map, shape)
     if depth is None or k_map is None:
         return None
-    return np.clip(1.0 - np.exp(-np.maximum(depth, 0.0) * np.maximum(k_map, 0.0)), 0.0, 1.0).astype(
+    return np.clip(
+        1.0 - np.exp(-np.maximum(depth, 0.0) * np.maximum(k_map, 0.0)), 0.0, 1.0
+    ).astype(
         np.float32,
         copy=False,
     )
@@ -1637,6 +1816,26 @@ def _context_fog_opacity_torch(
         0.0,
         1.0,
     )
+
+
+def _context_attribute_map(
+    context: CaptureContext,
+    key: str,
+    shape: tuple[int, int],
+) -> np.ndarray | None:
+    attrs = context.attributes or {}
+    return _context_float_map(attrs.get(key), shape)
+
+
+def _context_attribute_map_torch(
+    context: CaptureContext,
+    key: str,
+    shape: tuple[int, int],
+    device,
+    dtype,
+):
+    attrs = context.attributes or {}
+    return _context_float_map_torch(attrs.get(key), shape, device, dtype)
 
 
 def _as_float_rgb(image) -> np.ndarray:
@@ -1763,9 +1962,7 @@ def _resolve_auto_exposure_np(
     if protection > 0.0 and auto_gain > highlight_gain > 0.0:
         log_auto = math.log(max(auto_gain, 1e-6))
         log_highlight = math.log(max(highlight_gain, 1e-6))
-        auto_gain = math.exp(
-            (1.0 - protection) * log_auto + protection * log_highlight
-        )
+        auto_gain = math.exp((1.0 - protection) * log_auto + protection * log_highlight)
 
     compensation_ev = _sample_float(cfg, "exposure_compensation_ev", 0.0, rng)
     auto_gain *= 2.0**compensation_ev
@@ -1834,9 +2031,7 @@ def _resolve_auto_exposure_torch(
     if protection > 0.0 and auto_gain > highlight_gain > 0.0:
         log_auto = math.log(max(auto_gain, 1e-6))
         log_highlight = math.log(max(highlight_gain, 1e-6))
-        auto_gain = math.exp(
-            (1.0 - protection) * log_auto + protection * log_highlight
-        )
+        auto_gain = math.exp((1.0 - protection) * log_auto + protection * log_highlight)
 
     compensation_ev = _sample_float(cfg, "exposure_compensation_ev", 0.0, rng)
     auto_gain *= 2.0**compensation_ev
@@ -1923,19 +2118,76 @@ def _auto_exposure_metrics_np(
     center_weight = float(
         np.clip(_sample_float(config, "center_weight", 0.55, rng), 0.0, 1.0)
     )
-    if metering in {"mean", "average"}:
-        meter_luma = mean_luma
-    elif metering in {"percentile", "median"}:
-        meter_luma = percentile_luma
-    elif metering in {"center_percentile", "centered_percentile"}:
-        meter_luma = (
-            (1.0 - center_weight) * percentile_luma
-            + center_weight * center_luma
+    use_weighted = _auto_exposure_uses_weighted_metering(config)
+    if use_weighted:
+        center_weighted = metering in {
+            "fog_aware_center_weighted",
+            "fog-aware-center-weighted",
+            "sky_aware_center_weighted",
+            "sky-aware-center-weighted",
+            "center_weighted",
+            "center-weighted",
+        }
+        weights = _auto_exposure_weights_np(
+            luminance,
+            context,
+            config,
+            rng,
+            center_weighted=center_weighted,
         )
-    elif metering in {"highlight", "highlight_protect", "highlight_protected"}:
-        meter_luma = max(center_luma, percentile_luma)
     else:
-        meter_luma = (1.0 - center_weight) * mean_luma + center_weight * center_luma
+        weights = None
+
+    if weights is not None:
+        weighted_mean = _weighted_mean_np(luminance, weights)
+        weighted_percentile = _weighted_percentile_np(
+            luminance,
+            weights,
+            meter_percentile,
+        )
+        weighted_highlight = _weighted_percentile_np(
+            luminance,
+            weights,
+            highlight_percentile,
+        )
+        weighted_low = _weighted_percentile_np(luminance, weights, 5.0)
+        weighted_high = _weighted_percentile_np(luminance, weights, 95.0)
+        weighted_dark = _weighted_mean_np(
+            (luminance < dark_threshold).astype(np.float32), weights
+        )
+        percentile_luma = weighted_percentile
+        highlight_luma = weighted_highlight
+        low_luma = weighted_low
+        high_luma = weighted_high
+        dark_fraction = weighted_dark
+
+        if metering in {"mean", "average"}:
+            meter_luma = weighted_mean
+        elif metering in {"percentile", "median"}:
+            meter_luma = weighted_percentile
+        elif metering in {"center_percentile", "centered_percentile"}:
+            meter_luma = (
+                1.0 - center_weight
+            ) * weighted_percentile + center_weight * weighted_mean
+        elif metering in {"highlight", "highlight_protect", "highlight_protected"}:
+            meter_luma = max(weighted_mean, weighted_percentile)
+        elif metering in _FOG_AWARE_METERING_MODES:
+            meter_luma = weighted_percentile
+        else:
+            meter_luma = weighted_mean
+    else:
+        if metering in {"mean", "average"}:
+            meter_luma = mean_luma
+        elif metering in {"percentile", "median"}:
+            meter_luma = percentile_luma
+        elif metering in {"center_percentile", "centered_percentile"}:
+            meter_luma = (
+                1.0 - center_weight
+            ) * percentile_luma + center_weight * center_luma
+        elif metering in {"highlight", "highlight_protect", "highlight_protected"}:
+            meter_luma = max(center_luma, percentile_luma)
+        else:
+            meter_luma = (1.0 - center_weight) * mean_luma + center_weight * center_luma
 
     return {
         "meter_luminance": max(float(meter_luma), 1e-6),
@@ -1974,7 +2226,9 @@ def _auto_exposure_metrics_torch(
     meter_percentile = float(
         np.clip(_sample_float(config, "meter_percentile", 50.0, rng), 0.0, 100.0)
     )
-    percentile_luma = float(torch.quantile(luma, meter_percentile / 100.0).detach().cpu())
+    percentile_luma = float(
+        torch.quantile(luma, meter_percentile / 100.0).detach().cpu()
+    )
     highlight_percentile = float(
         np.clip(_sample_float(config, "highlight_percentile", 98.5, rng), 0.0, 100.0)
     )
@@ -1987,7 +2241,9 @@ def _auto_exposure_metrics_torch(
         _sample_float(config, "dark_fraction_threshold", 0.12, rng),
         0.0,
     )
-    dark_fraction = float(torch.mean((luma < dark_threshold).to(luma.dtype)).detach().cpu())
+    dark_fraction = float(
+        torch.mean((luma < dark_threshold).to(luma.dtype)).detach().cpu()
+    )
     opacity = _context_fog_opacity_torch(
         context,
         tuple(luminance.shape),
@@ -2002,19 +2258,77 @@ def _auto_exposure_metrics_torch(
     center_weight = float(
         np.clip(_sample_float(config, "center_weight", 0.55, rng), 0.0, 1.0)
     )
-    if metering in {"mean", "average"}:
-        meter_luma = mean_luma
-    elif metering in {"percentile", "median"}:
-        meter_luma = percentile_luma
-    elif metering in {"center_percentile", "centered_percentile"}:
-        meter_luma = (
-            (1.0 - center_weight) * percentile_luma
-            + center_weight * center_luma
+    use_weighted = _auto_exposure_uses_weighted_metering(config)
+    if use_weighted:
+        center_weighted = metering in {
+            "fog_aware_center_weighted",
+            "fog-aware-center-weighted",
+            "sky_aware_center_weighted",
+            "sky-aware-center-weighted",
+            "center_weighted",
+            "center-weighted",
+        }
+        weights = _auto_exposure_weights_torch(
+            luminance,
+            context,
+            config,
+            rng,
+            center_weighted=center_weighted,
         )
-    elif metering in {"highlight", "highlight_protect", "highlight_protected"}:
-        meter_luma = max(center_luma, percentile_luma)
     else:
-        meter_luma = (1.0 - center_weight) * mean_luma + center_weight * center_luma
+        weights = None
+
+    if weights is not None:
+        weighted_mean = _weighted_mean_torch(luminance, weights)
+        weighted_percentile = _weighted_percentile_torch(
+            luminance,
+            weights,
+            meter_percentile,
+        )
+        weighted_highlight = _weighted_percentile_torch(
+            luminance,
+            weights,
+            highlight_percentile,
+        )
+        weighted_low = _weighted_percentile_torch(luminance, weights, 5.0)
+        weighted_high = _weighted_percentile_torch(luminance, weights, 95.0)
+        weighted_dark = _weighted_mean_torch(
+            (luminance < dark_threshold).to(luminance.dtype),
+            weights,
+        )
+        percentile_luma = weighted_percentile
+        highlight_luma = weighted_highlight
+        low_luma = weighted_low
+        high_luma = weighted_high
+        dark_fraction = weighted_dark
+
+        if metering in {"mean", "average"}:
+            meter_luma = weighted_mean
+        elif metering in {"percentile", "median"}:
+            meter_luma = weighted_percentile
+        elif metering in {"center_percentile", "centered_percentile"}:
+            meter_luma = (
+                1.0 - center_weight
+            ) * weighted_percentile + center_weight * weighted_mean
+        elif metering in {"highlight", "highlight_protect", "highlight_protected"}:
+            meter_luma = max(weighted_mean, weighted_percentile)
+        elif metering in _FOG_AWARE_METERING_MODES:
+            meter_luma = weighted_percentile
+        else:
+            meter_luma = weighted_mean
+    else:
+        if metering in {"mean", "average"}:
+            meter_luma = mean_luma
+        elif metering in {"percentile", "median"}:
+            meter_luma = percentile_luma
+        elif metering in {"center_percentile", "centered_percentile"}:
+            meter_luma = (
+                1.0 - center_weight
+            ) * percentile_luma + center_weight * center_luma
+        elif metering in {"highlight", "highlight_protect", "highlight_protected"}:
+            meter_luma = max(center_luma, percentile_luma)
+        else:
+            meter_luma = (1.0 - center_weight) * mean_luma + center_weight * center_luma
 
     return {
         "meter_luminance": max(float(meter_luma), 1e-6),
@@ -2081,13 +2395,312 @@ def _center_weighted_mean_torch(
     finite = torch.isfinite(luminance)
     if not bool(torch.any(finite).detach().cpu()):
         return 0.18
-    weighted = torch.where(
-        finite,
-        torch.clamp(luminance, min=0.0),
-        torch.zeros_like(luminance),
-    ) * weights
+    weighted = (
+        torch.where(
+            finite,
+            torch.clamp(luminance, min=0.0),
+            torch.zeros_like(luminance),
+        )
+        * weights
+    )
     denom = torch.clamp(torch.sum(weights[finite]), min=1e-6)
     return float((torch.sum(weighted) / denom).detach().cpu())
+
+
+_FOG_AWARE_METERING_MODES = {
+    "fog_aware",
+    "fog-aware",
+    "fog_aware_center_weighted",
+    "fog-aware-center-weighted",
+    "sky_aware_center_weighted",
+    "sky-aware-center-weighted",
+}
+
+_AUTO_EXPOSURE_WEIGHT_KEYS = {
+    "sky_suppression",
+    "fog_meter_suppression",
+    "depth_meter_decay_m",
+    "min_meter_weight",
+}
+
+
+def _auto_exposure_uses_weighted_metering(config: Mapping[str, Any]) -> bool:
+    metering = str(config.get("metering", "center_weighted")).strip().lower()
+    return metering in _FOG_AWARE_METERING_MODES or any(
+        key in config for key in _AUTO_EXPOSURE_WEIGHT_KEYS
+    )
+
+
+def _auto_exposure_center_weight_map_np(
+    shape: tuple[int, int],
+    config: Mapping[str, Any],
+    rng: np.random.Generator,
+) -> np.ndarray:
+    height, width = shape
+    sigma = max(_sample_float(config, "center_sigma", 0.35, rng), 1e-3)
+    yy, xx = _coordinate_grid(height, width)
+    x = (xx - (width - 1) / 2.0) / max(width - 1, 1)
+    y = (yy - (height - 1) / 2.0) / max(height - 1, 1)
+    return np.exp(-0.5 * (x * x + y * y) / (sigma * sigma)).astype(np.float32)
+
+
+def _auto_exposure_center_weight_map_torch(
+    shape: tuple[int, int],
+    config: Mapping[str, Any],
+    rng: np.random.Generator,
+    device,
+    dtype,
+):
+    height, width = shape
+    sigma = max(_sample_float(config, "center_sigma", 0.35, rng), 1e-3)
+    yy, xx = _coordinate_grid_torch(height, width, device, dtype)
+    x = (xx - (width - 1) / 2.0) / max(width - 1, 1)
+    y = (yy - (height - 1) / 2.0) / max(height - 1, 1)
+    return torch.exp(-0.5 * (x * x + y * y) / (sigma * sigma))
+
+
+def _auto_exposure_weights_np(
+    luminance: np.ndarray,
+    context: CaptureContext,
+    config: Mapping[str, Any],
+    rng: np.random.Generator,
+    *,
+    center_weighted: bool,
+) -> np.ndarray | None:
+    shape = luminance.shape
+    metering = str(config.get("metering", "center_weighted")).strip().lower()
+    weights = (
+        _auto_exposure_center_weight_map_np(shape, config, rng)
+        if center_weighted
+        else np.ones(shape, dtype=np.float32)
+    )
+
+    default_depth_decay = (
+        35.0 if "fog_aware" in metering or "fog-aware" in metering else None
+    )
+    depth_decay_raw = config.get("depth_meter_decay_m", default_depth_decay)
+    if depth_decay_raw is not None:
+        depth_decay = max(float(sample_value(depth_decay_raw, rng)), 1e-6)
+        min_weight = float(
+            np.clip(
+                _sample_float(config, "min_meter_weight", 0.05, rng),
+                0.0,
+                1.0,
+            )
+        )
+        depth = _context_depth_map(context, shape)
+        if depth is not None:
+            depth_factor = np.exp(-np.maximum(depth, 0.0) / depth_decay)
+            weights *= np.maximum(min_weight, depth_factor).astype(np.float32)
+
+    default_fog_suppression = (
+        0.60 if "fog_aware" in metering or "fog-aware" in metering else 0.0
+    )
+    fog_suppression = float(
+        np.clip(
+            _sample_float(
+                config, "fog_meter_suppression", default_fog_suppression, rng
+            ),
+            0.0,
+            1.0,
+        )
+    )
+    if fog_suppression > 0.0:
+        opacity = _context_fog_opacity(context, shape)
+        if opacity is not None:
+            weights *= 1.0 - fog_suppression * np.clip(opacity, 0.0, 1.0)
+
+    default_sky_suppression = (
+        0.85
+        if "sky_aware" in metering
+        or "sky-aware" in metering
+        or "fog_aware" in metering
+        or "fog-aware" in metering
+        else 0.0
+    )
+    sky_suppression = float(
+        np.clip(
+            _sample_float(config, "sky_suppression", default_sky_suppression, rng),
+            0.0,
+            1.0,
+        )
+    )
+    if sky_suppression > 0.0:
+        sky = _context_attribute_map(context, "sky_mask", shape)
+        if sky is not None:
+            weights *= 1.0 - sky_suppression * np.clip(sky, 0.0, 1.0)
+
+    finite = np.isfinite(luminance)
+    weights = np.where(finite, np.clip(weights, 0.0, None), 0.0).astype(
+        np.float32,
+        copy=False,
+    )
+    if float(weights.sum()) <= 1e-8:
+        return None
+    return weights
+
+
+def _auto_exposure_weights_torch(
+    luminance,
+    context: CaptureContext,
+    config: Mapping[str, Any],
+    rng: np.random.Generator,
+    *,
+    center_weighted: bool,
+):
+    shape = tuple(luminance.shape)
+    metering = str(config.get("metering", "center_weighted")).strip().lower()
+    weights = (
+        _auto_exposure_center_weight_map_torch(
+            shape,
+            config,
+            rng,
+            luminance.device,
+            luminance.dtype,
+        )
+        if center_weighted
+        else torch.ones(shape, device=luminance.device, dtype=luminance.dtype)
+    )
+
+    default_depth_decay = (
+        35.0 if "fog_aware" in metering or "fog-aware" in metering else None
+    )
+    depth_decay_raw = config.get("depth_meter_decay_m", default_depth_decay)
+    if depth_decay_raw is not None:
+        depth_decay = max(float(sample_value(depth_decay_raw, rng)), 1e-6)
+        min_weight = float(
+            np.clip(
+                _sample_float(config, "min_meter_weight", 0.05, rng),
+                0.0,
+                1.0,
+            )
+        )
+        depth = _context_depth_map_torch(
+            context,
+            shape,
+            luminance.device,
+            luminance.dtype,
+        )
+        if depth is not None:
+            depth_factor = torch.exp(-torch.clamp(depth, min=0.0) / depth_decay)
+            weights = weights * torch.maximum(
+                torch.full_like(depth_factor, min_weight),
+                depth_factor,
+            )
+
+    default_fog_suppression = (
+        0.60 if "fog_aware" in metering or "fog-aware" in metering else 0.0
+    )
+    fog_suppression = float(
+        np.clip(
+            _sample_float(
+                config, "fog_meter_suppression", default_fog_suppression, rng
+            ),
+            0.0,
+            1.0,
+        )
+    )
+    if fog_suppression > 0.0:
+        opacity = _context_fog_opacity_torch(
+            context,
+            shape,
+            luminance.device,
+            luminance.dtype,
+        )
+        if opacity is not None:
+            weights = weights * (1.0 - fog_suppression * torch.clamp(opacity, 0.0, 1.0))
+
+    default_sky_suppression = (
+        0.85
+        if "sky_aware" in metering
+        or "sky-aware" in metering
+        or "fog_aware" in metering
+        or "fog-aware" in metering
+        else 0.0
+    )
+    sky_suppression = float(
+        np.clip(
+            _sample_float(config, "sky_suppression", default_sky_suppression, rng),
+            0.0,
+            1.0,
+        )
+    )
+    if sky_suppression > 0.0:
+        sky = _context_attribute_map_torch(
+            context,
+            "sky_mask",
+            shape,
+            luminance.device,
+            luminance.dtype,
+        )
+        if sky is not None:
+            weights = weights * (1.0 - sky_suppression * torch.clamp(sky, 0.0, 1.0))
+
+    finite = torch.isfinite(luminance)
+    weights = torch.where(
+        finite, torch.clamp(weights, min=0.0), torch.zeros_like(weights)
+    )
+    if float(torch.sum(weights).detach().cpu()) <= 1e-8:
+        return None
+    return weights
+
+
+def _weighted_mean_np(values: np.ndarray, weights: np.ndarray) -> float:
+    finite = np.isfinite(values) & np.isfinite(weights) & (weights > 0.0)
+    if not finite.any():
+        return 0.18
+    vals = np.clip(values[finite], 0.0, None)
+    w = weights[finite].astype(np.float64, copy=False)
+    return float(np.sum(vals * w) / max(float(np.sum(w)), 1e-8))
+
+
+def _weighted_percentile_np(
+    values: np.ndarray,
+    weights: np.ndarray,
+    percentile: float,
+) -> float:
+    finite = np.isfinite(values) & np.isfinite(weights) & (weights > 0.0)
+    if not finite.any():
+        return 0.18
+    vals = np.clip(values[finite], 0.0, None).astype(np.float32, copy=False)
+    w = weights[finite].astype(np.float64, copy=False)
+    order = np.argsort(vals)
+    vals = vals[order]
+    w = w[order]
+    cumulative = np.cumsum(w)
+    total = float(cumulative[-1])
+    if total <= 1e-8:
+        return 0.18
+    cutoff = np.clip(percentile, 0.0, 100.0) / 100.0 * total
+    index = int(np.searchsorted(cumulative, cutoff, side="left"))
+    return float(vals[min(index, vals.shape[0] - 1)])
+
+
+def _weighted_mean_torch(values, weights) -> float:
+    finite = torch.isfinite(values) & torch.isfinite(weights) & (weights > 0.0)
+    if not bool(torch.any(finite).detach().cpu()):
+        return 0.18
+    vals = torch.clamp(values[finite], min=0.0)
+    w = weights[finite]
+    return float(
+        (torch.sum(vals * w) / torch.clamp(torch.sum(w), min=1e-8)).detach().cpu()
+    )
+
+
+def _weighted_percentile_torch(values, weights, percentile: float) -> float:
+    finite = torch.isfinite(values) & torch.isfinite(weights) & (weights > 0.0)
+    if not bool(torch.any(finite).detach().cpu()):
+        return 0.18
+    vals = torch.clamp(values[finite], min=0.0)
+    w = weights[finite]
+    sorted_vals, order = torch.sort(vals)
+    sorted_weights = w[order]
+    cumulative = torch.cumsum(sorted_weights, dim=0)
+    total = torch.clamp(cumulative[-1], min=1e-8)
+    cutoff = float(np.clip(percentile, 0.0, 100.0) / 100.0) * total
+    index = int(torch.searchsorted(cumulative, cutoff).detach().cpu())
+    index = min(index, int(sorted_vals.numel()) - 1)
+    return float(sorted_vals[index].detach().cpu())
 
 
 def _resolve_electron_capacity(
@@ -2631,7 +3244,7 @@ def _apply_shadow_recovery_noise_np(
 
     blotch_sigma = max(_sample_float(cfg, "blotch_sigma", 0.0, rng), 0.0) * strength
     if blotch_sigma > 0.0:
-        blotch = (_low_frequency_field(image.shape[0], image.shape[1], rng) - 0.5)
+        blotch = _low_frequency_field(image.shape[0], image.shape[1], rng) - 0.5
         out += blotch[..., None] * (2.0 * blotch_sigma) * weight[..., None]
 
     return _clip01(out)
@@ -2694,13 +3307,16 @@ def _apply_shadow_recovery_noise_torch(
 
     blotch_sigma = max(_sample_float(cfg, "blotch_sigma", 0.0, rng), 0.0) * strength
     if blotch_sigma > 0.0:
-        blotch = _low_frequency_field_torch(
-            int(image.shape[0]),
-            int(image.shape[1]),
-            rng,
-            image.device,
-            image.dtype,
-        ) - 0.5
+        blotch = (
+            _low_frequency_field_torch(
+                int(image.shape[0]),
+                int(image.shape[1]),
+                rng,
+                image.device,
+                image.dtype,
+            )
+            - 0.5
+        )
         out = out + blotch[..., None] * (2.0 * blotch_sigma) * weight[..., None]
 
     return _clip01_torch(out)
@@ -2817,8 +3433,7 @@ def _shadow_chroma_noise_np(
     if luminance_preservation >= 1.0:
         return preserved
     return (
-        (1.0 - luminance_preservation) * raw
-        + luminance_preservation * preserved
+        (1.0 - luminance_preservation) * raw + luminance_preservation * preserved
     ).astype(np.float32, copy=False)
 
 
@@ -3072,39 +3687,19 @@ def _block_enabled(config: Mapping[str, Any], rng: np.random.Generator) -> bool:
 
 
 def _srgb_to_linear(image: np.ndarray) -> np.ndarray:
-    img = _clip01(image)
-    return np.where(
-        img <= 0.04045,
-        img / 12.92,
-        ((img + 0.055) / 1.055) ** 2.4,
-    ).astype(np.float32, copy=False)
+    return srgb_to_linear(image)
 
 
 def _srgb_to_linear_torch(image):
-    img = _clip01_torch(image)
-    return torch.where(
-        img <= 0.04045,
-        img / 12.92,
-        torch.pow((img + 0.055) / 1.055, 2.4),
-    )
+    return srgb_to_linear_torch(image)
 
 
 def _linear_to_srgb(image: np.ndarray) -> np.ndarray:
-    img = _clip01(image)
-    return np.where(
-        img <= 0.0031308,
-        img * 12.92,
-        1.055 * np.power(img, 1.0 / 2.4) - 0.055,
-    ).astype(np.float32, copy=False)
+    return linear_to_srgb(image)
 
 
 def _linear_to_srgb_torch(image):
-    img = _clip01_torch(image)
-    return torch.where(
-        img <= 0.0031308,
-        img * 12.92,
-        1.055 * torch.pow(img, 1.0 / 2.4) - 0.055,
-    )
+    return linear_to_srgb_torch(image)
 
 
 def _apply_color_matrix(image: np.ndarray, matrix: np.ndarray) -> np.ndarray:
@@ -3149,9 +3744,7 @@ def _gaussian_blur_torch(image, sigma: float):
     if sigma <= 1e-4:
         return image
     if image.ndim not in (2, 3):
-        raise ValueError(
-            f"Expected 2-D or HWC image tensor, got {tuple(image.shape)}"
-        )
+        raise ValueError(f"Expected 2-D or HWC image tensor, got {tuple(image.shape)}")
 
     is_2d = image.ndim == 2
     if is_2d:
@@ -3262,10 +3855,13 @@ def _convolve2d_same(image: np.ndarray, kernel: np.ndarray) -> np.ndarray:
     out = np.zeros_like(image, dtype=np.float32)
     for y in range(kernel.shape[0]):
         for x in range(kernel.shape[1]):
-            out += float(kernel[y, x]) * padded[
-                y : y + image.shape[0],
-                x : x + image.shape[1],
-            ]
+            out += (
+                float(kernel[y, x])
+                * padded[
+                    y : y + image.shape[0],
+                    x : x + image.shape[1],
+                ]
+            )
     return out
 
 
@@ -3525,9 +4121,9 @@ def _apply_depth_chromatic_fringing_np(
         0.0,
         1.0,
     )
-    return (
-        image * (1.0 - alpha[..., None]) + shifted * alpha[..., None]
-    ).astype(np.float32, copy=False)
+    return (image * (1.0 - alpha[..., None]) + shifted * alpha[..., None]).astype(
+        np.float32, copy=False
+    )
 
 
 def _apply_depth_chromatic_fringing_torch(
@@ -3650,7 +4246,9 @@ def _depth_fog_dark_weight_map_torch(
     return torch.clamp(weight, 0.0, 1.0)
 
 
-def _motion_blur_np(image: np.ndarray, length_px: float, angle_deg: float) -> np.ndarray:
+def _motion_blur_np(
+    image: np.ndarray, length_px: float, angle_deg: float
+) -> np.ndarray:
     length = max(2, int(round(length_px)))
     yy, xx = _coordinate_grid(image.shape[0], image.shape[1])
     angle = math.radians(float(angle_deg))
@@ -3719,6 +4317,117 @@ def _apply_bloom_torch(image, config: Mapping[str, Any], rng: np.random.Generato
     )
     glow = _gaussian_blur_torch(image * mask, sigma)
     return image + float(strength) * glow
+
+
+def _apply_fog_coupled_glare_np(
+    image: np.ndarray,
+    config: Mapping[str, Any],
+    context: CaptureContext,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    height, width = image.shape[:2]
+    alpha = np.full(
+        (height, width),
+        max(_sample_float(config, "base_strength", 0.0, rng), 0.0),
+        dtype=np.float32,
+    )
+
+    fog_strength = max(_sample_float(config, "fog_strength", 0.0, rng), 0.0)
+    if fog_strength > 0.0:
+        opacity = _context_fog_opacity(context, (height, width))
+        if opacity is not None:
+            alpha += fog_strength * np.clip(opacity, 0.0, 1.0)
+
+    highlight_strength = max(
+        _sample_float(config, "highlight_strength", 0.0, rng),
+        0.0,
+    )
+    if highlight_strength > 0.0:
+        threshold = _sample_float(config, "highlight_threshold", 0.72, rng)
+        luma = _linear_luminance_np(image)
+        highlights = np.clip((luma - threshold) / max(1.0 - threshold, 1e-6), 0.0, 1.0)
+        alpha += highlight_strength * highlights
+
+    airlight_strength = max(
+        _sample_float(config, "airlight_strength", 0.0, rng),
+        0.0,
+    )
+    if airlight_strength > 0.0:
+        airlight = (context.attributes or {}).get("airlight")
+        if airlight is not None:
+            alpha += airlight_strength * float(np.mean(np.clip(airlight, 0.0, 1.0)))
+
+    smooth_sigma = _sample_float(config, "smooth_sigma", 12.0, rng)
+    if smooth_sigma > 1e-4:
+        alpha = _gaussian_blur_np(alpha, smooth_sigma)
+    alpha = np.clip(alpha, 0.0, 0.75).astype(np.float32, copy=False)
+    color = _sample_triplet(config.get("color", [0.92, 0.95, 1.0]), rng)
+    return image * (1.0 - alpha[..., None]) + color.reshape(1, 1, 3) * alpha[..., None]
+
+
+def _apply_fog_coupled_glare_torch(
+    image,
+    config: Mapping[str, Any],
+    context: CaptureContext,
+    rng: np.random.Generator,
+):
+    height, width = int(image.shape[0]), int(image.shape[1])
+    alpha = torch.full(
+        (height, width),
+        max(_sample_float(config, "base_strength", 0.0, rng), 0.0),
+        device=image.device,
+        dtype=image.dtype,
+    )
+
+    fog_strength = max(_sample_float(config, "fog_strength", 0.0, rng), 0.0)
+    if fog_strength > 0.0:
+        opacity = _context_fog_opacity_torch(
+            context,
+            (height, width),
+            image.device,
+            image.dtype,
+        )
+        if opacity is not None:
+            alpha = alpha + fog_strength * torch.clamp(opacity, 0.0, 1.0)
+
+    highlight_strength = max(
+        _sample_float(config, "highlight_strength", 0.0, rng),
+        0.0,
+    )
+    if highlight_strength > 0.0:
+        threshold = _sample_float(config, "highlight_threshold", 0.72, rng)
+        luma = _linear_luminance_torch(image)
+        highlights = torch.clamp(
+            (luma - threshold) / max(1.0 - threshold, 1e-6),
+            0.0,
+            1.0,
+        )
+        alpha = alpha + highlight_strength * highlights
+
+    airlight_strength = max(
+        _sample_float(config, "airlight_strength", 0.0, rng),
+        0.0,
+    )
+    if airlight_strength > 0.0:
+        airlight = (context.attributes or {}).get("airlight")
+        if airlight is not None:
+            airlight_t = torch.as_tensor(
+                airlight, device=image.device, dtype=image.dtype
+            )
+            alpha = alpha + airlight_strength * torch.mean(
+                torch.clamp(airlight_t, 0.0, 1.0)
+            )
+
+    smooth_sigma = _sample_float(config, "smooth_sigma", 12.0, rng)
+    if smooth_sigma > 1e-4:
+        alpha = _gaussian_blur_torch(alpha, smooth_sigma)
+    alpha = torch.clamp(alpha, 0.0, 0.75)
+    color = torch.as_tensor(
+        _sample_triplet(config.get("color", [0.92, 0.95, 1.0]), rng),
+        device=image.device,
+        dtype=image.dtype,
+    )
+    return image * (1.0 - alpha[..., None]) + color.view(1, 1, 3) * alpha[..., None]
 
 
 def _low_frequency_field(
@@ -3975,6 +4684,130 @@ def _mosaic_channel_values_torch(
     return torch.sum(masks * values_t.view(1, 1, 3), dim=-1)
 
 
+def _sensor_identity_cache_key(
+    config: Mapping[str, Any],
+    shape: tuple[int, int],
+    pattern: str,
+) -> tuple[tuple[Any, ...], dict[str, Any]]:
+    sensor_id = str(config.get("sensor_id", "default"))
+    seed_rng = np.random.default_rng(_stable_seed("sensor_identity_seed", sensor_id))
+    base_seed = int(round(float(sample_value(config.get("seed", 0), seed_rng))))
+    height, width = int(shape[0]), int(shape[1])
+    resolved = dict(config)
+    resolved["sensor_id"] = sensor_id
+    resolved["seed"] = base_seed
+    resolved["pattern"] = str(pattern).upper()
+    resolved["shape"] = (height, width)
+    key = (sensor_id, resolved["pattern"], height, width, base_seed)
+    return key, resolved
+
+
+def _build_sensor_identity_maps_np(
+    shape: tuple[int, int],
+    config: Mapping[str, Any],
+) -> dict[str, Any]:
+    height, width = int(shape[0]), int(shape[1])
+    rng = np.random.default_rng(
+        _stable_seed(
+            "sensor_identity",
+            config.get("sensor_id", "default"),
+            config.get("seed", 0),
+            config.get("pattern", ""),
+            height,
+            width,
+        )
+    )
+
+    prnu_sigma = max(_identity_sample_float(config, "prnu_sigma", 0.0, rng), 0.0)
+    if prnu_sigma > 0.0:
+        prnu = rng.normal(1.0, prnu_sigma, size=(height, width)).astype(np.float32)
+        prnu = np.clip(prnu, 0.25, 4.0)
+    else:
+        prnu = np.ones((height, width), dtype=np.float32)
+
+    dsnu_sigma = max(_identity_sample_float(config, "dsnu_sigma", 0.0, rng), 0.0)
+    dsnu = (
+        rng.normal(0.0, dsnu_sigma, size=(height, width)).astype(np.float32)
+        if dsnu_sigma > 0.0
+        else np.zeros((height, width), dtype=np.float32)
+    )
+
+    row_sigma = max(
+        _identity_sample_float(config, "persistent_row_sigma", 0.0, rng),
+        0.0,
+    )
+    row_bias = (
+        rng.normal(0.0, row_sigma, size=height).astype(np.float32)
+        if row_sigma > 0.0
+        else np.zeros(height, dtype=np.float32)
+    )
+
+    column_sigma = max(
+        _identity_sample_float(config, "persistent_column_sigma", 0.0, rng),
+        0.0,
+    )
+    column_bias = (
+        rng.normal(0.0, column_sigma, size=width).astype(np.float32)
+        if column_sigma > 0.0
+        else np.zeros(width, dtype=np.float32)
+    )
+
+    hot_probability = float(
+        np.clip(
+            _identity_sample_float(
+                config,
+                "persistent_hot_pixel_probability",
+                0.0,
+                rng,
+            ),
+            0.0,
+            1.0,
+        )
+    )
+    dead_probability = float(
+        np.clip(
+            _identity_sample_float(
+                config,
+                "persistent_dead_pixel_probability",
+                0.0,
+                rng,
+            ),
+            0.0,
+            1.0,
+        )
+    )
+    hot_mask = rng.random((height, width)) < hot_probability
+    dead_mask = rng.random((height, width)) < dead_probability
+    dead_mask &= ~hot_mask
+
+    return {
+        "prnu": prnu.astype(np.float32, copy=False),
+        "dsnu": dsnu.astype(np.float32, copy=False),
+        "row_bias": row_bias.astype(np.float32, copy=False),
+        "column_bias": column_bias.astype(np.float32, copy=False),
+        "hot_mask": hot_mask,
+        "dead_mask": dead_mask,
+    }
+
+
+def _identity_sample_float(
+    config: Mapping[str, Any],
+    key: str,
+    default: float,
+    rng: np.random.Generator,
+) -> float:
+    value = config.get(key, default)
+    if value is None:
+        return float(default)
+    return float(sample_value(value, rng))
+
+
+def _stable_seed(*parts: Any) -> int:
+    joined = "|".join(str(part) for part in parts)
+    digest = hashlib.sha256(joined.encode("utf-8")).digest()
+    return int.from_bytes(digest[:8], "little", signed=False)
+
+
 def _demosaic_bilinear_np(raw: np.ndarray, pattern: str) -> np.ndarray:
     masks = _bayer_masks(raw.shape[0], raw.shape[1], pattern).astype(np.float32)
     kernel = np.array(
@@ -4035,6 +4868,47 @@ def _demosaic_bilinear_torch(raw, pattern: str):
     return torch.stack(channels, dim=-1)
 
 
+def _apply_persistent_bad_pixels_np(
+    raw: np.ndarray,
+    identity_maps: Mapping[str, Any],
+    *,
+    hot_value: float | np.ndarray = 1.0,
+    dead_value: float | np.ndarray = 0.0,
+) -> np.ndarray:
+    out = raw
+    hot_mask = np.asarray(identity_maps.get("hot_mask", False), dtype=bool)
+    if hot_mask.shape == raw.shape and hot_mask.any():
+        out = out.copy()
+        hot_arr = np.asarray(hot_value, dtype=np.float32)
+        out[hot_mask] = hot_arr[hot_mask] if hot_arr.shape else float(hot_arr)
+    dead_mask = np.asarray(identity_maps.get("dead_mask", False), dtype=bool)
+    if dead_mask.shape == raw.shape and dead_mask.any():
+        if out is raw:
+            out = out.copy()
+        dead_arr = np.asarray(dead_value, dtype=np.float32)
+        out[dead_mask] = dead_arr[dead_mask] if dead_arr.shape else float(dead_arr)
+    return out
+
+
+def _apply_persistent_bad_pixels_torch(
+    raw,
+    identity_maps: Mapping[str, Any],
+    *,
+    hot_value: float | Any = 1.0,
+    dead_value: float | Any = 0.0,
+):
+    out = raw
+    hot_mask = identity_maps.get("hot_mask")
+    if hot_mask is not None and bool(torch.any(hot_mask).detach().cpu()):
+        hot_t = torch.as_tensor(hot_value, device=raw.device, dtype=raw.dtype)
+        out = torch.where(hot_mask, hot_t.expand_as(raw), out)
+    dead_mask = identity_maps.get("dead_mask")
+    if dead_mask is not None and bool(torch.any(dead_mask).detach().cpu()):
+        dead_t = torch.as_tensor(dead_value, device=raw.device, dtype=raw.dtype)
+        out = torch.where(dead_mask, dead_t.expand_as(raw), out)
+    return out
+
+
 def _apply_bad_pixels_np(
     raw: np.ndarray,
     config: Mapping[str, Any],
@@ -4086,7 +4960,12 @@ def _apply_bad_pixels_torch(
     return out
 
 
-def _apply_tone_map_np(image: np.ndarray, mode: str, strength: float) -> np.ndarray:
+def _apply_tone_map_np(
+    image: np.ndarray,
+    mode: str,
+    strength: float,
+    config: Mapping[str, Any] | None = None,
+) -> np.ndarray:
     img = np.clip(image, 0.0, None).astype(np.float32, copy=False)
     strength = max(float(strength), 0.0)
     if mode == "reinhard":
@@ -4101,10 +4980,21 @@ def _apply_tone_map_np(image: np.ndarray, mode: str, strength: float) -> np.ndar
         return img * (1.0 - strength) + mapped * strength
     if mode == "clip":
         return _clip01(img)
+    if mode == "lut":
+        mapped = _apply_tone_map_lut_np(img, config or {})
+        return (img * (1.0 - strength) + mapped * strength).astype(
+            np.float32,
+            copy=False,
+        )
     raise ValueError(f"Unsupported tone_map: {mode}")
 
 
-def _apply_tone_map_torch(image, mode: str, strength: float):
+def _apply_tone_map_torch(
+    image,
+    mode: str,
+    strength: float,
+    config: Mapping[str, Any] | None = None,
+):
     img = torch.clamp(image, min=0.0)
     strength = max(float(strength), 0.0)
     if mode == "reinhard":
@@ -4119,7 +5009,52 @@ def _apply_tone_map_torch(image, mode: str, strength: float):
         return img * (1.0 - strength) + mapped * strength
     if mode == "clip":
         return _clip01_torch(img)
+    if mode == "lut":
+        mapped = _apply_tone_map_lut_torch(img, config or {})
+        return img * (1.0 - strength) + mapped * strength
     raise ValueError(f"Unsupported tone_map: {mode}")
+
+
+def _apply_tone_map_lut_np(
+    image: np.ndarray,
+    config: Mapping[str, Any],
+) -> np.ndarray:
+    domain = str(config.get("tone_map_lut_domain", "linear")).lower()
+    if domain not in {"linear", "scene_linear", "scene-linear"}:
+        raise ValueError("tone_map_lut_domain must be 'linear'")
+    raw_lut = config.get("tone_map_lut")
+    if raw_lut is None:
+        raise ValueError("tone_map_lut must be provided when tone_map='lut'")
+    lut = np.asarray(raw_lut, dtype=np.float32)
+    if lut.ndim != 1 or lut.shape[0] < 2:
+        raise ValueError("tone_map_lut must contain at least two values")
+    x = np.linspace(0.0, 1.0, lut.shape[0], dtype=np.float32)
+    return np.interp(np.clip(image, 0.0, 1.0), x, np.clip(lut, 0.0, 1.0)).astype(
+        np.float32,
+        copy=False,
+    )
+
+
+def _apply_tone_map_lut_torch(image, config: Mapping[str, Any]):
+    domain = str(config.get("tone_map_lut_domain", "linear")).lower()
+    if domain not in {"linear", "scene_linear", "scene-linear"}:
+        raise ValueError("tone_map_lut_domain must be 'linear'")
+    raw_lut = config.get("tone_map_lut")
+    if raw_lut is None:
+        raise ValueError("tone_map_lut must be provided when tone_map='lut'")
+    lut = torch.as_tensor(
+        raw_lut,
+        device=image.device,
+        dtype=image.dtype,
+    )
+    if lut.ndim != 1 or int(lut.shape[0]) < 2:
+        raise ValueError("tone_map_lut must contain at least two values")
+    lut = torch.clamp(lut, 0.0, 1.0)
+    scaled = torch.clamp(image, 0.0, 1.0) * float(int(lut.shape[0]) - 1)
+    lower = torch.floor(scaled).to(dtype=torch.long)
+    upper = torch.clamp(lower + 1, max=int(lut.shape[0]) - 1)
+    alpha = scaled - lower.to(dtype=image.dtype)
+    return lut[lower] * (1.0 - alpha) + lut[upper] * alpha
 
 
 def _apply_gamma_np(

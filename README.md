@@ -134,6 +134,7 @@ Controls the fog simulation.
   "depth_scale": 1.0,
   "resize_depth": true,
   "contrast_threshold": 0.05,
+  "render_input_space": "srgb",
   "mode": "sample",
   "device": "cpu",
   "gpu_batch_size": 4,
@@ -152,6 +153,7 @@ Controls the fog simulation.
 | `depth_scale` | Multiplier applied to depth values after loading. |
 | `resize_depth` | Resize the depth map to match the RGB resolution (bilinear). |
 | `contrast_threshold` | Threshold *C_t* used in the visibility-to-attenuation conversion (default `0.05`). |
+| `render_input_space` | Colour space of the RGB supplied to the fog renderer. Use `"srgb"` for display-encoded dataset images so fog and airlight are mixed in scene-linear RGB; use `"linear"` for legacy configs or already-linear radiance. |
 | `mode` | Optional scenario mode. Omit it or use `"sample"` for current one-scenario-per-image behavior; use `"progressive"` to render every scenario step for every image. |
 | `device` | `"cpu"`, `"cuda"`, `"mps"`, or `"gpu"` (alias for cuda). |
 | `gpu_batch_size` | Batch size when running on GPU. Uniform-model samples are batched; heterogeneous samples are processed individually. |
@@ -296,6 +298,22 @@ the exposure; `resolve_iso` can raise ISO from the metering pressure, dark pixel
 fraction, and fog opacity. When auto exposure is enabled, `exposure_gain` still
 applies as scenario-specific exposure compensation.
 
+Fog-aware metering modes use `CaptureContext.depth_m`, `k_map`, fog opacity, and
+`attributes.sky_mask` when available. Use `"metering":
+"fog_aware_center_weighted"` or `"sky_aware_center_weighted"` and tune
+`sky_suppression`, `fog_meter_suppression`, `depth_meter_decay_m`, and
+`min_meter_weight` to keep bright sky or dense far-field airlight from dominating
+the exposure meter. Legacy metering modes are unchanged unless these suppression
+keys are present.
+
+Set `sensor.sensor_identity.enabled` for persistent sensor structure across
+frames. The identity cache is deterministic for the same `sensor_id`, `seed`,
+image shape, and Bayer pattern. `prnu_sigma` adds multiplicative pixel-response
+non-uniformity before shot noise; `dsnu_sigma`, `persistent_row_sigma`, and
+`persistent_column_sigma` add fixed raw-domain offsets; persistent hot/dead pixel
+probabilities create stable bad-pixel masks that combine with the existing
+per-image bad-pixel probabilities.
+
 Set `sensor.shadow_recovery_noise.enabled` to add extra post-demosaic luma and
 chroma corruption only where the pre-exposure rendered luminance was low. This
 is useful for reducing broad global grain while keeping lifted shadows visibly
@@ -347,6 +365,20 @@ gain, read noise, banding, and dark/fog noise modulation should move together:
 }
 ```
 
+`isp.tone_map` supports `"reinhard"`, `"aces"`, `"clip"`, and `"lut"`. The LUT
+mode uses a cheap interpolated 1D camera-response curve:
+
+```json
+{
+  "type": "isp",
+  "tone_map": "lut",
+  "tone_map_strength": 1.0,
+  "tone_map_lut": [0.0, 0.006, 0.014, 0.028, 0.052, 0.090, 0.145, 0.220, 0.320, 0.450, 0.610, 0.780, 0.900, 0.965, 0.995, 1.0],
+  "tone_map_lut_domain": "linear",
+  "gamma": "srgb"
+}
+```
+
 Top-level `scenario_profiles` sample one latent scene/camera condition before
 rendering. The selected scenario is merged over the root config, so it can drive
 fog density, atmospheric light, camera profile, capture-stage overrides, ISP, and
@@ -376,11 +408,30 @@ compression together:
     "airlight_method": "dcp_heuristic",
     "models": {
       "heterogeneous_k_ls": {
-        "visibility_m": {"dist": "uniform", "min": 18.0, "max": 55.0}
+        "visibility_m": {"dist": "uniform", "min": 18.0, "max": 55.0},
+        "scene_illumination": {
+          "enabled": true,
+          "global_ev": {"dist": "uniform", "min": 0.25, "max": 0.85},
+          "near_ev": {"dist": "uniform", "min": 0.35, "max": 1.20},
+          "near_decay_depth_m": {"dist": "uniform", "min": 10.0, "max": 22.0},
+          "fog_coupled_ev": {"dist": "uniform", "min": 0.10, "max": 0.45},
+          "sky_weight": 0.0
+        }
       }
     },
     "capture_overrides": {
-      "sensor": {"condition_profile": "underexposed_noisy"},
+      "sensor": {
+        "condition_profile": "underexposed_noisy",
+        "auto_exposure": {
+          "enabled": true,
+          "metering": "fog_aware_center_weighted",
+          "target_luminance": {"dist": "uniform", "min": 0.13, "max": 0.20},
+          "highlight_protection": 0.78,
+          "manual_gain_weight": 0.0,
+          "sky_suppression": 0.85,
+          "fog_meter_suppression": 0.65
+        }
+      },
       "transport": {"jpeg": {"quality": {"dist": "uniform", "min": 54, "max": 78}}}
     }
   }
@@ -421,6 +472,14 @@ where:
 - **k** is derived from a meteorological visibility distance *V*: `k = -ln(C_t) / V`
 
 Distant objects are attenuated more (`t` approaches 0) and replaced by airlight, just as in real fog.
+
+For gloomy conditions, add `scene_illumination` inside a fog model config. This
+darkens pre-fog scene radiance `I(x)` before the atmospheric scattering equation,
+so near objects can become plausibly overcast or storm-lit instead of passing
+through unchanged. `global_ev` applies to the whole non-sky scene, `near_ev` adds
+extra near-field darkening with `near_decay_depth_m`, `fog_coupled_ev` adds a
+term proportional to local fog opacity, and `sky_weight: 0.0` preserves sky
+pixels when a sky mask is available.
 
 ### How Each Modality is Used
 

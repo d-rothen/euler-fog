@@ -28,6 +28,17 @@ DEFAULT_AIRLIGHT_DAMPENING_CONFIG = {
     "strength": 1.0,
 }
 
+DEFAULT_SCENE_ILLUMINATION_CONFIG = {
+    "enabled": False,
+    "global_ev": 0.0,
+    "near_ev": 0.0,
+    "near_decay_depth_m": 15.0,
+    "fog_coupled_ev": 0.0,
+    "airlight_ev_ratio": 0.0,
+    "sky_weight": 0.0,
+    "min_radiance_scale": 0.08,
+}
+
 _AIRLIGHT_DAMPENING_KEYS = (
     "airlight_dampening",
     "airlight_damping",
@@ -141,7 +152,11 @@ def resolve_scattering_coefficient(
         return beta, None, contrast_threshold
 
     visibility = float(sample_value(model_cfg.get("visibility_m"), rng))
-    return visibility_to_k(visibility, contrast_threshold), visibility, contrast_threshold
+    return (
+        visibility_to_k(visibility, contrast_threshold),
+        visibility,
+        contrast_threshold,
+    )
 
 
 def normalize_atmospheric_light(value: np.ndarray) -> np.ndarray:
@@ -237,9 +252,7 @@ def resolve_airlight_dampening_config(
     if min_factor > max_factor:
         raise ValueError("airlight_dampening.min_factor must be <= max_factor")
     if strength < 0.0:
-        raise ValueError(
-            f"airlight_dampening.strength must be >= 0, got {strength}"
-        )
+        raise ValueError(f"airlight_dampening.strength must be >= 0, got {strength}")
 
     reference_beta_spec = resolved.get(
         "reference_scattering_coefficient",
@@ -962,12 +975,151 @@ def _normalize_gradient_factors_torch(factors: "torch.Tensor") -> "torch.Tensor"
     return factors / mean_factor
 
 
+def _sanitize_depth_np(depth_m: np.ndarray) -> np.ndarray:
+    depth = np.asarray(depth_m, dtype=np.float32)
+    depth = np.nan_to_num(depth, nan=0.0, posinf=0.0, neginf=0.0)
+    return np.maximum(depth, 0.0).astype(np.float32, copy=False)
+
+
+def _sanitize_depth_torch(depth_m: "torch.Tensor") -> "torch.Tensor":
+    depth = torch.nan_to_num(
+        depth_m.to(dtype=torch.float32), nan=0.0, posinf=0.0, neginf=0.0
+    )
+    return torch.clamp(depth, min=0.0)
+
+
+def _resolve_scene_illumination_config(model_cfg: dict) -> dict:
+    raw = model_cfg.get("scene_illumination")
+    if raw is None:
+        raw = {"enabled": False}
+    if isinstance(raw, bool):
+        raw = {"enabled": raw}
+    if not isinstance(raw, dict):
+        raise ValueError("scene_illumination must be a boolean or object")
+    return deep_merge(dict(DEFAULT_SCENE_ILLUMINATION_CONFIG), raw)
+
+
+def apply_scene_illumination_np(
+    rgb_lin: np.ndarray,
+    depth_m: np.ndarray,
+    k_field,
+    model_cfg: dict,
+    rng: np.random.Generator,
+    sky_mask: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Darken pre-fog scene radiance for gloomy illumination conditions."""
+    height, width = depth_m.shape
+    cfg = _resolve_scene_illumination_config(model_cfg)
+    enabled = cfg.get("enabled", False)
+    if not isinstance(enabled, bool):
+        raise ValueError("scene_illumination.enabled must be a boolean")
+    if not enabled:
+        return (
+            np.asarray(rgb_lin, dtype=np.float32),
+            np.zeros((height, width), dtype=np.float32),
+        )
+
+    global_ev = _sample_float(
+        cfg.get("global_ev", 0.0),
+        rng,
+        "scene_illumination.global_ev",
+    )
+    near_ev = _sample_float(
+        cfg.get("near_ev", 0.0),
+        rng,
+        "scene_illumination.near_ev",
+    )
+    decay_depth = max(
+        _sample_float(
+            cfg.get("near_decay_depth_m", 15.0),
+            rng,
+            "scene_illumination.near_decay_depth_m",
+        ),
+        1e-6,
+    )
+    fog_ev = _sample_float(
+        cfg.get("fog_coupled_ev", 0.0),
+        rng,
+        "scene_illumination.fog_coupled_ev",
+    )
+
+    depth = _sanitize_depth_np(depth_m)
+    k_map = np.maximum(broadcast_k_field(k_field, height, width), 0.0)
+    near_weight = np.exp(-depth / decay_depth).astype(np.float32, copy=False)
+    fog_opacity = 1.0 - np.exp(-k_map * depth)
+    ev_map = (
+        global_ev + near_ev * near_weight + fog_ev * np.clip(fog_opacity, 0.0, 1.0)
+    ).astype(np.float32, copy=False)
+
+    if sky_mask is not None:
+        sky = np.asarray(sky_mask, dtype=np.float32)
+        if sky.shape != (height, width):
+            raise ValueError(
+                f"sky_mask must have shape ({height}, {width}); got {sky.shape}"
+            )
+        sky_weight = float(
+            np.clip(
+                _sample_float(
+                    cfg.get("sky_weight", 0.0),
+                    rng,
+                    "scene_illumination.sky_weight",
+                ),
+                0.0,
+                1.0,
+            )
+        )
+        ev_map *= 1.0 - np.clip(sky, 0.0, 1.0) * (1.0 - sky_weight)
+
+    min_scale = max(
+        _sample_float(
+            cfg.get("min_radiance_scale", 0.08),
+            rng,
+            "scene_illumination.min_radiance_scale",
+        ),
+        0.0,
+    )
+    scale = np.maximum(np.exp2(-ev_map), min_scale).astype(np.float32, copy=False)
+    radiance = np.nan_to_num(
+        np.asarray(rgb_lin, dtype=np.float32),
+        nan=0.0,
+        posinf=1.0,
+        neginf=0.0,
+    )
+    return (radiance * scale[..., None]).astype(np.float32, copy=False), ev_map
+
+
+def _apply_scene_airlight_dampening_np(
+    ls_field: np.ndarray,
+    ev_map: np.ndarray,
+    model_cfg: dict,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    cfg = _resolve_scene_illumination_config(model_cfg)
+    if not bool(cfg.get("enabled", False)):
+        return ls_field.astype(np.float32, copy=False)
+    ratio = _sample_float(
+        cfg.get("airlight_ev_ratio", 0.0),
+        rng,
+        "scene_illumination.airlight_ev_ratio",
+    )
+    if ratio <= 0.0:
+        return ls_field.astype(np.float32, copy=False)
+    scale = np.exp2(-np.maximum(ev_map, 0.0) * ratio).astype(np.float32, copy=False)
+    ls_map = broadcast_ls_field(ls_field, ev_map.shape[0], ev_map.shape[1])
+    return np.clip(ls_map * scale[..., None], 0.0, 1.0).astype(np.float32, copy=False)
+
+
 def apply_fog(
     rgb: np.ndarray, depth_m: np.ndarray, k_field: np.ndarray, ls_field: np.ndarray
 ) -> np.ndarray:
-    t = np.exp(-k_field * depth_m)
+    depth = _sanitize_depth_np(depth_m)
+    k_arr = np.maximum(np.asarray(k_field, dtype=np.float32), 0.0)
+    t = np.exp(-k_arr * depth)
     t = t[..., None]
-    return rgb * t + ls_field * (1.0 - t)
+    return (
+        np.asarray(rgb, dtype=np.float32) * t
+        + np.asarray(ls_field, dtype=np.float32) * (1.0 - t)
+    ).astype(np.float32, copy=False)
 
 
 def apply_fog_torch(
@@ -980,7 +1132,9 @@ def apply_fog_torch(
         k_field = torch.tensor(k_field, device=rgb.device, dtype=rgb.dtype)
     if not torch.is_tensor(ls_field):
         ls_field = torch.tensor(ls_field, device=rgb.device, dtype=rgb.dtype)
-    t = torch.exp(-k_field * depth_m)
+    depth = _sanitize_depth_torch(depth_m).to(device=rgb.device, dtype=rgb.dtype)
+    k_field = torch.clamp(k_field.to(device=rgb.device, dtype=rgb.dtype), min=0.0)
+    t = torch.exp(-k_field * depth)
     if t.ndim in (2, 3):
         t = t.unsqueeze(-1)
     return rgb * t + ls_field * (1.0 - t)
@@ -1051,6 +1205,7 @@ def apply_model(
     rng: np.random.Generator,
     contrast_threshold_default: float,
     estimated_airlight: np.ndarray,
+    sky_mask: np.ndarray | None = None,
 ) -> tuple[np.ndarray, float, np.ndarray, np.ndarray, np.ndarray]:
     """Apply a fog model to ``rgb``.
 
@@ -1089,13 +1244,6 @@ def apply_model(
         _contrast_threshold,
         estimated_airlight=airlight_is_estimated,
     )
-
-    if model_name == "uniform":
-        ls_field = ls_base.reshape(1, 1, 3)
-        foggy = apply_fog(rgb, depth_m, k_mean, ls_field)
-        k_map = broadcast_k_field(k_mean, height, width)
-        ls_map = broadcast_ls_field(ls_base, height, width)
-        return foggy, k_mean, ls_base, k_map, ls_map
 
     if model_name in ("heterogeneous_k", "heterogeneous_k_ls"):
         k_cfg = model_cfg.get("k_hetero", {})
@@ -1140,7 +1288,16 @@ def apply_model(
     else:
         ls_field = ls_base.reshape(1, 1, 3)
 
-    foggy = apply_fog(rgb, depth_m, k_field, ls_field)
+    scene_rgb, ev_map = apply_scene_illumination_np(
+        rgb,
+        depth_m,
+        k_field,
+        model_cfg,
+        rng,
+        sky_mask=sky_mask,
+    )
+    ls_field = _apply_scene_airlight_dampening_np(ls_field, ev_map, model_cfg, rng)
+    foggy = apply_fog(scene_rgb, depth_m, k_field, ls_field)
     k_map = broadcast_k_field(k_field, height, width)
     ls_map = broadcast_ls_field(ls_field, height, width)
     return foggy, k_mean, ls_base, k_map, ls_map
