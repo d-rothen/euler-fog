@@ -1,9 +1,10 @@
 {
   "airlight": "dcp_heuristic",
   "seed": 1337,
-  "depth_scale": 1.0,
+  "depth_scale": 1,
   "resize_depth": true,
   "contrast_threshold": 0.05,
+  "render_input_space": "srgb",
   "device": "mps",
   "gpu_batch_size": 4,
   "gpu_batching": {
@@ -23,13 +24,13 @@
           "probability": 0.18,
           "length_px": {
             "dist": "uniform",
-            "min": 2.0,
-            "max": 4.0
+            "min": 2,
+            "max": 4
           },
           "angle_deg": {
             "dist": "uniform",
-            "min": -6.0,
-            "max": 6.0
+            "min": -6,
+            "max": 6
           }
         },
         "vignetting_strength": {
@@ -95,8 +96,8 @@
           },
           "blur_sigma": {
             "dist": "uniform",
-            "min": 7.0,
-            "max": 18.0
+            "min": 7,
+            "max": 18
           },
           "color": [
             0.64,
@@ -105,7 +106,72 @@
           ]
         },
         "droplets": {
-          "enabled": false
+          "enabled": true,
+          "probability": 0.08,
+          "count": {
+            "dist": "uniform",
+            "min": 2,
+            "max": 9
+          },
+          "radius_fraction": {
+            "dist": "uniform",
+            "min": 0.006,
+            "max": 0.022
+          },
+          "opacity": {
+            "dist": "uniform",
+            "min": 0.14,
+            "max": 0.34
+          },
+          "refraction_px": {
+            "dist": "uniform",
+            "min": 0.8,
+            "max": 2.8
+          },
+          "blur_sigma": {
+            "dist": "uniform",
+            "min": 1.2,
+            "max": 3
+          }
+        },
+        "fog_coupled_glare": {
+          "enabled": true,
+          "probability": 0.72,
+          "base_strength": {
+            "dist": "uniform",
+            "min": 0.004,
+            "max": 0.012
+          },
+          "fog_strength": {
+            "dist": "uniform",
+            "min": 0.012,
+            "max": 0.04
+          },
+          "highlight_strength": {
+            "dist": "uniform",
+            "min": 0.015,
+            "max": 0.055
+          },
+          "airlight_strength": {
+            "dist": "uniform",
+            "min": 0,
+            "max": 0.025
+          },
+          "highlight_threshold": {
+            "dist": "uniform",
+            "min": 0.62,
+            "max": 0.76
+          },
+          "smooth_sigma": {
+            "dist": "uniform",
+            "min": 9,
+            "max": 22
+          },
+          "color": [
+            0.72,
+            0.75,
+            0.76
+          ]
         }
       },
       "sensor": {
@@ -113,11 +179,11 @@
         "exposure_gain": {
           "dist": "uniform",
           "min": 0.72,
-          "max": 1.0
+          "max": 1
         },
         "auto_exposure": {
           "enabled": true,
-          "metering": "center_weighted",
+          "metering": "fog_aware_center_weighted",
           "target_luminance": {
             "dist": "uniform",
             "min": 0.105,
@@ -125,7 +191,7 @@
           },
           "center_weight": 0.58,
           "center_sigma": 0.38,
-          "meter_percentile": 50.0,
+          "meter_percentile": 50,
           "highlight_percentile": 98.5,
           "highlight_target": {
             "dist": "uniform",
@@ -140,19 +206,23 @@
             "min": -0.65,
             "max": -0.2
           },
-          "manual_gain_weight": 1.0,
+          "manual_gain_weight": 0,
           "resolve_iso": true,
-          "min_iso": 100.0,
-          "max_iso": 1250.0,
+          "min_iso": 100,
+          "max_iso": 1250,
           "iso_activation_gain": 1.18,
           "iso_gain_power": 0.82,
           "dark_fraction_threshold": 0.12,
           "dark_iso_boost": 0.35,
-          "fog_iso_boost": 0.25
+          "fog_iso_boost": 0.25,
+          "sky_suppression": 0.85,
+          "fog_meter_suppression": 0.6,
+          "depth_meter_decay_m": 35,
+          "min_meter_weight": 0.05
         },
         "white_balance": [
           0.92,
-          1.0,
+          1,
           1.08
         ],
         "white_balance_jitter": 0.035,
@@ -178,9 +248,9 @@
         "iso": {
           "dist": "choice",
           "values": [
-            500.0,
-            800.0,
-            1250.0
+            500,
+            800,
+            1250
           ],
           "weights": [
             0.3,
@@ -188,11 +258,11 @@
             0.25
           ]
         },
-        "base_iso": 100.0,
+        "base_iso": 100,
         "full_well_electrons": [
-          13500.0,
-          12000.0,
-          12500.0
+          13500,
+          12000,
+          12500
         ],
         "read_noise_electrons": {
           "dist": "uniform",
@@ -216,13 +286,13 @@
         },
         "row_banding_correlation_px": {
           "dist": "uniform",
-          "min": 40.0,
-          "max": 160.0
+          "min": 40,
+          "max": 160
         },
         "column_banding_correlation_px": {
           "dist": "uniform",
-          "min": 36.0,
-          "max": 128.0
+          "min": 36,
+          "max": 128
         },
         "banding_modulation": 0.22,
         "noise_modulation": {
@@ -231,7 +301,7 @@
           "depth_gain": 0.12,
           "fog_gain": 0.32,
           "gamma": 1.55,
-          "max_gain": 2.0,
+          "max_gain": 2,
           "smooth_sigma": 2.2,
           "black_noise_floor": 0.5,
           "black_suppression_luminance": 0.015,
@@ -261,7 +331,7 @@
           "red_chroma_gain": {
             "dist": "uniform",
             "min": 0.7,
-            "max": 1.0
+            "max": 1
           },
           "blue_chroma_gain": {
             "dist": "uniform",
@@ -273,18 +343,18 @@
             "min": 0.05,
             "max": 0.25
           },
-          "chroma_spatial_sigma": 0.0,
-          "chroma_fine_fraction": 1.0,
-          "chroma_luminance_preservation": 1.0,
+          "chroma_spatial_sigma": 0,
+          "chroma_fine_fraction": 1,
+          "chroma_luminance_preservation": 1,
           "blotch_sigma": {
             "dist": "uniform",
-            "min": 0.0,
+            "min": 0,
             "max": 0.0008
           },
           "fog_weight": 0.16,
           "depth_weight": 0.06,
           "smooth_sigma": 1.2,
-          "max_weight": 1.0,
+          "max_weight": 1,
           "black_noise_floor": 0.28,
           "black_suppression_luminance": 0.025,
           "black_suppression_softness": 0.07
@@ -300,9 +370,9 @@
           "max": 0.0025
         },
         "white_level": [
-          1.0,
+          1,
           0.995,
-          1.0
+          1
         ],
         "white_level_jitter": {
           "dist": "uniform",
@@ -325,8 +395,8 @@
             "iso": {
               "dist": "choice",
               "values": [
-                100.0,
-                200.0
+                100,
+                200
               ],
               "weights": [
                 0.6,
@@ -340,17 +410,17 @@
             },
             "fixed_pattern_sigma": {
               "dist": "uniform",
-              "min": 0.0,
+              "min": 0,
               "max": 0.00022
             },
             "row_noise_sigma": {
               "dist": "uniform",
-              "min": 0.0,
+              "min": 0,
               "max": 0.00016
             },
             "column_noise_sigma": {
               "dist": "uniform",
-              "min": 0.0,
+              "min": 0,
               "max": 0.00008
             },
             "banding_modulation": 0.08,
@@ -361,7 +431,7 @@
               "fog_gain": 0.25,
               "gamma": 1.2,
               "max_gain": 1.55,
-              "smooth_sigma": 2.0,
+              "smooth_sigma": 2,
               "black_noise_floor": 0.7,
               "black_suppression_luminance": 0.01,
               "black_suppression_softness": 0.045
@@ -390,13 +460,13 @@
               },
               "chroma_axis_correlation": {
                 "dist": "uniform",
-                "min": 0.0,
+                "min": 0,
                 "max": 0.15
               },
-              "chroma_luminance_preservation": 1.0,
+              "chroma_luminance_preservation": 1,
               "blotch_sigma": {
                 "dist": "uniform",
-                "min": 0.0,
+                "min": 0,
                 "max": 0.0005
               },
               "fog_weight": 0.12,
@@ -406,7 +476,7 @@
               "black_suppression_softness": 0.055
             },
             "hot_pixel_probability": 0.000001,
-            "dead_pixel_probability": 0.0000005
+            "dead_pixel_probability": 5e-7
           },
           {
             "name": "nominal_gloom",
@@ -419,9 +489,9 @@
             "iso": {
               "dist": "choice",
               "values": [
-                320.0,
-                640.0,
-                800.0
+                320,
+                640,
+                800
               ],
               "weights": [
                 0.25,
@@ -456,7 +526,7 @@
               "depth_gain": 0.12,
               "fog_gain": 0.35,
               "gamma": 1.55,
-              "max_gain": 2.0,
+              "max_gain": 2,
               "smooth_sigma": 2.2,
               "black_noise_floor": 0.45,
               "black_suppression_luminance": 0.018,
@@ -477,7 +547,7 @@
               "red_chroma_gain": {
                 "dist": "uniform",
                 "min": 0.7,
-                "max": 1.0
+                "max": 1
               },
               "blue_chroma_gain": {
                 "dist": "uniform",
@@ -489,10 +559,10 @@
                 "min": 0.05,
                 "max": 0.25
               },
-              "chroma_luminance_preservation": 1.0,
+              "chroma_luminance_preservation": 1,
               "blotch_sigma": {
                 "dist": "uniform",
-                "min": 0.0,
+                "min": 0,
                 "max": 0.0008
               },
               "fog_weight": 0.14,
@@ -515,9 +585,9 @@
             "iso": {
               "dist": "choice",
               "values": [
-                400.0,
-                640.0,
-                800.0
+                400,
+                640,
+                800
               ],
               "weights": [
                 0.3,
@@ -552,7 +622,7 @@
               "depth_gain": 0.12,
               "fog_gain": 0.36,
               "gamma": 1.65,
-              "max_gain": 2.0,
+              "max_gain": 2,
               "smooth_sigma": 2.4,
               "black_noise_floor": 0.35,
               "black_suppression_luminance": 0.022,
@@ -585,10 +655,10 @@
                 "min": 0.08,
                 "max": 0.32
               },
-              "chroma_luminance_preservation": 1.0,
+              "chroma_luminance_preservation": 1,
               "blotch_sigma": {
                 "dist": "uniform",
-                "min": 0.0,
+                "min": 0,
                 "max": 0.001
               },
               "fog_weight": 0.14,
@@ -600,7 +670,26 @@
             "hot_pixel_probability": 0.0000045,
             "dead_pixel_probability": 0.0000025
           }
-        ]
+        ],
+        "sensor_identity": {
+          "enabled": true,
+          "sensor_id": "dense_gloomy_daylight_dashcam",
+          "seed": 2207,
+          "prnu_sigma": {
+            "dist": "uniform",
+            "min": 0.001,
+            "max": 0.004
+          },
+          "dsnu_sigma": {
+            "dist": "uniform",
+            "min": 0.00003,
+            "max": 0.00018
+          },
+          "persistent_hot_pixel_probability": 0.00001,
+          "persistent_dead_pixel_probability": 0.000005,
+          "persistent_row_sigma": 0.00025,
+          "persistent_column_sigma": 0.00016
+        }
       },
       "isp": {
         "denoise_sigma": {
@@ -625,17 +714,9 @@
             0.945
           ]
         ],
-        "tone_map": "reinhard",
-        "tone_map_strength": {
-          "dist": "uniform",
-          "min": 0.22,
-          "max": 0.42
-        },
-        "gamma": {
-          "dist": "uniform",
-          "min": 2.05,
-          "max": 2.3
-        },
+        "tone_map": "lut",
+        "tone_map_strength": 1,
+        "gamma": "srgb",
         "local_contrast_strength": {
           "dist": "uniform",
           "min": 0.02,
@@ -643,8 +724,8 @@
         },
         "local_contrast_sigma": {
           "dist": "uniform",
-          "min": 10.0,
-          "max": 24.0
+          "min": 10,
+          "max": 24
         },
         "sharpen_amount": {
           "dist": "uniform",
@@ -656,7 +737,26 @@
           "dist": "uniform",
           "min": 0.58,
           "max": 0.82
-        }
+        },
+        "tone_map_lut": [
+          0,
+          0.006,
+          0.014,
+          0.028,
+          0.052,
+          0.09,
+          0.145,
+          0.22,
+          0.32,
+          0.45,
+          0.61,
+          0.78,
+          0.9,
+          0.965,
+          0.995,
+          1
+        ],
+        "tone_map_lut_domain": "linear"
       },
       "transport": {
         "bit_depth": 8,
@@ -664,8 +764,8 @@
           "enabled": true,
           "quality": {
             "dist": "uniform",
-            "min": 70.0,
-            "max": 90.0
+            "min": 70,
+            "max": 90
           },
           "subsampling": 0
         }
@@ -686,10 +786,10 @@
         "heterogeneous_k_ls": {
           "visibility_m": {
             "dist": "normal",
-            "mean": 155.0,
-            "std": 32.0,
-            "min": 90.0,
-            "max": 240.0
+            "mean": 155,
+            "std": 32,
+            "min": 90,
+            "max": 240
           },
           "airlight_dampening": {
             "min_factor": {
@@ -721,16 +821,46 @@
               "probability": 0.15,
               "top_factor": {
                 "dist": "uniform",
-                "min": 1.0,
+                "min": 1,
                 "max": 1.04
               },
               "bottom_factor": {
                 "dist": "uniform",
                 "min": 0.96,
-                "max": 1.0
+                "max": 1
               },
               "fog_opacity_weight": 0.25
             }
+          },
+          "scene_illumination": {
+            "enabled": true,
+            "global_ev": {
+              "dist": "uniform",
+              "min": 0,
+              "max": 0.14
+            },
+            "near_ev": {
+              "dist": "uniform",
+              "min": 0,
+              "max": 0.18
+            },
+            "near_decay_depth_m": {
+              "dist": "uniform",
+              "min": 18,
+              "max": 34
+            },
+            "fog_coupled_ev": {
+              "dist": "uniform",
+              "min": 0,
+              "max": 0.05
+            },
+            "airlight_ev_ratio": {
+              "dist": "uniform",
+              "min": 0,
+              "max": 0.04
+            },
+            "sky_weight": 0.18,
+            "min_radiance_scale": 0.18
           }
         }
       },
@@ -740,24 +870,32 @@
           "auto_exposure": {
             "target_luminance": {
               "dist": "uniform",
-              "min": 0.145,
-              "max": 0.2
+              "min": 0.15,
+              "max": 0.21
             },
             "highlight_target": {
               "dist": "uniform",
-              "min": 0.86,
+              "min": 0.87,
               "max": 0.97
             },
-            "highlight_protection": 0.82,
+            "highlight_protection": 0.84,
             "max_gain": 1.35,
             "exposure_compensation_ev": {
               "dist": "uniform",
               "min": -0.35,
-              "max": -0.12
+              "max": -0.1
             },
-            "max_iso": 500.0,
+            "max_iso": 500,
             "dark_iso_boost": 0.12,
-            "fog_iso_boost": 0.08
+            "fog_iso_boost": 0.08,
+            "enabled": true,
+            "metering": "fog_aware_center_weighted",
+            "manual_gain_weight": 0,
+            "resolve_iso": true,
+            "sky_suppression": 0.72,
+            "fog_meter_suppression": 0.18,
+            "depth_meter_decay_m": 58,
+            "min_meter_weight": 0.16
           },
           "shadow_recovery_noise": {
             "strength": 0.35,
@@ -771,6 +909,55 @@
             "black_noise_floor": 0.55,
             "black_suppression_luminance": 0.015,
             "black_suppression_softness": 0.05
+          },
+          "noise_adjustment": {
+            "enabled": true,
+            "level": 0.72,
+            "static_chroma_bias": -0.15,
+            "groups": {
+              "read": {
+                "dist": "constant",
+                "value": 0.75
+              },
+              "static": {
+                "dist": "constant",
+                "value": 0.9
+              },
+              "banding": {
+                "dist": "constant",
+                "value": 0.85
+              },
+              "bad_pixels": {
+                "dist": "constant",
+                "value": 0.7
+              },
+              "chroma": {
+                "dist": "constant",
+                "value": 0.6
+              },
+              "shadow_luma": {
+                "dist": "constant",
+                "value": 0.65
+              },
+              "modulation": {
+                "dist": "constant",
+                "value": 0.75
+              }
+            },
+            "limits": {
+              "min_factor": {
+                "dist": "constant",
+                "value": 0.2
+              },
+              "max_factor": {
+                "dist": "constant",
+                "value": 1.4
+              },
+              "max_bad_pixel_probability": {
+                "dist": "constant",
+                "value": 0.00008
+              }
+            }
           }
         },
         "isp": {
@@ -788,14 +975,89 @@
             "dist": "uniform",
             "min": 0.72,
             "max": 0.94
+          },
+          "tone_map_strength": {
+            "dist": "uniform",
+            "min": 0.78,
+            "max": 0.96
           }
         },
         "transport": {
           "jpeg": {
             "quality": {
-                "dist": "uniform",
-                "min": 80.0,
-                "max": 96.0
+              "dist": "uniform",
+              "min": 80,
+              "max": 96
+            }
+          }
+        },
+        "optics": {
+          "fog_coupled_glare": {
+            "enabled": true,
+            "probability": 0.22,
+            "base_strength": {
+              "dist": "uniform",
+              "min": 0,
+              "max": 0.006
+            },
+            "fog_strength": {
+              "dist": "uniform",
+              "min": 0,
+              "max": 0.012
+            },
+            "highlight_strength": {
+              "dist": "uniform",
+              "min": 0.006,
+              "max": 0.018
+            },
+            "airlight_strength": {
+              "dist": "uniform",
+              "min": 0,
+              "max": 0.006
+            },
+            "highlight_threshold": {
+              "dist": "uniform",
+              "min": 0.58,
+              "max": 0.76
+            },
+            "smooth_sigma": {
+              "dist": "uniform",
+              "min": 10,
+              "max": 24
+            },
+            "color": [
+              0.72,
+              0.75,
+              0.76
+            ]
+          },
+          "droplets": {
+            "enabled": true,
+            "probability": 0.015,
+            "count": {
+              "dist": "uniform",
+              "min": 2,
+              "max": 12
+            },
+            "radius_fraction": {
+              "dist": "uniform",
+              "min": 0.006,
+              "max": 0.024
+            },
+            "opacity": {
+              "dist": "uniform",
+              "min": 0.14,
+              "max": 0.36
+            },
+            "refraction_px": {
+              "dist": "uniform",
+              "min": 0.8,
+              "max": 3.2
+            },
+            "blur_sigma": {
+              "dist": "uniform",
+              "min": 1.2,
+              "max": 3.2
             }
           }
         }
@@ -810,10 +1072,10 @@
         "heterogeneous_k_ls": {
           "visibility_m": {
             "dist": "normal",
-            "mean": 95.0,
-            "std": 20.0,
-            "min": 55.0,
-            "max": 160.0
+            "mean": 95,
+            "std": 20,
+            "min": 55,
+            "max": 160
           },
           "airlight_dampening": {
             "min_factor": {
@@ -855,6 +1117,36 @@
               },
               "fog_opacity_weight": 0.45
             }
+          },
+          "scene_illumination": {
+            "enabled": true,
+            "global_ev": {
+              "dist": "uniform",
+              "min": 0.08,
+              "max": 0.32
+            },
+            "near_ev": {
+              "dist": "uniform",
+              "min": 0.12,
+              "max": 0.48
+            },
+            "near_decay_depth_m": {
+              "dist": "uniform",
+              "min": 14,
+              "max": 28
+            },
+            "fog_coupled_ev": {
+              "dist": "uniform",
+              "min": 0.03,
+              "max": 0.14
+            },
+            "airlight_ev_ratio": {
+              "dist": "uniform",
+              "min": 0.03,
+              "max": 0.09
+            },
+            "sky_weight": 0.08,
+            "min_radiance_scale": 0.14
           }
         }
       },
@@ -864,24 +1156,32 @@
           "auto_exposure": {
             "target_luminance": {
               "dist": "uniform",
-              "min": 0.12,
-              "max": 0.18
+              "min": 0.125,
+              "max": 0.185
             },
             "highlight_target": {
               "dist": "uniform",
               "min": 0.84,
               "max": 0.94
             },
-            "highlight_protection": 0.76,
+            "highlight_protection": 0.78,
             "max_gain": 1.55,
             "exposure_compensation_ev": {
               "dist": "uniform",
-              "min": -0.48,
-              "max": -0.15
+              "min": -0.5,
+              "max": -0.16
             },
-            "max_iso": 800.0,
+            "max_iso": 800,
             "dark_iso_boost": 0.22,
-            "fog_iso_boost": 0.16
+            "fog_iso_boost": 0.16,
+            "enabled": true,
+            "metering": "fog_aware_center_weighted",
+            "manual_gain_weight": 0,
+            "resolve_iso": true,
+            "sky_suppression": 0.8,
+            "fog_meter_suppression": 0.36,
+            "depth_meter_decay_m": 45,
+            "min_meter_weight": 0.1
           },
           "shadow_recovery_noise": {
             "strength": 0.65,
@@ -895,6 +1195,55 @@
             "black_noise_floor": 0.35,
             "black_suppression_luminance": 0.022,
             "black_suppression_softness": 0.065
+          },
+          "noise_adjustment": {
+            "enabled": true,
+            "level": 0.95,
+            "static_chroma_bias": 0.05,
+            "groups": {
+              "read": {
+                "dist": "constant",
+                "value": 0.95
+              },
+              "static": {
+                "dist": "constant",
+                "value": 0.95
+              },
+              "banding": {
+                "dist": "constant",
+                "value": 0.95
+              },
+              "bad_pixels": {
+                "dist": "constant",
+                "value": 0.85
+              },
+              "chroma": {
+                "dist": "constant",
+                "value": 0.95
+              },
+              "shadow_luma": {
+                "dist": "constant",
+                "value": 0.9
+              },
+              "modulation": {
+                "dist": "constant",
+                "value": 0.95
+              }
+            },
+            "limits": {
+              "min_factor": {
+                "dist": "constant",
+                "value": 0.2
+              },
+              "max_factor": {
+                "dist": "constant",
+                "value": 1.7
+              },
+              "max_bad_pixel_probability": {
+                "dist": "constant",
+                "value": 0.00008
+              }
+            }
           }
         },
         "isp": {
@@ -912,14 +1261,89 @@
             "dist": "uniform",
             "min": 0.66,
             "max": 0.86
+          },
+          "tone_map_strength": {
+            "dist": "uniform",
+            "min": 0.86,
+            "max": 1.02
           }
         },
         "transport": {
           "jpeg": {
             "quality": {
-                "dist": "uniform",
-                "min": 76.0,
-                "max": 94.0
+              "dist": "uniform",
+              "min": 76,
+              "max": 94
+            }
+          }
+        },
+        "optics": {
+          "fog_coupled_glare": {
+            "enabled": true,
+            "probability": 0.42,
+            "base_strength": {
+              "dist": "uniform",
+              "min": 0.002,
+              "max": 0.01
+            },
+            "fog_strength": {
+              "dist": "uniform",
+              "min": 0.006,
+              "max": 0.024
+            },
+            "highlight_strength": {
+              "dist": "uniform",
+              "min": 0.01,
+              "max": 0.034
+            },
+            "airlight_strength": {
+              "dist": "uniform",
+              "min": 0,
+              "max": 0.012
+            },
+            "highlight_threshold": {
+              "dist": "uniform",
+              "min": 0.58,
+              "max": 0.76
+            },
+            "smooth_sigma": {
+              "dist": "uniform",
+              "min": 10,
+              "max": 24
+            },
+            "color": [
+              0.72,
+              0.75,
+              0.76
+            ]
+          },
+          "droplets": {
+            "enabled": true,
+            "probability": 0.04,
+            "count": {
+              "dist": "uniform",
+              "min": 2,
+              "max": 12
+            },
+            "radius_fraction": {
+              "dist": "uniform",
+              "min": 0.006,
+              "max": 0.024
+            },
+            "opacity": {
+              "dist": "uniform",
+              "min": 0.14,
+              "max": 0.36
+            },
+            "refraction_px": {
+              "dist": "uniform",
+              "min": 0.8,
+              "max": 3.2
+            },
+            "blur_sigma": {
+              "dist": "uniform",
+              "min": 1.2,
+              "max": 3.2
             }
           }
         }
@@ -934,10 +1358,10 @@
         "heterogeneous_k_ls": {
           "visibility_m": {
             "dist": "normal",
-            "mean": 62.0,
-            "std": 13.0,
-            "min": 36.0,
-            "max": 98.0
+            "mean": 62,
+            "std": 13,
+            "min": 36,
+            "max": 98
           },
           "airlight_dampening": {
             "min_factor": {
@@ -979,6 +1403,36 @@
               },
               "fog_opacity_weight": 0.58
             }
+          },
+          "scene_illumination": {
+            "enabled": true,
+            "global_ev": {
+              "dist": "uniform",
+              "min": 0.22,
+              "max": 0.58
+            },
+            "near_ev": {
+              "dist": "uniform",
+              "min": 0.24,
+              "max": 0.88
+            },
+            "near_decay_depth_m": {
+              "dist": "uniform",
+              "min": 11,
+              "max": 24
+            },
+            "fog_coupled_ev": {
+              "dist": "uniform",
+              "min": 0.08,
+              "max": 0.28
+            },
+            "airlight_ev_ratio": {
+              "dist": "uniform",
+              "min": 0.06,
+              "max": 0.15
+            },
+            "sky_weight": 0.03,
+            "min_radiance_scale": 0.1
           }
         }
       },
@@ -988,8 +1442,8 @@
           "auto_exposure": {
             "target_luminance": {
               "dist": "uniform",
-              "min": 0.095,
-              "max": 0.15
+              "min": 0.1,
+              "max": 0.155
             },
             "highlight_target": {
               "dist": "uniform",
@@ -1000,12 +1454,20 @@
             "max_gain": 1.65,
             "exposure_compensation_ev": {
               "dist": "uniform",
-              "min": -0.7,
-              "max": -0.25
+              "min": -0.72,
+              "max": -0.26
             },
-            "max_iso": 1000.0,
+            "max_iso": 1000,
             "dark_iso_boost": 0.3,
-            "fog_iso_boost": 0.18
+            "fog_iso_boost": 0.2,
+            "enabled": true,
+            "metering": "fog_aware_center_weighted",
+            "manual_gain_weight": 0,
+            "resolve_iso": true,
+            "sky_suppression": 0.85,
+            "fog_meter_suppression": 0.58,
+            "depth_meter_decay_m": 35,
+            "min_meter_weight": 0.06
           },
           "shadow_recovery_noise": {
             "strength": 0.9,
@@ -1019,6 +1481,55 @@
             "black_noise_floor": 0.24,
             "black_suppression_luminance": 0.03,
             "black_suppression_softness": 0.08
+          },
+          "noise_adjustment": {
+            "enabled": true,
+            "level": 1.18,
+            "static_chroma_bias": 0.28,
+            "groups": {
+              "read": {
+                "dist": "constant",
+                "value": 1.12
+              },
+              "static": {
+                "dist": "constant",
+                "value": 1
+              },
+              "banding": {
+                "dist": "constant",
+                "value": 1
+              },
+              "bad_pixels": {
+                "dist": "constant",
+                "value": 1
+              },
+              "chroma": {
+                "dist": "constant",
+                "value": 1.2
+              },
+              "shadow_luma": {
+                "dist": "constant",
+                "value": 1.12
+              },
+              "modulation": {
+                "dist": "constant",
+                "value": 1.1
+              }
+            },
+            "limits": {
+              "min_factor": {
+                "dist": "constant",
+                "value": 0.2
+              },
+              "max_factor": {
+                "dist": "constant",
+                "value": 2.1
+              },
+              "max_bad_pixel_probability": {
+                "dist": "constant",
+                "value": 0.00008
+              }
+            }
           }
         },
         "isp": {
@@ -1036,14 +1547,89 @@
             "dist": "uniform",
             "min": 0.6,
             "max": 0.8
+          },
+          "tone_map_strength": {
+            "dist": "uniform",
+            "min": 0.94,
+            "max": 1.08
           }
         },
         "transport": {
           "jpeg": {
             "quality": {
-                "dist": "uniform",
-                "min": 72.0,
-                "max": 90.0
+              "dist": "uniform",
+              "min": 72,
+              "max": 90
+            }
+          }
+        },
+        "optics": {
+          "fog_coupled_glare": {
+            "enabled": true,
+            "probability": 0.66,
+            "base_strength": {
+              "dist": "uniform",
+              "min": 0.004,
+              "max": 0.014
+            },
+            "fog_strength": {
+              "dist": "uniform",
+              "min": 0.012,
+              "max": 0.04
+            },
+            "highlight_strength": {
+              "dist": "uniform",
+              "min": 0.016,
+              "max": 0.052
+            },
+            "airlight_strength": {
+              "dist": "uniform",
+              "min": 0,
+              "max": 0.022
+            },
+            "highlight_threshold": {
+              "dist": "uniform",
+              "min": 0.58,
+              "max": 0.76
+            },
+            "smooth_sigma": {
+              "dist": "uniform",
+              "min": 10,
+              "max": 24
+            },
+            "color": [
+              0.72,
+              0.75,
+              0.76
+            ]
+          },
+          "droplets": {
+            "enabled": true,
+            "probability": 0.08,
+            "count": {
+              "dist": "uniform",
+              "min": 2,
+              "max": 12
+            },
+            "radius_fraction": {
+              "dist": "uniform",
+              "min": 0.006,
+              "max": 0.024
+            },
+            "opacity": {
+              "dist": "uniform",
+              "min": 0.14,
+              "max": 0.36
+            },
+            "refraction_px": {
+              "dist": "uniform",
+              "min": 0.8,
+              "max": 3.2
+            },
+            "blur_sigma": {
+              "dist": "uniform",
+              "min": 1.2,
+              "max": 3.2
             }
           }
         }
@@ -1058,10 +1644,10 @@
         "heterogeneous_k_ls": {
           "visibility_m": {
             "dist": "normal",
-            "mean": 34.0,
-            "std": 8.0,
-            "min": 18.0,
-            "max": 54.0
+            "mean": 34,
+            "std": 8,
+            "min": 18,
+            "max": 54
           },
           "airlight_dampening": {
             "min_factor": {
@@ -1103,6 +1689,36 @@
               },
               "fog_opacity_weight": 0.78
             }
+          },
+          "scene_illumination": {
+            "enabled": true,
+            "global_ev": {
+              "dist": "uniform",
+              "min": 0.42,
+              "max": 0.95
+            },
+            "near_ev": {
+              "dist": "uniform",
+              "min": 0.44,
+              "max": 1.25
+            },
+            "near_decay_depth_m": {
+              "dist": "uniform",
+              "min": 9,
+              "max": 20
+            },
+            "fog_coupled_ev": {
+              "dist": "uniform",
+              "min": 0.14,
+              "max": 0.46
+            },
+            "airlight_ev_ratio": {
+              "dist": "uniform",
+              "min": 0.1,
+              "max": 0.22
+            },
+            "sky_weight": 0,
+            "min_radiance_scale": 0.08
           }
         }
       },
@@ -1112,8 +1728,8 @@
           "auto_exposure": {
             "target_luminance": {
               "dist": "uniform",
-              "min": 0.065,
-              "max": 0.11
+              "min": 0.07,
+              "max": 0.115
             },
             "highlight_target": {
               "dist": "uniform",
@@ -1124,15 +1740,23 @@
             "max_gain": 1.35,
             "exposure_compensation_ev": {
               "dist": "uniform",
-              "min": -1.1,
-              "max": -0.55
+              "min": -1.12,
+              "max": -0.58
             },
-            "max_iso": 800.0,
-            "dark_iso_boost": 0.18,
-            "fog_iso_boost": 0.1
+            "max_iso": 900,
+            "dark_iso_boost": 0.2,
+            "fog_iso_boost": 0.12,
+            "enabled": true,
+            "metering": "fog_aware_center_weighted",
+            "manual_gain_weight": 0,
+            "resolve_iso": true,
+            "sky_suppression": 0.88,
+            "fog_meter_suppression": 0.7,
+            "depth_meter_decay_m": 28,
+            "min_meter_weight": 0.05
           },
           "shadow_recovery_noise": {
-            "strength": 1.0,
+            "strength": 1,
             "luminance_threshold": {
               "dist": "uniform",
               "min": 0.11,
@@ -1143,6 +1767,55 @@
             "black_noise_floor": 0.16,
             "black_suppression_luminance": 0.04,
             "black_suppression_softness": 0.09
+          },
+          "noise_adjustment": {
+            "enabled": true,
+            "level": 1.42,
+            "static_chroma_bias": 0.45,
+            "groups": {
+              "read": {
+                "dist": "constant",
+                "value": 1.22
+              },
+              "static": {
+                "dist": "constant",
+                "value": 1.08
+              },
+              "banding": {
+                "dist": "constant",
+                "value": 1.05
+              },
+              "bad_pixels": {
+                "dist": "constant",
+                "value": 1.15
+              },
+              "chroma": {
+                "dist": "constant",
+                "value": 1.38
+              },
+              "shadow_luma": {
+                "dist": "constant",
+                "value": 1.24
+              },
+              "modulation": {
+                "dist": "constant",
+                "value": 1.18
+              }
+            },
+            "limits": {
+              "min_factor": {
+                "dist": "constant",
+                "value": 0.2
+              },
+              "max_factor": {
+                "dist": "constant",
+                "value": 2.6
+              },
+              "max_bad_pixel_probability": {
+                "dist": "constant",
+                "value": 0.00008
+              }
+            }
           }
         },
         "isp": {
@@ -1160,14 +1833,89 @@
             "dist": "uniform",
             "min": 0.48,
             "max": 0.72
+          },
+          "tone_map_strength": {
+            "dist": "uniform",
+            "min": 1,
+            "max": 1.16
           }
         },
         "transport": {
           "jpeg": {
             "quality": {
-                "dist": "uniform",
-                "min": 68.0,
-                "max": 88.0
+              "dist": "uniform",
+              "min": 68,
+              "max": 88
+            }
+          }
+        },
+        "optics": {
+          "fog_coupled_glare": {
+            "enabled": true,
+            "probability": 0.8,
+            "base_strength": {
+              "dist": "uniform",
+              "min": 0.006,
+              "max": 0.018
+            },
+            "fog_strength": {
+              "dist": "uniform",
+              "min": 0.02,
+              "max": 0.058
+            },
+            "highlight_strength": {
+              "dist": "uniform",
+              "min": 0.018,
+              "max": 0.06
+            },
+            "airlight_strength": {
+              "dist": "uniform",
+              "min": 0.004,
+              "max": 0.032
+            },
+            "highlight_threshold": {
+              "dist": "uniform",
+              "min": 0.58,
+              "max": 0.76
+            },
+            "smooth_sigma": {
+              "dist": "uniform",
+              "min": 10,
+              "max": 24
+            },
+            "color": [
+              0.72,
+              0.75,
+              0.76
+            ]
+          },
+          "droplets": {
+            "enabled": true,
+            "probability": 0.12,
+            "count": {
+              "dist": "uniform",
+              "min": 2,
+              "max": 12
+            },
+            "radius_fraction": {
+              "dist": "uniform",
+              "min": 0.006,
+              "max": 0.024
+            },
+            "opacity": {
+              "dist": "uniform",
+              "min": 0.14,
+              "max": 0.36
+            },
+            "refraction_px": {
+              "dist": "uniform",
+              "min": 0.8,
+              "max": 3.2
+            },
+            "blur_sigma": {
+              "dist": "uniform",
+              "min": 1.2,
+              "max": 3.2
             }
           }
         }
@@ -1182,10 +1930,10 @@
         "heterogeneous_k_ls": {
           "visibility_m": {
             "dist": "normal",
-            "mean": 24.0,
-            "std": 6.0,
-            "min": 12.0,
-            "max": 40.0
+            "mean": 24,
+            "std": 6,
+            "min": 12,
+            "max": 40
           },
           "airlight_dampening": {
             "min_factor": {
@@ -1211,7 +1959,7 @@
           },
           "ls_hetero": {
             "min_factor": 0.56,
-            "max_factor": 1.0,
+            "max_factor": 1,
             "contrast": 0.76,
             "ls_gradient": {
               "probability": 0.9,
@@ -1227,11 +1975,41 @@
               },
               "gamma": {
                 "dist": "uniform",
-                "min": 1.0,
+                "min": 1,
                 "max": 1.9
               },
               "fog_opacity_weight": 0.86
             }
+          },
+          "scene_illumination": {
+            "enabled": true,
+            "global_ev": {
+              "dist": "uniform",
+              "min": 0.62,
+              "max": 1.25
+            },
+            "near_ev": {
+              "dist": "uniform",
+              "min": 0.7,
+              "max": 1.55
+            },
+            "near_decay_depth_m": {
+              "dist": "uniform",
+              "min": 8,
+              "max": 18
+            },
+            "fog_coupled_ev": {
+              "dist": "uniform",
+              "min": 0.25,
+              "max": 0.72
+            },
+            "airlight_ev_ratio": {
+              "dist": "uniform",
+              "min": 0.14,
+              "max": 0.3
+            },
+            "sky_weight": 0,
+            "min_radiance_scale": 0.07
           }
         }
       },
@@ -1246,6 +2024,74 @@
             "dist": "uniform",
             "min": 0.04,
             "max": 0.1
+          },
+          "fog_coupled_glare": {
+            "enabled": true,
+            "probability": 0.92,
+            "base_strength": {
+              "dist": "uniform",
+              "min": 0.008,
+              "max": 0.024
+            },
+            "fog_strength": {
+              "dist": "uniform",
+              "min": 0.03,
+              "max": 0.082
+            },
+            "highlight_strength": {
+              "dist": "uniform",
+              "min": 0.02,
+              "max": 0.07
+            },
+            "airlight_strength": {
+              "dist": "uniform",
+              "min": 0.006,
+              "max": 0.04
+            },
+            "highlight_threshold": {
+              "dist": "uniform",
+              "min": 0.58,
+              "max": 0.76
+            },
+            "smooth_sigma": {
+              "dist": "uniform",
+              "min": 10,
+              "max": 24
+            },
+            "color": [
+              0.72,
+              0.75,
+              0.76
+            ]
+          },
+          "droplets": {
+            "enabled": true,
+            "probability": 0.18,
+            "count": {
+              "dist": "uniform",
+              "min": 2,
+              "max": 12
+            },
+            "radius_fraction": {
+              "dist": "uniform",
+              "min": 0.006,
+              "max": 0.024
+            },
+            "opacity": {
+              "dist": "uniform",
+              "min": 0.14,
+              "max": 0.36
+            },
+            "refraction_px": {
+              "dist": "uniform",
+              "min": 0.8,
+              "max": 3.2
+            },
+            "blur_sigma": {
+              "dist": "uniform",
+              "min": 1.2,
+              "max": 3.2
+            }
           }
         },
         "sensor": {
@@ -1253,8 +2099,8 @@
           "auto_exposure": {
             "target_luminance": {
               "dist": "uniform",
-              "min": 0.055,
-              "max": 0.095
+              "min": 0.058,
+              "max": 0.098
             },
             "highlight_target": {
               "dist": "uniform",
@@ -1266,11 +2112,19 @@
             "exposure_compensation_ev": {
               "dist": "uniform",
               "min": -1.35,
-              "max": -0.75
+              "max": -0.78
             },
-            "max_iso": 900.0,
-            "dark_iso_boost": 0.22,
-            "fog_iso_boost": 0.12
+            "max_iso": 1000,
+            "dark_iso_boost": 0.24,
+            "fog_iso_boost": 0.14,
+            "enabled": true,
+            "metering": "fog_aware_center_weighted",
+            "manual_gain_weight": 0,
+            "resolve_iso": true,
+            "sky_suppression": 0.9,
+            "fog_meter_suppression": 0.78,
+            "depth_meter_decay_m": 24,
+            "min_meter_weight": 0.04
           },
           "shadow_recovery_noise": {
             "strength": 1.12,
@@ -1284,6 +2138,55 @@
             "black_noise_floor": 0.12,
             "black_suppression_luminance": 0.045,
             "black_suppression_softness": 0.1
+          },
+          "noise_adjustment": {
+            "enabled": true,
+            "level": 1.72,
+            "static_chroma_bias": 0.58,
+            "groups": {
+              "read": {
+                "dist": "constant",
+                "value": 1.35
+              },
+              "static": {
+                "dist": "constant",
+                "value": 1.15
+              },
+              "banding": {
+                "dist": "constant",
+                "value": 1.12
+              },
+              "bad_pixels": {
+                "dist": "constant",
+                "value": 1.2
+              },
+              "chroma": {
+                "dist": "constant",
+                "value": 1.65
+              },
+              "shadow_luma": {
+                "dist": "constant",
+                "value": 1.38
+              },
+              "modulation": {
+                "dist": "constant",
+                "value": 1.3
+              }
+            },
+            "limits": {
+              "min_factor": {
+                "dist": "constant",
+                "value": 0.2
+              },
+              "max_factor": {
+                "dist": "constant",
+                "value": 3
+              },
+              "max_bad_pixel_probability": {
+                "dist": "constant",
+                "value": 0.00008
+              }
+            }
           }
         },
         "isp": {
@@ -1294,26 +2197,31 @@
           },
           "local_contrast_strength": {
             "dist": "uniform",
-            "min": 0.0,
+            "min": 0,
             "max": 0.05
           },
           "sharpen_amount": {
             "dist": "uniform",
-            "min": 0.0,
+            "min": 0,
             "max": 0.12
           },
           "saturation": {
             "dist": "uniform",
             "min": 0.42,
             "max": 0.65
+          },
+          "tone_map_strength": {
+            "dist": "uniform",
+            "min": 1.05,
+            "max": 1.22
           }
         },
         "transport": {
           "jpeg": {
             "quality": {
-                "dist": "uniform",
-                "min": 62.0,
-                "max": 84.0
+              "dist": "uniform",
+              "min": 62,
+              "max": 84
             }
           }
         }
@@ -1339,16 +2247,16 @@
     "heterogeneous_k_ls": {
       "visibility_m": {
         "dist": "normal",
-        "mean": 42.0,
-        "std": 11.0,
-        "min": 22.0,
-        "max": 72.0
+        "mean": 42,
+        "std": 11,
+        "min": 22,
+        "max": 72
       },
       "atmospheric_light": "dcp_heuristic",
       "airlight_dampening": {
         "enabled": true,
         "apply_to": "estimated",
-        "reference_visibility_m": 90.0,
+        "reference_visibility_m": 90,
         "min_factor": {
           "dist": "uniform",
           "min": 0.22,
@@ -1361,7 +2269,7 @@
         },
         "strength": {
           "dist": "uniform",
-          "min": 2.0,
+          "min": 2,
           "max": 3.2
         }
       },
@@ -1405,7 +2313,7 @@
           },
           "normalize_to_mean": true,
           "fog_opacity_weight": 0.65,
-          "fog_opacity_gamma": 1.0
+          "fog_opacity_gamma": 1
         }
       }
     }
