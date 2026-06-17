@@ -1,6 +1,6 @@
 [project]
 name = "euler-preprocess"
-version = "3.6.0"
+version = "3.7.0"
 description = "Physics-based preprocessing (fog, etc.) for RGB+depth datasets"
 readme = "README.md"
 requires-python = ">=3.9"

@@ -151,8 +151,21 @@ def test_dense_gloomy_scenario_profiles_render_real_drive_sim_samples(
         assert metrics["severe_low_contrast_sensor_stress"]["luma_mean"] < (
             metrics["clear_high_visibility_daylight_reference"]["luma_mean"] * 0.65
         )
+        chromatically_bounded_profiles = SCENARIO_ORDER[:3]
         assert all(
-            0.75 <= row["blue_red_ratio"] <= 1.65 for row in metrics.values()
+            0.75 <= metrics[name]["blue_red_ratio"] <= 1.65
+            for name in chromatically_bounded_profiles
+        ), {sample["id"]: metrics}
+
+        # The underexposed profiles can drive red near the black/noise floor,
+        # so a blue/red ratio is not stable there. Bound absolute blue bias
+        # instead to keep the stress profile from becoming a blue wash.
+        stress_profiles = SCENARIO_ORDER[3:]
+        assert all(
+            metrics[name]["blue_minus_red_mean"] <= 0.25 for name in stress_profiles
+        ), {sample["id"]: metrics}
+        assert all(
+            metrics[name]["blue_minus_red_p95"] <= 0.70 for name in stress_profiles
         ), {sample["id"]: metrics}
 
 
@@ -361,6 +374,8 @@ def _render_scenario_metrics(
             "opacity_p95": float(np.percentile(opacity, 95.0)),
             "luma_mean": _mean_luminance(image),
             "blue_red_ratio": _blue_red_ratio(image),
+            "blue_minus_red_mean": _blue_minus_red_mean(image),
+            "blue_minus_red_p95": _blue_minus_red_p95(image),
         }
     return metrics
 
@@ -376,6 +391,16 @@ def _blue_red_ratio(image: np.ndarray) -> float:
     red = float(arr[..., 0].mean())
     blue = float(arr[..., 2].mean())
     return blue / max(red, 1e-6)
+
+
+def _blue_minus_red_mean(image: np.ndarray) -> float:
+    arr = np.asarray(image, dtype=np.float32)
+    return float((arr[..., 2] - arr[..., 0]).mean())
+
+
+def _blue_minus_red_p95(image: np.ndarray) -> float:
+    arr = np.asarray(image, dtype=np.float32)
+    return float(np.percentile(arr[..., 2] - arr[..., 0], 95.0))
 
 
 def _truthy_env(name: str) -> bool:
