@@ -158,14 +158,18 @@ def test_dense_gloomy_scenario_profiles_render_real_drive_sim_samples(
         ), {sample["id"]: metrics}
 
         # The underexposed profiles can drive red near the black/noise floor,
-        # so a blue/red ratio is not stable there. Bound absolute blue bias
-        # instead to keep the stress profile from becoming a blue wash.
+        # so a blue/red ratio is not stable for the severe case. Bound
+        # absolute blue bias instead to keep the stress profile from becoming
+        # a blue wash.
+        assert metrics["underexposed_dense_gloom"]["blue_red_ratio"] <= 2.5, {
+            sample["id"]: metrics
+        }
         stress_profiles = SCENARIO_ORDER[3:]
         assert all(
-            metrics[name]["blue_minus_red_mean"] <= 0.25 for name in stress_profiles
+            metrics[name]["blue_minus_red_mean"] <= 0.1 for name in stress_profiles
         ), {sample["id"]: metrics}
         assert all(
-            metrics[name]["blue_minus_red_p95"] <= 0.70 for name in stress_profiles
+            metrics[name]["blue_minus_red_p95"] <= 0.45 for name in stress_profiles
         ), {sample["id"]: metrics}
 
 

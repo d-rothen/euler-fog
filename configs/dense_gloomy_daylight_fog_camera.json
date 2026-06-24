@@ -637,23 +637,23 @@
               },
               "chroma_sigma": {
                 "dist": "uniform",
-                "min": 0.018,
-                "max": 0.045
+                "min": 0.016,
+                "max": 0.04
               },
               "red_chroma_gain": {
                 "dist": "uniform",
-                "min": 0.55,
-                "max": 0.9
+                "min": 0.9,
+                "max": 1.2
               },
               "blue_chroma_gain": {
                 "dist": "uniform",
-                "min": 2.2,
-                "max": 3.6
+                "min": 1.2,
+                "max": 1.95
               },
               "chroma_axis_correlation": {
                 "dist": "uniform",
-                "min": 0.08,
-                "max": 0.32
+                "min": 0.02,
+                "max": 0.2
               },
               "chroma_luminance_preservation": 1,
               "blotch_sigma": {
@@ -1718,18 +1718,24 @@
               "max": 0.22
             },
             "sky_weight": 0,
-            "min_radiance_scale": 0.08
+            "min_radiance_scale": 0.09
           }
         }
       },
       "capture_overrides": {
         "sensor": {
           "condition_profile": "underexposed_noisy",
+          "white_balance": [
+            1.05,
+            1,
+            0.94
+          ],
+          "white_balance_jitter": 0.025,
           "auto_exposure": {
             "target_luminance": {
               "dist": "uniform",
-              "min": 0.07,
-              "max": 0.115
+              "min": 0.085,
+              "max": 0.13
             },
             "highlight_target": {
               "dist": "uniform",
@@ -1737,15 +1743,15 @@
               "max": 0.88
             },
             "highlight_protection": 0.68,
-            "max_gain": 1.35,
+            "max_gain": 1.5,
             "exposure_compensation_ev": {
               "dist": "uniform",
-              "min": -1.12,
-              "max": -0.58
+              "min": -0.9,
+              "max": -0.4
             },
-            "max_iso": 900,
-            "dark_iso_boost": 0.2,
-            "fog_iso_boost": 0.12,
+            "max_iso": 1000,
+            "dark_iso_boost": 0.24,
+            "fog_iso_boost": 0.14,
             "enabled": true,
             "metering": "fog_aware_center_weighted",
             "manual_gain_weight": 0,
@@ -1771,7 +1777,7 @@
           "noise_adjustment": {
             "enabled": true,
             "level": 1.42,
-            "static_chroma_bias": 0.45,
+            "static_chroma_bias": 0.22,
             "groups": {
               "read": {
                 "dist": "constant",
@@ -1791,7 +1797,7 @@
               },
               "chroma": {
                 "dist": "constant",
-                "value": 1.38
+                "value": 1.2
               },
               "shadow_luma": {
                 "dist": "constant",
@@ -1831,8 +1837,8 @@
           },
           "saturation": {
             "dist": "uniform",
-            "min": 0.48,
-            "max": 0.72
+            "min": 0.46,
+            "max": 0.68
           },
           "tone_map_strength": {
             "dist": "uniform",
@@ -2009,7 +2015,7 @@
               "max": 0.3
             },
             "sky_weight": 0,
-            "min_radiance_scale": 0.07
+            "min_radiance_scale": 0.095
           }
         }
       },
@@ -2096,11 +2102,17 @@
         },
         "sensor": {
           "condition_profile": "underexposed_noisy",
+          "white_balance": [
+            1.14,
+            1.02,
+            0.88
+          ],
+          "white_balance_jitter": 0.025,
           "auto_exposure": {
             "target_luminance": {
               "dist": "uniform",
-              "min": 0.058,
-              "max": 0.098
+              "min": 0.082,
+              "max": 0.125
             },
             "highlight_target": {
               "dist": "uniform",
@@ -2108,15 +2120,15 @@
               "max": 0.82
             },
             "highlight_protection": 0.62,
-            "max_gain": 1.25,
+            "max_gain": 1.55,
             "exposure_compensation_ev": {
               "dist": "uniform",
-              "min": -1.35,
-              "max": -0.78
+              "min": -0.95,
+              "max": -0.48
             },
-            "max_iso": 1000,
-            "dark_iso_boost": 0.24,
-            "fog_iso_boost": 0.14,
+            "max_iso": 1200,
+            "dark_iso_boost": 0.3,
+            "fog_iso_boost": 0.18,
             "enabled": true,
             "metering": "fog_aware_center_weighted",
             "manual_gain_weight": 0,
@@ -2142,7 +2154,7 @@
           "noise_adjustment": {
             "enabled": true,
             "level": 1.72,
-            "static_chroma_bias": 0.58,
+            "static_chroma_bias": 0.24,
             "groups": {
               "read": {
                 "dist": "constant",
@@ -2162,7 +2174,7 @@
               },
               "chroma": {
                 "dist": "constant",
-                "value": 1.65
+                "value": 1.28
               },
               "shadow_luma": {
                 "dist": "constant",
@@ -2207,8 +2219,8 @@
           },
           "saturation": {
             "dist": "uniform",
-            "min": 0.42,
-            "max": 0.65
+            "min": 0.38,
+            "max": 0.58
           },
           "tone_map_strength": {
             "dist": "uniform",
@@ -2236,11 +2248,11 @@
     "patch_size": 15,
     "top_percent": 0.001,
     "white_bias": 0.03,
-    "cool_bias": 0.18,
+    "cool_bias": 0.13,
     "cool_target": [
-      0.82,
+      0.83,
       0.87,
-      0.9
+      0.89
     ]
   },
   "models": {
