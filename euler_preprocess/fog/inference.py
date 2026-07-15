@@ -301,33 +301,23 @@ def _render_gpu(
         depth_t = planar_to_radial_depth_torch(depth_t, K_t)
 
     sky_mask_t = torch.from_numpy(sky_mask).to(device=device, dtype=torch.bool)
-    estimated_airlight = (
-        torch.zeros(3, device=device, dtype=torch.float32)
-        if plan.clear_weather
-        else transform._estimate_airlight_torch(
-            rgb_t,
-            sky_mask_t,
-            sample_id=sample_id,
-            method=plan.airlight_method,
-        )
-    )
     torch_gen = torch_generator_for_index(
         transform.torch_device,
         transform.seed,
         transform.base_rng,
         sample_index,
     )
-    foggy_t, beta, airlight_t, k_map_t, ls_map_t = transform._apply_model_torch(
+    foggy_t, beta, airlight_t, k_map_t, ls_map_t = transform._process_torch_pipeline(
         rgb_t,
         depth_t,
+        sky_mask_t,
         plan.model_name,
         plan.model_cfg,
         rng,
-        estimated_airlight,
         torch_gen,
         sample_id=sample_id,
         intrinsics=intrinsics_np,
-        depth_m=depth_t,
+        airlight_method=plan.airlight_method,
         capture_artifacts=plan.capture_artifacts,
         clear_weather=plan.clear_weather,
     )

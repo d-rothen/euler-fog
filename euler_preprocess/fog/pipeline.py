@@ -5,7 +5,12 @@ from typing import Any
 
 import numpy as np
 
-from euler_preprocess.common.color import linear_to_srgb, srgb_to_linear
+from euler_preprocess.common.color import (
+    linear_to_srgb,
+    linear_to_srgb_torch,
+    srgb_to_linear,
+    srgb_to_linear_torch,
+)
 from euler_preprocess.fog.atmospheric_light import AtmosphericLightResolver
 from euler_preprocess.fog.capture import CaptureArtifactPipeline, CaptureContext
 from euler_preprocess.fog.models import apply_model
@@ -71,9 +76,7 @@ class FogProcessingPipeline:
         sample_id: str | None,
         airlight_method: str | None = None,
     ) -> FogPipelineResult:
-        render_input_space = _normalize_render_input_space(
-            model_cfg.get("render_input_space", self.render_input_space)
-        )
+        render_input_space = self.render_input_space_for(model_cfg)
         rgb_for_render = srgb_to_linear(rgb) if render_input_space == "srgb" else rgb
         estimated_airlight = self.atmospheric_light.estimate_np(
             rgb_for_render,
@@ -99,6 +102,61 @@ class FogProcessingPipeline:
             airlight=airlight,
             k_map=k_map,
             ls_map=ls_map,
+        )
+
+    def render_input_space_for(self, model_cfg: dict) -> str:
+        """Resolve the input encoding used by both scene-rendering backends."""
+        return _normalize_render_input_space(
+            model_cfg.get("render_input_space", self.render_input_space)
+        )
+
+    def prepare_render_rgb_torch(self, rgb, model_cfg: dict):
+        """Convert display RGB to the scene-linear domain when configured."""
+        if self.render_input_space_for(model_cfg) == "srgb":
+            return srgb_to_linear_torch(rgb)
+        return rgb
+
+    def restore_render_rgb_torch(
+        self,
+        rgb,
+        model_cfg: dict,
+        *,
+        clear_weather: bool = False,
+    ):
+        """Return a rendered Torch image to the CPU pathway's output domain."""
+        if not clear_weather and self.render_input_space_for(model_cfg) == "srgb":
+            return linear_to_srgb_torch(rgb)
+        return rgb
+
+    def capture_context(
+        self,
+        *,
+        sample_id: str | None,
+        rng: np.random.Generator,
+        model_cfg: dict,
+        sky_mask,
+        airlight,
+        intrinsics=None,
+        depth_m=None,
+        k_map=None,
+        device=None,
+    ) -> CaptureContext:
+        """Build the complete capture context shared by CPU and Torch routes."""
+        return CaptureContext(
+            sample_id=sample_id,
+            rng=rng,
+            device=device,
+            intrinsics=intrinsics,
+            depth_m=depth_m,
+            k_map=k_map,
+            attributes={
+                "sky_mask": sky_mask,
+                "airlight": airlight,
+                "render_input_space": model_cfg.get(
+                    "render_input_space",
+                    self.render_input_space,
+                ),
+            },
         )
 
     def process_np(
@@ -138,20 +196,15 @@ class FogProcessingPipeline:
             )
         return self.apply_capture_np(
             result,
-            context=CaptureContext(
+            context=self.capture_context(
                 sample_id=sample_id,
                 rng=rng,
+                model_cfg=model_cfg,
+                sky_mask=sky_mask,
+                airlight=result.airlight,
                 intrinsics=intrinsics,
                 depth_m=depth_m,
                 k_map=result.k_map,
-                attributes={
-                    "sky_mask": sky_mask,
-                    "airlight": result.airlight,
-                    "render_input_space": model_cfg.get(
-                        "render_input_space",
-                        self.render_input_space,
-                    ),
-                },
             ),
             capture_artifacts=capture_artifacts,
         )

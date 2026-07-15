@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import math
+from typing import Any
 
 import numpy as np
 
@@ -1088,6 +1089,115 @@ def apply_scene_illumination_np(
     return (radiance * scale[..., None]).astype(np.float32, copy=False), ev_map
 
 
+def apply_scene_illumination_torch(
+    rgb_lin: "torch.Tensor",
+    depth_m: "torch.Tensor",
+    k_field,
+    model_cfg: dict,
+    rng: np.random.Generator,
+    sky_mask: "torch.Tensor | None" = None,
+) -> tuple["torch.Tensor", "torch.Tensor"]:
+    """Torch equivalent of :func:`apply_scene_illumination_np`."""
+    height, width = int(depth_m.shape[0]), int(depth_m.shape[1])
+    cfg = _resolve_scene_illumination_config(model_cfg)
+    enabled = cfg.get("enabled", False)
+    if not isinstance(enabled, bool):
+        raise ValueError("scene_illumination.enabled must be a boolean")
+    if not enabled:
+        return rgb_lin.to(dtype=torch.float32), torch.zeros(
+            (height, width),
+            device=rgb_lin.device,
+            dtype=torch.float32,
+        )
+
+    global_ev = _sample_float(
+        cfg.get("global_ev", 0.0),
+        rng,
+        "scene_illumination.global_ev",
+    )
+    near_ev = _sample_float(
+        cfg.get("near_ev", 0.0),
+        rng,
+        "scene_illumination.near_ev",
+    )
+    decay_depth = max(
+        _sample_float(
+            cfg.get("near_decay_depth_m", 15.0),
+            rng,
+            "scene_illumination.near_decay_depth_m",
+        ),
+        1e-6,
+    )
+    fog_ev = _sample_float(
+        cfg.get("fog_coupled_ev", 0.0),
+        rng,
+        "scene_illumination.fog_coupled_ev",
+    )
+
+    depth = _sanitize_depth_torch(depth_m).to(
+        device=rgb_lin.device,
+        dtype=rgb_lin.dtype,
+    )
+    k_map = torch.clamp(
+        broadcast_k_field_torch(
+            k_field,
+            height,
+            width,
+            device=rgb_lin.device,
+            dtype=rgb_lin.dtype,
+        ),
+        min=0.0,
+    )
+    near_weight = torch.exp(-depth / decay_depth)
+    fog_opacity = 1.0 - torch.exp(-k_map * depth)
+    ev_map = (
+        global_ev + near_ev * near_weight + fog_ev * torch.clamp(fog_opacity, 0.0, 1.0)
+    )
+
+    if sky_mask is not None:
+        sky = torch.as_tensor(
+            sky_mask,
+            device=rgb_lin.device,
+            dtype=rgb_lin.dtype,
+        )
+        if tuple(sky.shape) != (height, width):
+            raise ValueError(
+                f"sky_mask must have shape ({height}, {width}); got {tuple(sky.shape)}"
+            )
+        sky_weight = float(
+            np.clip(
+                _sample_float(
+                    cfg.get("sky_weight", 0.0),
+                    rng,
+                    "scene_illumination.sky_weight",
+                ),
+                0.0,
+                1.0,
+            )
+        )
+        ev_map = ev_map * (1.0 - torch.clamp(sky, 0.0, 1.0) * (1.0 - sky_weight))
+
+    min_scale = max(
+        _sample_float(
+            cfg.get("min_radiance_scale", 0.08),
+            rng,
+            "scene_illumination.min_radiance_scale",
+        ),
+        0.0,
+    )
+    scale = torch.maximum(
+        torch.exp2(-ev_map),
+        torch.full_like(ev_map, min_scale),
+    )
+    radiance = torch.nan_to_num(
+        rgb_lin.to(dtype=torch.float32),
+        nan=0.0,
+        posinf=1.0,
+        neginf=0.0,
+    )
+    return radiance * scale[..., None], ev_map
+
+
 def _apply_scene_airlight_dampening_np(
     ls_field: np.ndarray,
     ev_map: np.ndarray,
@@ -1107,6 +1217,33 @@ def _apply_scene_airlight_dampening_np(
     scale = np.exp2(-np.maximum(ev_map, 0.0) * ratio).astype(np.float32, copy=False)
     ls_map = broadcast_ls_field(ls_field, ev_map.shape[0], ev_map.shape[1])
     return np.clip(ls_map * scale[..., None], 0.0, 1.0).astype(np.float32, copy=False)
+
+
+def _apply_scene_airlight_dampening_torch(
+    ls_field: "torch.Tensor",
+    ev_map: "torch.Tensor",
+    model_cfg: dict,
+    rng: np.random.Generator,
+) -> "torch.Tensor":
+    cfg = _resolve_scene_illumination_config(model_cfg)
+    if not bool(cfg.get("enabled", False)):
+        return ls_field.to(dtype=torch.float32)
+    ratio = _sample_float(
+        cfg.get("airlight_ev_ratio", 0.0),
+        rng,
+        "scene_illumination.airlight_ev_ratio",
+    )
+    if ratio <= 0.0:
+        return ls_field.to(dtype=torch.float32)
+    scale = torch.exp2(-torch.clamp(ev_map, min=0.0) * ratio)
+    ls_map = broadcast_ls_field_torch(
+        ls_field,
+        int(ev_map.shape[0]),
+        int(ev_map.shape[1]),
+        device=ev_map.device,
+        dtype=ev_map.dtype,
+    )
+    return torch.clamp(ls_map * scale[..., None], 0.0, 1.0)
 
 
 def apply_fog(
@@ -1138,6 +1275,127 @@ def apply_fog_torch(
     if t.ndim in (2, 3):
         t = t.unsqueeze(-1)
     return rgb * t + ls_field * (1.0 - t)
+
+
+def broadcast_k_field_torch(
+    k_field,
+    height: int,
+    width: int,
+    *,
+    device,
+    dtype,
+) -> "torch.Tensor":
+    """Return ``k_field`` as a Torch ``(H, W)`` map."""
+    field = torch.as_tensor(k_field, device=device, dtype=dtype)
+    if field.ndim == 0:
+        return field.expand(height, width)
+    if tuple(field.shape) == (height, width):
+        return field
+    raise ValueError(
+        f"k_field must be scalar or shape ({height}, {width}); got {tuple(field.shape)}"
+    )
+
+
+def broadcast_ls_field_torch(
+    ls_field,
+    height: int,
+    width: int,
+    *,
+    device,
+    dtype,
+) -> "torch.Tensor":
+    """Return ``ls_field`` as a Torch ``(H, W, 3)`` map."""
+    field = torch.as_tensor(ls_field, device=device, dtype=dtype)
+    if tuple(field.shape) == (3,):
+        return field.view(1, 1, 3).expand(height, width, 3)
+    if tuple(field.shape) == (1, 1, 3):
+        return field.expand(height, width, 3)
+    if tuple(field.shape) == (height, width, 3):
+        return field
+    raise ValueError(
+        f"ls_field must have shape (3,), (1, 1, 3), or "
+        f"({height}, {width}, 3); got {tuple(field.shape)}"
+    )
+
+
+def render_fog_fields_np(
+    rgb: np.ndarray,
+    depth_m: np.ndarray,
+    k_field,
+    ls_field: np.ndarray,
+    model_cfg: dict,
+    rng: np.random.Generator,
+    *,
+    sky_mask: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Render resolved fog fields with the shared CPU scene semantics."""
+    height, width = depth_m.shape
+    scene_rgb, ev_map = apply_scene_illumination_np(
+        rgb,
+        depth_m,
+        k_field,
+        model_cfg,
+        rng,
+        sky_mask=sky_mask,
+    )
+    rendered_ls_field = _apply_scene_airlight_dampening_np(
+        ls_field,
+        ev_map,
+        model_cfg,
+        rng,
+    )
+    foggy = apply_fog(scene_rgb, depth_m, k_field, rendered_ls_field)
+    return (
+        foggy,
+        broadcast_k_field(k_field, height, width),
+        broadcast_ls_field(rendered_ls_field, height, width),
+    )
+
+
+def render_fog_fields_torch(
+    rgb: "torch.Tensor",
+    depth_m: "torch.Tensor",
+    k_field,
+    ls_field: "torch.Tensor",
+    model_cfg: dict,
+    rng: np.random.Generator,
+    *,
+    sky_mask: "torch.Tensor | None" = None,
+) -> tuple["torch.Tensor", "torch.Tensor", "torch.Tensor"]:
+    """Render resolved fog fields with CPU-equivalent Torch semantics."""
+    height, width = int(depth_m.shape[0]), int(depth_m.shape[1])
+    scene_rgb, ev_map = apply_scene_illumination_torch(
+        rgb,
+        depth_m,
+        k_field,
+        model_cfg,
+        rng,
+        sky_mask=sky_mask,
+    )
+    rendered_ls_field = _apply_scene_airlight_dampening_torch(
+        ls_field,
+        ev_map,
+        model_cfg,
+        rng,
+    )
+    foggy = apply_fog_torch(scene_rgb, depth_m, k_field, rendered_ls_field)
+    return (
+        foggy,
+        broadcast_k_field_torch(
+            k_field,
+            height,
+            width,
+            device=rgb.device,
+            dtype=rgb.dtype,
+        ),
+        broadcast_ls_field_torch(
+            rendered_ls_field,
+            height,
+            width,
+            device=rgb.device,
+            dtype=rgb.dtype,
+        ),
+    )
 
 
 def select_model(config: dict, rng: np.random.Generator) -> str:
@@ -1288,16 +1546,13 @@ def apply_model(
     else:
         ls_field = ls_base.reshape(1, 1, 3)
 
-    scene_rgb, ev_map = apply_scene_illumination_np(
+    foggy, k_map, ls_map = render_fog_fields_np(
         rgb,
         depth_m,
         k_field,
+        ls_field,
         model_cfg,
         rng,
         sky_mask=sky_mask,
     )
-    ls_field = _apply_scene_airlight_dampening_np(ls_field, ev_map, model_cfg, rng)
-    foggy = apply_fog(scene_rgb, depth_m, k_field, ls_field)
-    k_map = broadcast_k_field(k_field, height, width)
-    ls_map = broadcast_ls_field(ls_field, height, width)
     return foggy, k_mean, ls_base, k_map, ls_map

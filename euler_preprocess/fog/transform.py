@@ -39,16 +39,16 @@ from euler_preprocess.fog.augmentations import (
     FogAugmentationSpec,
     parse_fog_augmentations,
 )
-from euler_preprocess.fog.capture import CaptureArtifactPipeline, CaptureContext
+from euler_preprocess.fog.capture import CaptureArtifactPipeline
 from euler_preprocess.fog.logging import log_config
 from euler_preprocess.fog.models import (
     AIRLIGHT_METHODS,
     DEFAULT_CONTRAST_THRESHOLD,
     DEFAULT_MODEL_CONFIGS,
-    apply_fog_torch,
     apply_ls_gradient_torch,
     modulate_with_noise_torch,
     prepare_noise_field_torch,
+    render_fog_fields_torch,
     resolve_scattering_coefficient,
     resolve_model_config,
     resolve_scales,
@@ -1544,6 +1544,54 @@ class FogTransform(Transform):
         self._finalize_backends()
         return saved_paths
 
+    def _process_torch_pipeline(
+        self,
+        rgb_t: "torch.Tensor",
+        depth_t: "torch.Tensor",
+        sky_mask_t: "torch.Tensor",
+        model_name: str,
+        model_cfg: dict,
+        rng: np.random.Generator,
+        torch_gen: "torch.Generator",
+        *,
+        sample_id: str | None = None,
+        intrinsics: np.ndarray | None = None,
+        airlight_method: str | None = None,
+        capture_artifacts: CaptureArtifactPipeline | None = None,
+        clear_weather: bool = False,
+    ) -> tuple["torch.Tensor", float, "torch.Tensor", "torch.Tensor", "torch.Tensor"]:
+        """Run the complete Torch render using the CPU pipeline's semantics."""
+        rgb_for_render = (
+            rgb_t
+            if clear_weather
+            else self.pipeline.prepare_render_rgb_torch(rgb_t, model_cfg)
+        )
+        estimated_airlight = (
+            torch.zeros(3, device=rgb_t.device, dtype=torch.float32)
+            if clear_weather
+            else self._estimate_airlight_torch(
+                rgb_for_render,
+                sky_mask_t,
+                sample_id=sample_id,
+                method=airlight_method,
+            )
+        )
+        return self._apply_model_torch(
+            rgb_for_render,
+            depth_t,
+            model_name,
+            model_cfg,
+            rng,
+            estimated_airlight,
+            torch_gen,
+            sample_id=sample_id,
+            intrinsics=intrinsics,
+            depth_m=depth_t,
+            sky_mask=sky_mask_t,
+            capture_artifacts=capture_artifacts,
+            clear_weather=clear_weather,
+        )
+
     def _apply_model_torch(
         self,
         rgb_t: "torch.Tensor",
@@ -1556,11 +1604,10 @@ class FogTransform(Transform):
         sample_id: str | None = None,
         intrinsics: np.ndarray | None = None,
         depth_m: Any | None = None,
+        sky_mask: Any | None = None,
         capture_artifacts: CaptureArtifactPipeline | None = None,
         clear_weather: bool = False,
-    ) -> tuple[
-        "torch.Tensor", float, "torch.Tensor", "torch.Tensor", "torch.Tensor"
-    ]:
+    ) -> tuple["torch.Tensor", float, "torch.Tensor", "torch.Tensor", "torch.Tensor"]:
         if clear_weather:
             height = int(depth_t.shape[0])
             width = int(depth_t.shape[1])
@@ -1583,9 +1630,12 @@ class FogTransform(Transform):
                 ls_map,
                 rng=rng,
                 sample_id=sample_id,
+                model_cfg=model_cfg,
+                sky_mask=sky_mask,
                 intrinsics=intrinsics,
-                depth_m=depth_m,
+                depth_m=depth_t if depth_m is None else depth_m,
                 capture_artifacts=capture_artifacts,
+                clear_weather=True,
             )
         if model_name not in DEFAULT_MODEL_CONFIGS:
             raise ValueError(f"Unsupported fog model: {model_name}")
@@ -1598,24 +1648,6 @@ class FogTransform(Transform):
         )
         height = int(depth_t.shape[0])
         width = int(depth_t.shape[1])
-
-        if model_name == "uniform":
-            ls_field = ls_base.view(1, 1, 3)
-            foggy = apply_fog_torch(rgb_t, depth_t, k_mean, ls_field)
-            k_map = self._broadcast_k_map_torch(k_mean, height, width)
-            ls_map = self._broadcast_ls_map_torch(ls_base, height, width)
-            return self._finalize_torch_pipeline_result(
-                foggy,
-                k_mean,
-                ls_base,
-                k_map,
-                ls_map,
-                rng=rng,
-                sample_id=sample_id,
-                intrinsics=intrinsics,
-                depth_m=depth_m,
-                capture_artifacts=capture_artifacts,
-            )
 
         if model_name in ("heterogeneous_k", "heterogeneous_k_ls"):
             k_cfg = model_cfg.get("k_hetero", {})
@@ -1672,9 +1704,15 @@ class FogTransform(Transform):
         else:
             ls_field = ls_base.view(1, 1, 3)
 
-        foggy = apply_fog_torch(rgb_t, depth_t, k_field, ls_field)
-        k_map = self._broadcast_k_map_torch(k_field, height, width)
-        ls_map = self._broadcast_ls_map_torch(ls_field, height, width)
+        foggy, k_map, ls_map = render_fog_fields_torch(
+            rgb_t,
+            depth_t,
+            k_field,
+            ls_field,
+            model_cfg,
+            rng,
+            sky_mask=sky_mask,
+        )
         return self._finalize_torch_pipeline_result(
             foggy,
             k_mean,
@@ -1683,8 +1721,10 @@ class FogTransform(Transform):
             ls_map,
             rng=rng,
             sample_id=sample_id,
+            model_cfg=model_cfg,
+            sky_mask=sky_mask,
             intrinsics=intrinsics,
-            depth_m=depth_m,
+            depth_m=depth_t if depth_m is None else depth_m,
             capture_artifacts=capture_artifacts,
         )
 
@@ -1698,14 +1738,19 @@ class FogTransform(Transform):
         *,
         rng: np.random.Generator,
         sample_id: str | None,
+        model_cfg: dict,
+        sky_mask: Any | None,
         intrinsics: np.ndarray | None = None,
         depth_m: Any | None = None,
         capture_artifacts: CaptureArtifactPipeline | None = None,
-    ) -> tuple[
-        "torch.Tensor", float, "torch.Tensor", "torch.Tensor", "torch.Tensor"
-    ]:
+        clear_weather: bool = False,
+    ) -> tuple["torch.Tensor", float, "torch.Tensor", "torch.Tensor", "torch.Tensor"]:
         result = FogPipelineResult(
-            rgb=foggy,
+            rgb=self.pipeline.restore_render_rgb_torch(
+                foggy,
+                model_cfg,
+                clear_weather=clear_weather,
+            ),
             beta=beta,
             airlight=airlight,
             k_map=k_map,
@@ -1713,10 +1758,13 @@ class FogTransform(Transform):
         )
         result = self.pipeline.apply_capture_torch(
             result,
-            context=CaptureContext(
+            context=self.pipeline.capture_context(
                 sample_id=sample_id,
                 rng=rng,
-                device=self.torch_device,
+                model_cfg=model_cfg,
+                sky_mask=sky_mask,
+                airlight=airlight,
+                device=foggy.device,
                 intrinsics=intrinsics,
                 depth_m=depth_m,
                 k_map=k_map,
@@ -1724,30 +1772,6 @@ class FogTransform(Transform):
             capture_artifacts=capture_artifacts,
         )
         return result.rgb, result.beta, result.airlight, result.k_map, result.ls_map
-
-    def _broadcast_k_map_torch(
-        self, k_field, height: int, width: int
-    ) -> "torch.Tensor":
-        if torch.is_tensor(k_field) and k_field.shape == (height, width):
-            return k_field.to(dtype=torch.float32)
-        return torch.full(
-            (height, width),
-            float(k_field if not torch.is_tensor(k_field) else k_field.item()),
-            device=self.torch_device,
-            dtype=torch.float32,
-        )
-
-    def _broadcast_ls_map_torch(
-        self, ls_field, height: int, width: int
-    ) -> "torch.Tensor":
-        if torch.is_tensor(ls_field) and ls_field.shape == (height, width, 3):
-            return ls_field.to(dtype=torch.float32)
-        # ls_field is (3,) base or (1, 1, 3) view — expand to full size.
-        if torch.is_tensor(ls_field):
-            base = ls_field.reshape(3)
-        else:
-            base = torch.tensor(ls_field, device=self.torch_device, dtype=torch.float32)
-        return base.view(1, 1, 3).expand(height, width, 3).to(dtype=torch.float32)
 
     def _generate_fog_gpu(self, samples: Iterable[dict]) -> list[Path]:
         if torch is None or self.torch_device is None:
@@ -1814,17 +1838,26 @@ class FogTransform(Transform):
                     grouped.setdefault(shape, []).append(item)
 
                 for group_items in grouped.values():
-                    uniform_groups: dict[int, list[dict]] = {}
+                    uniform_groups: dict[tuple[int, int, str | None], list[dict]] = {}
                     other_items = []
                     for item in group_items:
-                        if item["clear_weather"] or item["model_name"] != "uniform":
+                        if (
+                            item["clear_weather"]
+                            or item["model_name"] != "uniform"
+                            or self.seed is None
+                        ):
                             other_items.append(item)
                             continue
                         capture_artifacts = item.get("capture_artifacts")
                         capture_key = (
                             0 if capture_artifacts is None else id(capture_artifacts)
                         )
-                        uniform_groups.setdefault(capture_key, []).append(item)
+                        group_key = (
+                            capture_key,
+                            id(item["model_cfg"]),
+                            item.get("airlight_method"),
+                        )
+                        uniform_groups.setdefault(group_key, []).append(item)
 
                     for uniform_items in uniform_groups.values():
                         rgb_batch = torch.stack(
@@ -1833,6 +1866,10 @@ class FogTransform(Transform):
                                 for item in uniform_items
                             ],
                             dim=0,
+                        )
+                        rgb_batch = self.pipeline.prepare_render_rgb_torch(
+                            rgb_batch,
+                            uniform_items[0]["model_cfg"],
                         )
                         depth_tensors = []
                         for item in uniform_items:
@@ -1852,8 +1889,6 @@ class FogTransform(Transform):
                                 )
                                 depth_t = planar_to_radial_depth_torch(depth_t, K_t)
                             depth_tensors.append(depth_t)
-                        depth_batch = torch.stack(depth_tensors, dim=0)
-
                         k_means, ls_base = (
                             self.atmospheric_light.resolve_uniform_batch_torch(
                                 rgb_batch=rgb_batch,
@@ -1865,37 +1900,48 @@ class FogTransform(Transform):
                                 method=uniform_items[0].get("airlight_method"),
                             )
                         )
-                        k_tensor = torch.tensor(
-                            k_means, device=device, dtype=rgb_batch.dtype
+                        rendered = [
+                            render_fog_fields_torch(
+                                rgb_batch[idx],
+                                depth_tensors[idx],
+                                k_means[idx],
+                                ls_base[idx].view(1, 1, 3),
+                                item["model_cfg"],
+                                item["rng"],
+                                sky_mask=torch.from_numpy(item["sky_mask"]).to(
+                                    device=device,
+                                    dtype=torch.bool,
+                                ),
+                            )
+                            for idx, item in enumerate(uniform_items)
+                        ]
+                        foggy = torch.stack([result[0] for result in rendered], dim=0)
+                        k_maps = [result[1] for result in rendered]
+                        ls_maps = [result[2] for result in rendered]
+                        foggy = self.pipeline.restore_render_rgb_torch(
+                            foggy,
+                            uniform_items[0]["model_cfg"],
                         )
-                        t = torch.exp(-depth_batch * k_tensor[:, None, None])
-                        foggy = rgb_batch * t[..., None] + ls_base[
-                            :, None, None, :
-                        ] * (1.0 - t[..., None])
                         capture_artifacts = uniform_items[0].get("capture_artifacts")
                         foggy = self.pipeline.apply_capture_torch_batch(
                             foggy,
                             contexts=tuple(
-                                CaptureContext(
+                                self.pipeline.capture_context(
                                     sample_id=item["sample_id"],
                                     rng=item["rng"],
+                                    model_cfg=item["model_cfg"],
+                                    sky_mask=item["sky_mask"],
+                                    airlight=ls_base[idx],
                                     device=device,
                                     intrinsics=item.get("intrinsics"),
                                     depth_m=depth_tensors[idx],
-                                    k_map=torch.full(
-                                        depth_tensors[idx].shape,
-                                        float(k_means[idx]),
-                                        device=device,
-                                        dtype=depth_tensors[idx].dtype,
-                                    ),
+                                    k_map=k_maps[idx],
                                 )
                                 for idx, item in enumerate(uniform_items)
                             ),
                             capture_artifacts=capture_artifacts,
                         )
 
-                        height = int(rgb_batch.shape[1])
-                        width = int(rgb_batch.shape[2])
                         for idx, item in enumerate(uniform_items):
                             foggy_img = (
                                 torch.clamp(foggy[idx], 0.0, 1.0).cpu().numpy()
@@ -1933,19 +1979,10 @@ class FogTransform(Transform):
                                 SCATTERING_COEFFICIENT_SLOT in self.output_backends
                                 or ATMOSPHERIC_LIGHT_SLOT in self.output_backends
                             ):
-                                k_map_np = np.full(
-                                    (height, width),
-                                    float(k_means[idx]),
-                                    dtype=np.float32,
-                                )
-                                ls_map_np = np.broadcast_to(
-                                    airlight_np.astype(np.float32, copy=False),
-                                    (height, width, 3),
-                                ).copy()
                                 self._write_auxiliary(
                                     sample_ref,
-                                    k_map=k_map_np,
-                                    ls_map=ls_map_np,
+                                    k_map=k_maps[idx].detach().cpu().numpy(),
+                                    ls_map=ls_maps[idx].detach().cpu().numpy(),
                                     sample_id=item["sample_id"],
                                     model_name=item["model_name"],
                                     full_id=item.get("full_id"),
@@ -1966,16 +2003,6 @@ class FogTransform(Transform):
                         sky_mask_t = (
                             torch.from_numpy(item["sky_mask"]).to(device).bool()
                         )
-                        estimated_airlight = (
-                            torch.zeros(3, device=device, dtype=torch.float32)
-                            if item["clear_weather"]
-                            else self._estimate_airlight_torch(
-                                rgb_t,
-                                sky_mask_t,
-                                sample_id=item["sample_id"],
-                                method=item.get("airlight_method"),
-                            )
-                        )
                         torch_gen = torch_generator_for_index(
                             self.torch_device,
                             self.seed,
@@ -1983,17 +2010,17 @@ class FogTransform(Transform):
                             item["index"],
                         )
                         foggy_t, beta, airlight_t, k_map_t, ls_map_t = (
-                            self._apply_model_torch(
+                            self._process_torch_pipeline(
                                 rgb_t,
                                 depth_t,
+                                sky_mask_t,
                                 item["model_name"],
                                 item["model_cfg"],
                                 item["rng"],
-                                estimated_airlight,
                                 torch_gen,
                                 sample_id=item["sample_id"],
                                 intrinsics=item.get("intrinsics"),
-                                depth_m=depth_t,
+                                airlight_method=item.get("airlight_method"),
                                 capture_artifacts=item.get("capture_artifacts"),
                                 clear_weather=item["clear_weather"],
                             )
@@ -2096,16 +2123,6 @@ class FogTransform(Transform):
                     )
                     plan = self._resolve_progressive_render_plan(rng, step)
                     variant = self._progressive_output_variant(step)
-                    estimated_airlight = (
-                        torch.zeros(3, device=device, dtype=torch.float32)
-                        if plan.clear_weather
-                        else self._estimate_airlight_torch(
-                            rgb_t,
-                            sky_mask_t,
-                            sample_id=sample.get("id"),
-                            method=plan.airlight_method,
-                        )
-                    )
                     torch_gen = torch_generator_for_index(
                         self.torch_device,
                         self.seed,
@@ -2113,17 +2130,17 @@ class FogTransform(Transform):
                         index * 1_000_000 + variant_index,
                     )
                     foggy_t, beta, airlight_t, k_map_t, ls_map_t = (
-                        self._apply_model_torch(
+                        self._process_torch_pipeline(
                             rgb_t,
                             depth_t,
+                            sky_mask_t,
                             plan.model_name,
                             plan.model_cfg,
                             rng,
-                            estimated_airlight,
                             torch_gen,
                             sample_id=sample.get("id"),
                             intrinsics=intrinsics,
-                            depth_m=depth_t,
+                            airlight_method=plan.airlight_method,
                             capture_artifacts=plan.capture_artifacts,
                             clear_weather=plan.clear_weather,
                         )
@@ -2214,16 +2231,6 @@ class FogTransform(Transform):
                     rng = self._rng_for(index, aug_index)
                     plan = self._resolve_render_plan(rng, augmentation)
                     variant = self._augmentation_output_variant(augmentation)
-                    estimated_airlight = (
-                        torch.zeros(3, device=device, dtype=torch.float32)
-                        if plan.clear_weather
-                        else self._estimate_airlight_torch(
-                            rgb_t,
-                            sky_mask_t,
-                            sample_id=sample.get("id"),
-                            method=plan.airlight_method,
-                        )
-                    )
                     torch_gen = torch_generator_for_index(
                         self.torch_device,
                         self.seed,
@@ -2231,17 +2238,17 @@ class FogTransform(Transform):
                         index * 100_000 + aug_index,
                     )
                     foggy_t, beta, airlight_t, k_map_t, ls_map_t = (
-                        self._apply_model_torch(
+                        self._process_torch_pipeline(
                             rgb_t,
                             depth_t,
+                            sky_mask_t,
                             plan.model_name,
                             plan.model_cfg,
                             rng,
-                            estimated_airlight,
                             torch_gen,
                             sample_id=sample.get("id"),
                             intrinsics=intrinsics,
-                            depth_m=depth_t,
+                            airlight_method=plan.airlight_method,
                             capture_artifacts=plan.capture_artifacts,
                             clear_weather=plan.clear_weather,
                         )
