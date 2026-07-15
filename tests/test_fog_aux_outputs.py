@@ -1418,6 +1418,93 @@ def test_scenario_profile_correlates_model_and_capture_overrides(
     np.testing.assert_allclose(result.rgb, 0.2)
 
 
+def test_clear_weather_scenario_bypasses_weather_render_but_keeps_capture(
+    tmp_path: Path,
+) -> None:
+    cfg = {
+        "airlight": "from_sky",
+        "device": "cpu",
+        "seed": 7,
+        "contrast_threshold": 0.05,
+        "capture": {
+            "stages": [
+                {
+                    "type": "exposure",
+                    "gain": 1.0,
+                    "condition_profiles": [
+                        {"name": "clean", "weight": 1.0, "gain": 1.0},
+                        {"name": "camera_reference", "weight": 0.0, "gain": 0.25},
+                    ],
+                }
+            ]
+        },
+        "scenario_profiles": [
+            {
+                "name": "clear_weather_camera_reference",
+                "weight": 1.0,
+                "clear_weather": True,
+                "model": "uniform",
+                "models": {
+                    "uniform": {
+                        "visibility_m": 5.0,
+                        "atmospheric_light": [0.1, 0.1, 0.1],
+                        "scene_illumination": {
+                            "enabled": True,
+                            "global_ev": 2.0,
+                        },
+                    }
+                },
+                "capture_overrides": {
+                    "exposure": {"condition_profile": "camera_reference"}
+                },
+            }
+        ],
+    }
+    config_path = tmp_path / "clear_scenario_config.json"
+    config_path.write_text(json.dumps(cfg))
+    transform = FogTransform(
+        config_path=str(config_path),
+        out_path=str(tmp_path / "out"),
+    )
+
+    plan = transform._resolve_render_plan(np.random.default_rng(3))
+    assert plan.scenario_name == "clear_weather_camera_reference"
+    assert plan.clear_weather is True
+
+    rgb = np.full((4, 5, 3), 0.8, dtype=np.float32)
+    depth = np.full((4, 5), 100.0, dtype=np.float32)
+    sky_mask = np.ones((4, 5), dtype=bool)
+    result = transform.pipeline.process_np(
+        rgb=rgb,
+        depth_m=depth,
+        sky_mask=sky_mask,
+        model_name=plan.model_name,
+        model_cfg=plan.model_cfg,
+        rng=np.random.default_rng(3),
+        sample_id="sample",
+        capture_artifacts=plan.capture_artifacts,
+        clear_weather=plan.clear_weather,
+    )
+
+    assert result.beta == 0.0
+    np.testing.assert_allclose(result.k_map, 0.0)
+    np.testing.assert_allclose(result.rgb, 0.2)
+
+    inference_result = render_fog_sample(
+        rgb=rgb,
+        depth=depth,
+        semantic_segmentation=sky_mask,
+        intrinsics=np.eye(3, dtype=np.float32),
+        config=cfg,
+        scenario_profile_name="clear_weather_camera_reference",
+        mode="cpu",
+    )
+    assert inference_result.beta == 0.0
+    np.testing.assert_allclose(inference_result.k_map, 0.0)
+    np.testing.assert_allclose(inference_result.ls_map, 0.0)
+    np.testing.assert_allclose(inference_result.rgb, 0.2)
+
+
 def test_gpu_batching_freezes_batch_condition_parameters(
     tmp_path: Path,
 ) -> None:

@@ -264,6 +264,7 @@ def _render_cpu(
         intrinsics=intrinsics_np,
         airlight_method=plan.airlight_method,
         capture_artifacts=plan.capture_artifacts,
+        clear_weather=plan.clear_weather,
     )
     return FogInferenceResult(
         rgb=np.asarray(result.rgb, dtype=np.float32),
@@ -300,11 +301,15 @@ def _render_gpu(
         depth_t = planar_to_radial_depth_torch(depth_t, K_t)
 
     sky_mask_t = torch.from_numpy(sky_mask).to(device=device, dtype=torch.bool)
-    estimated_airlight = transform._estimate_airlight_torch(
-        rgb_t,
-        sky_mask_t,
-        sample_id=sample_id,
-        method=plan.airlight_method,
+    estimated_airlight = (
+        torch.zeros(3, device=device, dtype=torch.float32)
+        if plan.clear_weather
+        else transform._estimate_airlight_torch(
+            rgb_t,
+            sky_mask_t,
+            sample_id=sample_id,
+            method=plan.airlight_method,
+        )
     )
     torch_gen = torch_generator_for_index(
         transform.torch_device,
@@ -324,6 +329,7 @@ def _render_gpu(
         intrinsics=intrinsics_np,
         depth_m=depth_t,
         capture_artifacts=plan.capture_artifacts,
+        clear_weather=plan.clear_weather,
     )
     return FogInferenceResult(
         rgb=torch.clamp(foggy_t, 0.0, 1.0).detach().cpu().numpy().astype(np.float32),

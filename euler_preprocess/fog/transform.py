@@ -118,6 +118,7 @@ _SCENARIO_CONTROL_KEYS = {
     "model",
     "model_name",
     "fog_model",
+    "clear_weather",
     "model_overrides",
     "fog_model_overrides",
     "model_config",
@@ -185,6 +186,7 @@ class RenderPlan:
     airlight_method: str | None = None
     capture_artifacts: CaptureArtifactPipeline | None = None
     scenario_name: str | None = None
+    clear_weather: bool = False
 
 
 @dataclass(frozen=True)
@@ -725,6 +727,29 @@ class FogTransform(Transform):
             )
         return method
 
+    def _scenario_clear_weather(self, payload: dict[str, Any]) -> bool:
+        clear_weather = payload.get("clear_weather", False)
+        if not isinstance(clear_weather, bool):
+            raise ValueError("scenario clear_weather must be a boolean")
+        return clear_weather
+
+    def _clear_weather_progressive_model_config(
+        self,
+        model_cfg: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Return the no-fog target used to ramp a progressive clear scenario.
+
+        Sampled clear scenarios bypass the weather render entirely. Progressive
+        mode still needs a numeric target to interpolate toward, so it uses zero
+        scattering and disables scene illumination at the final step.
+        """
+        clear_cfg = copy.deepcopy(model_cfg)
+        clear_cfg.pop("visibility_m", None)
+        clear_cfg.pop("beta", None)
+        clear_cfg["scattering_coefficient"] = 0.0
+        clear_cfg["scene_illumination"] = {"enabled": False}
+        return clear_cfg
+
     def _scenario_model_name(
         self,
         payload: dict[str, Any],
@@ -834,6 +859,7 @@ class FogTransform(Transform):
             airlight_method=airlight_method,
             capture_artifacts=CaptureArtifactPipeline.from_config(effective_config),
             scenario_name=self._scenario_name(scenario),
+            clear_weather=self._scenario_clear_weather(payload),
         )
 
     def _resolve_progressive_render_plan(
@@ -870,6 +896,10 @@ class FogTransform(Transform):
             target_model_cfg,
             self._scenario_model_overrides(frozen_payload),
         )
+        if self._scenario_clear_weather(frozen_payload):
+            target_model_cfg = self._clear_weather_progressive_model_config(
+                target_model_cfg
+            )
         base_model_cfg = _freeze_distribution_specs(base_model_cfg, rng)
         target_model_cfg = _freeze_distribution_specs(target_model_cfg, rng)
 
@@ -1359,6 +1389,7 @@ class FogTransform(Transform):
                         intrinsics=intrinsics,
                         airlight_method=plan.airlight_method,
                         capture_artifacts=plan.capture_artifacts,
+                        clear_weather=plan.clear_weather,
                     )
                     saved_paths.append(
                         self._write_primary_output(
@@ -1435,6 +1466,7 @@ class FogTransform(Transform):
                             intrinsics=intrinsics,
                             airlight_method=plan.airlight_method,
                             capture_artifacts=plan.capture_artifacts,
+                            clear_weather=plan.clear_weather,
                         )
                         saved_paths.append(
                             self._write_primary_output(
@@ -1479,6 +1511,7 @@ class FogTransform(Transform):
                         intrinsics=intrinsics,
                         airlight_method=plan.airlight_method,
                         capture_artifacts=plan.capture_artifacts,
+                        clear_weather=plan.clear_weather,
                     )
                     saved_paths.append(
                         self._write_primary_output(
@@ -1524,9 +1557,36 @@ class FogTransform(Transform):
         intrinsics: np.ndarray | None = None,
         depth_m: Any | None = None,
         capture_artifacts: CaptureArtifactPipeline | None = None,
+        clear_weather: bool = False,
     ) -> tuple[
         "torch.Tensor", float, "torch.Tensor", "torch.Tensor", "torch.Tensor"
     ]:
+        if clear_weather:
+            height = int(depth_t.shape[0])
+            width = int(depth_t.shape[1])
+            airlight = torch.zeros(3, device=self.torch_device, dtype=torch.float32)
+            k_map = torch.zeros(
+                (height, width),
+                device=self.torch_device,
+                dtype=torch.float32,
+            )
+            ls_map = torch.zeros(
+                (height, width, 3),
+                device=self.torch_device,
+                dtype=torch.float32,
+            )
+            return self._finalize_torch_pipeline_result(
+                rgb_t,
+                0.0,
+                airlight,
+                k_map,
+                ls_map,
+                rng=rng,
+                sample_id=sample_id,
+                intrinsics=intrinsics,
+                depth_m=depth_m,
+                capture_artifacts=capture_artifacts,
+            )
         if model_name not in DEFAULT_MODEL_CONFIGS:
             raise ValueError(f"Unsupported fog model: {model_name}")
         k_mean, ls_base = self.atmospheric_light.resolve_model_torch(
@@ -1740,6 +1800,7 @@ class FogTransform(Transform):
                             "airlight_method": plan.airlight_method,
                             "capture_artifacts": plan.capture_artifacts,
                             "scenario_name": plan.scenario_name,
+                            "clear_weather": plan.clear_weather,
                             "index": global_index,
                         }
                     )
@@ -1756,7 +1817,7 @@ class FogTransform(Transform):
                     uniform_groups: dict[int, list[dict]] = {}
                     other_items = []
                     for item in group_items:
-                        if item["model_name"] != "uniform":
+                        if item["clear_weather"] or item["model_name"] != "uniform":
                             other_items.append(item)
                             continue
                         capture_artifacts = item.get("capture_artifacts")
@@ -1905,11 +1966,15 @@ class FogTransform(Transform):
                         sky_mask_t = (
                             torch.from_numpy(item["sky_mask"]).to(device).bool()
                         )
-                        estimated_airlight = self._estimate_airlight_torch(
-                            rgb_t,
-                            sky_mask_t,
-                            sample_id=item["sample_id"],
-                            method=item.get("airlight_method"),
+                        estimated_airlight = (
+                            torch.zeros(3, device=device, dtype=torch.float32)
+                            if item["clear_weather"]
+                            else self._estimate_airlight_torch(
+                                rgb_t,
+                                sky_mask_t,
+                                sample_id=item["sample_id"],
+                                method=item.get("airlight_method"),
+                            )
                         )
                         torch_gen = torch_generator_for_index(
                             self.torch_device,
@@ -1930,6 +1995,7 @@ class FogTransform(Transform):
                                 intrinsics=item.get("intrinsics"),
                                 depth_m=depth_t,
                                 capture_artifacts=item.get("capture_artifacts"),
+                                clear_weather=item["clear_weather"],
                             )
                         )
                         foggy_img = torch.clamp(foggy_t, 0.0, 1.0).cpu().numpy()
@@ -2030,11 +2096,15 @@ class FogTransform(Transform):
                     )
                     plan = self._resolve_progressive_render_plan(rng, step)
                     variant = self._progressive_output_variant(step)
-                    estimated_airlight = self._estimate_airlight_torch(
-                        rgb_t,
-                        sky_mask_t,
-                        sample_id=sample.get("id"),
-                        method=plan.airlight_method,
+                    estimated_airlight = (
+                        torch.zeros(3, device=device, dtype=torch.float32)
+                        if plan.clear_weather
+                        else self._estimate_airlight_torch(
+                            rgb_t,
+                            sky_mask_t,
+                            sample_id=sample.get("id"),
+                            method=plan.airlight_method,
+                        )
                     )
                     torch_gen = torch_generator_for_index(
                         self.torch_device,
@@ -2055,6 +2125,7 @@ class FogTransform(Transform):
                             intrinsics=intrinsics,
                             depth_m=depth_t,
                             capture_artifacts=plan.capture_artifacts,
+                            clear_weather=plan.clear_weather,
                         )
                     )
                     foggy_img = torch.clamp(foggy_t, 0.0, 1.0).cpu().numpy()
@@ -2143,11 +2214,15 @@ class FogTransform(Transform):
                     rng = self._rng_for(index, aug_index)
                     plan = self._resolve_render_plan(rng, augmentation)
                     variant = self._augmentation_output_variant(augmentation)
-                    estimated_airlight = self._estimate_airlight_torch(
-                        rgb_t,
-                        sky_mask_t,
-                        sample_id=sample.get("id"),
-                        method=plan.airlight_method,
+                    estimated_airlight = (
+                        torch.zeros(3, device=device, dtype=torch.float32)
+                        if plan.clear_weather
+                        else self._estimate_airlight_torch(
+                            rgb_t,
+                            sky_mask_t,
+                            sample_id=sample.get("id"),
+                            method=plan.airlight_method,
+                        )
                     )
                     torch_gen = torch_generator_for_index(
                         self.torch_device,
@@ -2168,6 +2243,7 @@ class FogTransform(Transform):
                             intrinsics=intrinsics,
                             depth_m=depth_t,
                             capture_artifacts=plan.capture_artifacts,
+                            clear_weather=plan.clear_weather,
                         )
                     )
                     foggy_img = torch.clamp(foggy_t, 0.0, 1.0).cpu().numpy()

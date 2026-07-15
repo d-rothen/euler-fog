@@ -55,6 +55,14 @@ def test_dense_gloomy_daylight_config_activates_realism_stack() -> None:
     assert len(profile["isp"]["tone_map_lut"]) >= 2
 
     assert config["scenario_profiles"]
+    clear = _profile_by_name(
+        config["scenario_profiles"],
+        "clear_weather_camera_reference",
+    )
+    assert clear["clear_weather"] is True
+    assert clear["weight"] == 0.1
+    assert clear["model"] == "uniform"
+    assert sum(scenario["weight"] for scenario in config["scenario_profiles"]) == 1.0
     underexposed_condition = _profile_by_name(
         profile["sensor"]["condition_profiles"],
         "underexposed_noisy",
@@ -65,8 +73,9 @@ def test_dense_gloomy_daylight_config_activates_realism_stack() -> None:
 
     for scenario in config["scenario_profiles"]:
         model_name = scenario["model"]
-        model_config = scenario["models"][model_name]
-        assert model_config["scene_illumination"]["enabled"] is True
+        if not scenario.get("clear_weather", False):
+            model_config = scenario["models"][model_name]
+            assert model_config["scene_illumination"]["enabled"] is True
 
         capture = scenario["capture_overrides"]
         scenario_auto_exposure = capture["sensor"]["auto_exposure"]
@@ -82,8 +91,9 @@ def test_dense_gloomy_daylight_config_activates_realism_stack() -> None:
         noise_adjustment = capture["sensor"]["noise_adjustment"]
         assert noise_adjustment["enabled"] is True
         assert set(noise_adjustment["groups"]) == NOISE_GROUPS
-        assert capture["optics"]["fog_coupled_glare"]["enabled"] is True
-        assert capture["optics"]["droplets"]["enabled"] is True
+        weather_optics_enabled = not scenario.get("clear_weather", False)
+        assert capture["optics"]["fog_coupled_glare"]["enabled"] is weather_optics_enabled
+        assert capture["optics"]["droplets"]["enabled"] is weather_optics_enabled
         assert "tone_map_strength" in capture["isp"]
         assert "quality" in capture["transport"]["jpeg"]
 

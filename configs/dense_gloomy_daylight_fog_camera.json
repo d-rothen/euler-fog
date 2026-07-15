@@ -778,12 +778,13 @@
   },
   "scenario_profiles": [
     {
-      "name": "clear_high_visibility_daylight_reference",
+      "name": "clear_weather_camera_reference",
       "weight": 0.1,
-      "model": "heterogeneous_k_ls",
+      "clear_weather": true,
+      "model": "uniform",
       "airlight_method": "dcp_heuristic",
       "models": {
-        "heterogeneous_k_ls": {
+        "uniform": {
           "visibility_m": {
             "dist": "normal",
             "mean": 155,
@@ -806,30 +807,6 @@
               "dist": "uniform",
               "min": 0.9,
               "max": 1.35
-            }
-          },
-          "k_hetero": {
-            "min_factor": 0.86,
-            "max_factor": 1.18,
-            "contrast": 0.25
-          },
-          "ls_hetero": {
-            "min_factor": 0.92,
-            "max_factor": 1.04,
-            "contrast": 0.25,
-            "ls_gradient": {
-              "probability": 0.15,
-              "top_factor": {
-                "dist": "uniform",
-                "min": 1,
-                "max": 1.04
-              },
-              "bottom_factor": {
-                "dist": "uniform",
-                "min": 0.96,
-                "max": 1
-              },
-              "fog_opacity_weight": 0.25
             }
           },
           "scene_illumination": {
@@ -993,7 +970,7 @@
         },
         "optics": {
           "fog_coupled_glare": {
-            "enabled": true,
+            "enabled": false,
             "probability": 0.22,
             "base_strength": {
               "dist": "uniform",
@@ -1032,7 +1009,7 @@
             ]
           },
           "droplets": {
-            "enabled": true,
+            "enabled": false,
             "probability": 0.015,
             "count": {
               "dist": "uniform",

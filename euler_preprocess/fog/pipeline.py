@@ -114,17 +114,28 @@ class FogProcessingPipeline:
         intrinsics: np.ndarray | None = None,
         airlight_method: str | None = None,
         capture_artifacts: CaptureArtifactPipeline | None = None,
+        clear_weather: bool = False,
     ) -> FogPipelineResult:
-        result = self.render_scene_np(
-            rgb=rgb,
-            depth_m=depth_m,
-            sky_mask=sky_mask,
-            model_name=model_name,
-            model_cfg=model_cfg,
-            rng=rng,
-            sample_id=sample_id,
-            airlight_method=airlight_method,
-        )
+        if clear_weather:
+            height, width = depth_m.shape
+            result = FogPipelineResult(
+                rgb=rgb,
+                beta=0.0,
+                airlight=np.zeros(3, dtype=np.float32),
+                k_map=np.zeros((height, width), dtype=np.float32),
+                ls_map=np.zeros((height, width, 3), dtype=np.float32),
+            )
+        else:
+            result = self.render_scene_np(
+                rgb=rgb,
+                depth_m=depth_m,
+                sky_mask=sky_mask,
+                model_name=model_name,
+                model_cfg=model_cfg,
+                rng=rng,
+                sample_id=sample_id,
+                airlight_method=airlight_method,
+            )
         return self.apply_capture_np(
             result,
             context=CaptureContext(

@@ -32,7 +32,7 @@ DEFAULT_RDS_SAMPLE_ZIP = (
 )
 RDS_CONFIG_PATH = Path("configs/dense_gloomy_daylight_fog_camera.json")
 SCENARIO_ORDER = (
-    "clear_high_visibility_daylight_reference",
+    "clear_weather_camera_reference",
     "light_haze_soft_overcast",
     "moderate_gloomy_fog_nominal_camera",
     "underexposed_dense_gloom",
@@ -142,14 +142,14 @@ def test_dense_gloomy_scenario_profiles_render_real_drive_sim_samples(
         ]
         assert opacity_by_scenario == sorted(opacity_by_scenario)
         assert metrics["severe_low_contrast_sensor_stress"]["opacity_mean"] > (
-            metrics["clear_high_visibility_daylight_reference"]["opacity_mean"] + 0.25
+            metrics["clear_weather_camera_reference"]["opacity_mean"] + 0.25
         )
 
         assert metrics["underexposed_dense_gloom"]["luma_mean"] < (
             metrics["moderate_gloomy_fog_nominal_camera"]["luma_mean"] * 0.75
         )
         assert metrics["severe_low_contrast_sensor_stress"]["luma_mean"] < (
-            metrics["clear_high_visibility_daylight_reference"]["luma_mean"] * 0.65
+            metrics["clear_weather_camera_reference"]["luma_mean"] * 0.65
         )
         chromatically_bounded_profiles = SCENARIO_ORDER[:3]
         assert all(
