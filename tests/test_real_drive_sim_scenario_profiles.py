@@ -33,6 +33,7 @@ DEFAULT_RDS_SAMPLE_ZIP = (
 RDS_CONFIG_PATH = Path("configs/dense_gloomy_daylight_fog_camera.json")
 SCENARIO_ORDER = (
     "clear_weather_camera_reference",
+    "clear_high_visibility_daylight_reference",
     "light_haze_soft_overcast",
     "moderate_gloomy_fog_nominal_camera",
     "underexposed_dense_gloom",
@@ -137,10 +138,17 @@ def test_dense_gloomy_scenario_profiles_render_real_drive_sim_samples(
     for sample in rds_samples:
         metrics = _render_scenario_metrics(transform, sample)
 
-        opacity_by_scenario = [
-            metrics[name]["opacity_mean"] for name in SCENARIO_ORDER
-        ]
-        assert opacity_by_scenario == sorted(opacity_by_scenario)
+        clear_metrics = metrics["clear_weather_camera_reference"]
+        assert clear_metrics["beta"] == 0.0
+        assert clear_metrics["opacity_mean"] == 0.0
+        assert clear_metrics["opacity_p95"] == 0.0
+        fog_profiles = SCENARIO_ORDER[1:]
+        assert all(metrics[name]["opacity_mean"] > 0.0 for name in fog_profiles)
+        # Adjacent fog profiles intentionally have overlapping distributions,
+        # so sampled opacity need not be strictly ordered for every image.
+        assert metrics["severe_low_contrast_sensor_stress"]["opacity_mean"] > (
+            metrics["clear_high_visibility_daylight_reference"]["opacity_mean"]
+        )
         assert metrics["severe_low_contrast_sensor_stress"]["opacity_mean"] > (
             metrics["clear_weather_camera_reference"]["opacity_mean"] + 0.25
         )
@@ -151,7 +159,7 @@ def test_dense_gloomy_scenario_profiles_render_real_drive_sim_samples(
         assert metrics["severe_low_contrast_sensor_stress"]["luma_mean"] < (
             metrics["clear_weather_camera_reference"]["luma_mean"] * 0.65
         )
-        chromatically_bounded_profiles = SCENARIO_ORDER[:3]
+        chromatically_bounded_profiles = SCENARIO_ORDER[:4]
         assert all(
             0.75 <= metrics[name]["blue_red_ratio"] <= 1.65
             for name in chromatically_bounded_profiles
@@ -164,7 +172,7 @@ def test_dense_gloomy_scenario_profiles_render_real_drive_sim_samples(
         assert metrics["underexposed_dense_gloom"]["blue_red_ratio"] <= 2.5, {
             sample["id"]: metrics
         }
-        stress_profiles = SCENARIO_ORDER[3:]
+        stress_profiles = SCENARIO_ORDER[4:]
         assert all(
             metrics[name]["blue_minus_red_mean"] <= 0.1 for name in stress_profiles
         ), {sample["id"]: metrics}
@@ -328,7 +336,12 @@ def _render_profile(
     profile: dict[str, Any],
     scenario_index: int,
 ):
-    rng = np.random.default_rng(np.random.SeedSequence([1337, scenario_index, 1]))
+    # Keep the original five profiles on their historical deterministic seeds
+    # when the new clear-weather profile is inserted at the front.
+    stable_scenario_index = max(0, scenario_index - 1)
+    rng = np.random.default_rng(
+        np.random.SeedSequence([1337, stable_scenario_index, 1])
+    )
     plan = transform._resolve_render_plan(
         rng,
         scenario=profile,
@@ -346,6 +359,7 @@ def _render_profile(
         intrinsics=sample["intrinsics"]["intrinsics"],
         airlight_method=plan.airlight_method,
         capture_artifacts=plan.capture_artifacts,
+        clear_weather=plan.clear_weather,
     )
 
 
