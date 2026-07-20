@@ -989,6 +989,170 @@ def _sanitize_depth_torch(depth_m: "torch.Tensor") -> "torch.Tensor":
     return torch.clamp(depth, min=0.0)
 
 
+def _resolve_sky_fog_path_config(
+    model_cfg: dict,
+    rng: np.random.Generator,
+) -> dict | None:
+    raw = model_cfg.get("sky_fog_path")
+    if raw is None or raw is False:
+        return None
+    if not isinstance(raw, dict):
+        raise ValueError("sky_fog_path must be an object or false")
+    enabled = raw.get("enabled", True)
+    if not isinstance(enabled, bool):
+        raise ValueError("sky_fog_path.enabled must be a boolean")
+    if not enabled:
+        return None
+    mode = str(raw.get("mode", "layer")).lower()
+    if mode != "layer":
+        raise ValueError("sky_fog_path.mode must be 'layer'")
+
+    def value(key: str, default: float) -> float:
+        return _sample_float(raw.get(key, default), rng, f"sky_fog_path.{key}")
+
+    camera_height = value("camera_height_m", 1.6)
+    fog_top = value("fog_valley_peak_m", 80.0)
+    transition = value("transition_height_m", 10.0)
+    max_path = value("max_path_m", 1000.0)
+    if transition < 0.0:
+        raise ValueError("sky_fog_path.transition_height_m must be >= 0")
+    if max_path <= 0.0:
+        raise ValueError("sky_fog_path.max_path_m must be > 0")
+    profile = str(raw.get("density_profile", "linear_fade")).lower()
+    if profile not in {"linear_fade", "uniform"}:
+        raise ValueError(
+            "sky_fog_path.density_profile must be 'linear_fade' or 'uniform'"
+        )
+    return {
+        "layer_height_m": max(fog_top - camera_height, 0.0),
+        "transition_height_m": transition,
+        "max_path_m": max_path,
+        "pitch_rad": math.radians(value("camera_pitch_deg", 0.0)),
+        "roll_rad": math.radians(value("camera_roll_deg", 0.0)),
+        "density_profile": profile,
+    }
+
+
+def _camera_up_vector(cfg: dict) -> tuple[float, float, float]:
+    pitch = cfg["pitch_rad"]
+    roll = cfg["roll_rad"]
+    return (
+        math.sin(roll) * math.cos(pitch),
+        -math.cos(roll) * math.cos(pitch),
+        math.sin(pitch),
+    )
+
+
+def apply_sky_fog_path_np(
+    depth_m: np.ndarray,
+    sky_mask: np.ndarray | None,
+    intrinsics: np.ndarray | None,
+    model_cfg: dict,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    """Replace sky depth with its density-weighted path through a fog layer."""
+    cfg = _resolve_sky_fog_path_config(model_cfg, rng)
+    if cfg is None or sky_mask is None:
+        return depth_m
+    if intrinsics is None:
+        raise ValueError("sky_fog_path requires camera intrinsics")
+    depth = np.asarray(depth_m, dtype=np.float32)
+    sky = np.asarray(sky_mask, dtype=bool)
+    if sky.shape != depth.shape:
+        raise ValueError(f"sky_mask must have shape {depth.shape}; got {sky.shape}")
+    K = np.asarray(intrinsics, dtype=np.float32)
+    if K.shape != (3, 3):
+        raise ValueError(f"intrinsics must have shape (3, 3); got {K.shape}")
+
+    height, width = depth.shape
+    yy, xx = np.indices((height, width), dtype=np.float32)
+    pixels = np.stack((xx, yy, np.ones_like(xx)), axis=-1)
+    rays = pixels @ np.linalg.inv(K).T
+    rays /= np.maximum(np.linalg.norm(rays, axis=-1, keepdims=True), 1e-8)
+    up = np.maximum(rays @ np.asarray(_camera_up_vector(cfg), dtype=np.float32), 0.0)
+    layer_height = cfg["layer_height_m"]
+    path = np.full_like(depth, cfg["max_path_m"])
+    if layer_height <= 0.0:
+        path.fill(0.0)
+    else:
+        reached_height = np.minimum(up * cfg["max_path_m"], layer_height)
+        if cfg["density_profile"] == "uniform":
+            vertical_optical_depth = reached_height
+        else:
+            transition = min(cfg["transition_height_m"], layer_height)
+            fade_start = layer_height - transition
+            fade_height = np.clip(reached_height - fade_start, 0.0, transition)
+            vertical_optical_depth = np.minimum(reached_height, fade_start)
+            if transition > 0.0:
+                vertical_optical_depth += fade_height - fade_height**2 / (
+                    2.0 * transition
+                )
+        np.divide(vertical_optical_depth, up, out=path, where=up > 1e-8)
+    return np.where(sky, path, depth).astype(np.float32, copy=False)
+
+
+def apply_sky_fog_path_torch(
+    depth_m: "torch.Tensor",
+    sky_mask: "torch.Tensor | None",
+    intrinsics,
+    model_cfg: dict,
+    rng: np.random.Generator,
+) -> "torch.Tensor":
+    """Torch equivalent of :func:`apply_sky_fog_path_np`."""
+    cfg = _resolve_sky_fog_path_config(model_cfg, rng)
+    if cfg is None or sky_mask is None:
+        return depth_m
+    if intrinsics is None:
+        raise ValueError("sky_fog_path requires camera intrinsics")
+    depth = depth_m.to(dtype=torch.float32)
+    sky = torch.as_tensor(sky_mask, device=depth.device, dtype=torch.bool)
+    if tuple(sky.shape) != tuple(depth.shape):
+        raise ValueError(
+            f"sky_mask must have shape {tuple(depth.shape)}; got {tuple(sky.shape)}"
+        )
+    K = torch.as_tensor(intrinsics, device=depth.device, dtype=depth.dtype)
+    if tuple(K.shape) != (3, 3):
+        raise ValueError(f"intrinsics must have shape (3, 3); got {tuple(K.shape)}")
+
+    height, width = int(depth.shape[0]), int(depth.shape[1])
+    yy, xx = torch.meshgrid(
+        torch.arange(height, device=depth.device, dtype=depth.dtype),
+        torch.arange(width, device=depth.device, dtype=depth.dtype),
+        indexing="ij",
+    )
+    pixels = torch.stack((xx, yy, torch.ones_like(xx)), dim=-1)
+    rays = pixels @ torch.linalg.inv(K).T
+    rays = rays / torch.clamp(torch.linalg.vector_norm(rays, dim=-1, keepdim=True), min=1e-8)
+    up_vector = torch.tensor(_camera_up_vector(cfg), device=depth.device, dtype=depth.dtype)
+    up = torch.clamp(rays @ up_vector, min=0.0)
+    layer_height = cfg["layer_height_m"]
+    if layer_height <= 0.0:
+        path = torch.zeros_like(depth)
+    else:
+        reached_height = torch.clamp(
+            up * cfg["max_path_m"], max=layer_height
+        )
+        if cfg["density_profile"] == "uniform":
+            vertical_optical_depth = reached_height
+        else:
+            transition = min(cfg["transition_height_m"], layer_height)
+            fade_start = layer_height - transition
+            fade_height = torch.clamp(
+                reached_height - fade_start, min=0.0, max=transition
+            )
+            vertical_optical_depth = torch.clamp(reached_height, max=fade_start)
+            if transition > 0.0:
+                vertical_optical_depth = vertical_optical_depth + (
+                    fade_height - fade_height**2 / (2.0 * transition)
+                )
+        path = torch.where(
+            up > 1e-8,
+            vertical_optical_depth / torch.clamp(up, min=1e-8),
+            torch.full_like(up, cfg["max_path_m"]),
+        )
+    return torch.where(sky, path, depth)
+
+
 def _resolve_scene_illumination_config(model_cfg: dict) -> dict:
     raw = model_cfg.get("scene_illumination")
     if raw is None:
@@ -1464,6 +1628,7 @@ def apply_model(
     contrast_threshold_default: float,
     estimated_airlight: np.ndarray,
     sky_mask: np.ndarray | None = None,
+    intrinsics: np.ndarray | None = None,
 ) -> tuple[np.ndarray, float, np.ndarray, np.ndarray, np.ndarray]:
     """Apply a fog model to ``rgb``.
 
@@ -1493,6 +1658,13 @@ def apply_model(
         sampled_al = sample_value(al_spec, rng)
         raw_ls_base = normalize_atmospheric_light(np.asarray(sampled_al))
 
+    depth_m = apply_sky_fog_path_np(
+        depth_m,
+        sky_mask,
+        intrinsics,
+        model_cfg,
+        rng,
+    )
     height, width = depth_m.shape
     ls_base = dampen_airlight(
         raw_ls_base,

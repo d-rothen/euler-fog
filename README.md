@@ -485,11 +485,38 @@ pixels when a sky mask is available.
 
 **RGB** — The clean scene image. Normalised to float32 in [0, 1]. This is the *I(x)* term in the fog equation -- it gets blended with the airlight according to transmittance.
 
-**Depth** — A per-pixel depth map in **metres**. Provides the *d(x)* term in the transmittance calculation `t(x) = exp(-k * d(x))`. Pixels with greater depth receive more fog. Invalid values (NaN, inf, negative) are clamped to zero (treated as infinitely close, receiving no fog).
+**Depth** — A per-pixel depth map in **metres**. Provides the *d(x)* term in the transmittance calculation `t(x) = exp(-k * d(x))`. Pixels with greater depth receive more fog. Invalid values (NaN, inf, negative) are clamped to zero (treated as infinitely close, receiving no fog). By default, depth remains authoritative even where the semantic map says sky. For noisy real-world predictions, `sky_fog_path` can instead derive a density-weighted sky path through a bounded fog layer from the camera intrinsics and assumed orientation.
 
-**Semantic Segmentation** — A per-pixel semantic segmentation map from which a boolean sky mask is derived, loaded via euler-loading's dataset-specific `semantic_segmentation` loader. The sky mask is used for airlight estimation when the `airlight` method is `"from_sky"`: the mean RGB of all sky pixels in the clean image is used as the airlight colour *L_s*.
+**Semantic Segmentation** — A per-pixel semantic segmentation map from which a boolean sky mask is derived, loaded via euler-loading's dataset-specific `semantic_segmentation` loader. The sky mask is used for airlight estimation when the `airlight` method is `"from_sky"`: the mean RGB of all sky pixels in the clean image is used as the airlight colour *L_s*. When `sky_fog_path` is configured, semantic sky pixels use the modeled fog-layer path while depth remains authoritative everywhere else.
 
 **Intrinsics** *(optional)* — When present, planar (z-buffer) depth is converted to radial (Euclidean) depth before fog is applied.
+
+For a bounded valley-fog treatment of sky, add this inside a model config:
+
+```json
+"sky_fog_path": {
+  "mode": "layer",
+  "camera_height_m": 1.6,
+  "fog_valley_peak_m": 80.0,
+  "camera_pitch_deg": 0.0,
+  "camera_roll_deg": 0.0,
+  "density_profile": "linear_fade",
+  "transition_height_m": 10.0,
+  "max_path_m": 1000.0
+}
+```
+
+Pixel rays are reconstructed from the intrinsics. Near-horizon rays accumulate
+long paths through fog, while upward rays exit the layer sooner. The default
+`linear_fade` profile has full density below the transition and decreases
+linearly to zero at `fog_valley_peak_m`; both `camera_height_m` and
+`fog_valley_peak_m` are elevations in the same local vertical coordinate.
+`uniform` keeps full density up to the top. Positive `camera_pitch_deg` points
+the optical axis upward. `max_path_m` bounds horizon rays. The fog-layer path feeds the same fog
+opacity, scene-illumination, and atmospheric-light-gradient heuristics as
+ordinary depth. The original depth is retained for non-sky pixels and capture
+effects. Enabling this option without intrinsics raises an error rather than
+silently reverting to predicted sky depth.
 
 ### Airlight Estimation
 

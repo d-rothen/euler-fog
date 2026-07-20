@@ -46,11 +46,13 @@ def _write_rgb_dataset(root: Path) -> None:
         meta={"range": [0, 255]},
         euler_loading={"loader": "generic_dense_depth", "function": "rgb"},
     )
-    rgb = np.dstack([
-        np.full((4, 6), 32, dtype=np.uint8),
-        np.full((4, 6), 96, dtype=np.uint8),
-        np.full((4, 6), 160, dtype=np.uint8),
-    ])
+    rgb = np.dstack(
+        [
+            np.full((4, 6), 32, dtype=np.uint8),
+            np.full((4, 6), 96, dtype=np.uint8),
+            np.full((4, 6), 160, dtype=np.uint8),
+        ]
+    )
     path = writer.get_path("Scene01/Camera_0/00001", "00001.png")
     write_rgb(str(path), rgb)
     writer.save_index()
@@ -247,7 +249,9 @@ def test_writes_scattering_and_airlight_maps(tmp_path: Path) -> None:
     }
 
     transform = FogTransform(
-        config_path=str(_write_fog_config(tmp_path / "fog_cfg.json", visibility_m=visibility_m)),
+        config_path=str(
+            _write_fog_config(tmp_path / "fog_cfg.json", visibility_m=visibility_m)
+        ),
         out_path=str(backends["rgb"].root),
         output_backends=backends,
     )
@@ -318,20 +322,10 @@ def test_stepped_augmentations_write_file_id_layout_and_attributes(
         assert path.exists()
 
     scattering_path = (
-        pipeline_root
-        / "scattering"
-        / "Scene01"
-        / "Camera_0"
-        / "00001"
-        / "mor_10m.npy"
+        pipeline_root / "scattering" / "Scene01" / "Camera_0" / "00001" / "mor_10m.npy"
     )
     airlight_path = (
-        pipeline_root
-        / "airlight"
-        / "Scene01"
-        / "Camera_0"
-        / "00001"
-        / "mor_10m.npy"
+        pipeline_root / "airlight" / "Scene01" / "Camera_0" / "00001" / "mor_10m.npy"
     )
     assert scattering_path.exists()
     assert airlight_path.exists()
@@ -547,7 +541,9 @@ def test_only_scattering_target_writes_only_scattering(tmp_path: Path) -> None:
     )
     transform.run(dataset)
 
-    assert (pipeline_root / "scattering" / "Scene01" / "Camera_0" / "00001.npy").exists()
+    assert (
+        pipeline_root / "scattering" / "Scene01" / "Camera_0" / "00001.npy"
+    ).exists()
     assert not (pipeline_root / "airlight").exists()
 
 
@@ -1913,13 +1909,7 @@ def _deterministic_sensor_pipeline(
     }
     if sensor_overrides:
         sensor.update(sensor_overrides)
-    return CaptureArtifactPipeline.from_config(
-        {
-            "capture": {
-                "stages": [sensor]
-            }
-        }
-    )
+    return CaptureArtifactPipeline.from_config({"capture": {"stages": [sensor]}})
 
 
 def test_sensor_noise_adjustment_scales_authored_noise_groups() -> None:
@@ -1980,7 +1970,9 @@ def test_sensor_noise_adjustment_scales_authored_noise_groups() -> None:
         < chroma["shadow_recovery_noise"]["blue_chroma_gain"]
     )
     assert static["read_noise_sigma"]["min"] < chroma["read_noise_sigma"]["min"]
-    assert static["noise_modulation"]["max_gain"] == chroma["noise_modulation"]["max_gain"]
+    assert (
+        static["noise_modulation"]["max_gain"] == chroma["noise_modulation"]["max_gain"]
+    )
 
 
 def test_sensor_noise_adjustment_level_changes_output_noise() -> None:
@@ -2880,3 +2872,87 @@ def test_apply_model_accepts_direct_scattering_coefficient() -> None:
 
     assert k_mean == 0.123
     np.testing.assert_allclose(k_map, 0.123)
+
+
+def test_sky_fog_path_uses_ray_angle_and_linear_density_fade() -> None:
+    from euler_preprocess.fog.models import apply_sky_fog_path_np
+
+    depth = np.full((3, 3), 2.0, dtype=np.float32)
+    sky = np.zeros((3, 3), dtype=bool)
+    sky[:, 1] = True
+    intrinsics = np.array(
+        [[1.0, 0.0, 1.0], [0.0, 1.0, 1.0], [0.0, 0.0, 1.0]],
+        dtype=np.float32,
+    )
+    cfg = {
+        "sky_fog_path": {
+            "camera_height_m": 0.0,
+            "fog_valley_peak_m": 10.0,
+            "transition_height_m": 4.0,
+            "max_path_m": 100.0,
+        }
+    }
+
+    result = apply_sky_fog_path_np(
+        depth, sky, intrinsics, cfg, np.random.default_rng(0)
+    )
+
+    # The vertical density integral is 6 m full-density + 2 m fade.
+    np.testing.assert_allclose(result[0, 1], 8.0 * np.sqrt(2.0), rtol=1e-6)
+    assert result[1, 1] == 100.0  # level-camera horizon is capped
+    assert result[2, 1] == 100.0  # downward ray cannot leave through the top
+    assert result[0, 0] == 2.0  # non-sky depth remains untouched
+
+
+def test_sky_fog_path_changes_rendering_without_changing_non_sky_depth() -> None:
+    from euler_preprocess.fog.models import apply_model
+
+    rgb = np.full((3, 3, 3), 0.2, dtype=np.float32)
+    depth = np.full((3, 3), 1.0, dtype=np.float32)
+    sky = np.zeros((3, 3), dtype=bool)
+    sky[:2, 1] = True
+    intrinsics = np.array(
+        [[1.0, 0.0, 1.0], [0.0, 1.0, 1.0], [0.0, 0.0, 1.0]],
+        dtype=np.float32,
+    )
+    cfg = {
+        "scattering_coefficient": 0.1,
+        "atmospheric_light": [0.8, 0.8, 0.8],
+        "sky_fog_path": {
+            "camera_height_m": 0.0,
+            "fog_valley_peak_m": 10.0,
+            "transition_height_m": 4.0,
+            "max_path_m": 100.0,
+        },
+    }
+
+    foggy, _, _, _, _ = apply_model(
+        rgb,
+        depth,
+        "uniform",
+        cfg,
+        np.random.default_rng(0),
+        0.05,
+        np.full(3, 0.8, dtype=np.float32),
+        sky_mask=sky,
+        intrinsics=intrinsics,
+    )
+
+    assert foggy[1, 1, 0] > foggy[0, 1, 0] > foggy[2, 1, 0]
+    np.testing.assert_allclose(
+        foggy[2, 1],
+        0.2 * np.exp(-0.1) + 0.8 * (1.0 - np.exp(-0.1)),
+    )
+
+
+def test_sky_fog_path_requires_intrinsics() -> None:
+    from euler_preprocess.fog.models import apply_sky_fog_path_np
+
+    with pytest.raises(ValueError, match="requires camera intrinsics"):
+        apply_sky_fog_path_np(
+            np.ones((2, 2), dtype=np.float32),
+            np.ones((2, 2), dtype=bool),
+            None,
+            {"sky_fog_path": {"fog_valley_peak_m": 20.0}},
+            np.random.default_rng(0),
+        )

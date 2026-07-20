@@ -45,6 +45,7 @@ from euler_preprocess.fog.models import (
     AIRLIGHT_METHODS,
     DEFAULT_CONTRAST_THRESHOLD,
     DEFAULT_MODEL_CONFIGS,
+    apply_sky_fog_path_torch,
     apply_ls_gradient_torch,
     modulate_with_noise_torch,
     prepare_noise_field_torch,
@@ -215,8 +216,7 @@ def _freeze_distribution_specs(value: Any, rng: np.random.Generator) -> Any:
         if "dist" in value:
             return sample_value(value, rng)
         return {
-            key: _freeze_distribution_specs(child, rng)
-            for key, child in value.items()
+            key: _freeze_distribution_specs(child, rng) for key, child in value.items()
         }
     if isinstance(value, list):
         return [_freeze_distribution_specs(child, rng) for child in value]
@@ -333,9 +333,7 @@ class FogTransform(Transform):
         self.config_path = Path(config_path)
         if output_backends is not None:
             if "rgb" not in output_backends:
-                raise ValueError(
-                    "output_backends must contain the primary 'rgb' slot"
-                )
+                raise ValueError("output_backends must contain the primary 'rgb' slot")
             self.output_backends = dict(output_backends)
             self.output_backend = self.output_backends["rgb"]
         else:
@@ -457,9 +455,7 @@ class FogTransform(Transform):
     def _rng_for_batch(self, batch_index: int):
         if self.seed is not None:
             return np.random.default_rng(
-                np.random.SeedSequence(
-                    [int(self.seed), int(batch_index), 1_000_003]
-                )
+                np.random.SeedSequence([int(self.seed), int(batch_index), 1_000_003])
             )
         return self.base_rng
 
@@ -524,7 +520,9 @@ class FogTransform(Transform):
         augmentation: FogAugmentationSpec,
     ) -> tuple[str, dict]:
         base_cfg = resolve_model_config(augmentation.model_name, self.models_cfg)
-        return augmentation.model_name, deep_merge(base_cfg, augmentation.model_overrides)
+        return augmentation.model_name, deep_merge(
+            base_cfg, augmentation.model_overrides
+        )
 
     def _parse_scenario_profiles(
         self,
@@ -598,7 +596,9 @@ class FogTransform(Transform):
                     "a finite non-negative number in progressive mode"
                 )
 
-            scenario_name = self._scenario_name(profile) or f"scenario_{scenario_index:03d}"
+            scenario_name = (
+                self._scenario_name(profile) or f"scenario_{scenario_index:03d}"
+            )
             scenario_id = _sanitize_variant_identifier(scenario_name)
             for step_index in range(step_count + 1):
                 weight = (
@@ -644,9 +644,7 @@ class FogTransform(Transform):
             raw.get("scenario_scope", config.get("gpu_scenario_scope", "sample"))
         ).lower()
         if scenario_scope not in _GPU_BATCH_SCOPE_VALUES:
-            raise ValueError(
-                "gpu_batching.scenario_scope must be 'sample' or 'batch'"
-            )
+            raise ValueError("gpu_batching.scenario_scope must be 'sample' or 'batch'")
 
         if "condition_parameter_scope" in raw:
             condition_scope = str(raw["condition_parameter_scope"]).lower()
@@ -808,7 +806,7 @@ class FogTransform(Transform):
                         if freeze_sampled_parameters
                         else None
                     ),
-            )
+                )
             model_name = select_model(effective_config, rng)
             model_cfg = resolve_model_config(model_name, models_cfg)
             if freeze_sampled_parameters:
@@ -831,9 +829,7 @@ class FogTransform(Transform):
         if freeze_sampled_parameters:
             effective_config = _freeze_distribution_specs(effective_config, rng)
         models_cfg = (
-            effective_config.get("models")
-            or effective_config.get("fog_models")
-            or {}
+            effective_config.get("models") or effective_config.get("fog_models") or {}
         )
         scenario_overrides = self._scenario_model_overrides(payload)
 
@@ -952,10 +948,12 @@ class FogTransform(Transform):
             rng,
             self.contrast_threshold_default,
         )
-        target_beta, _target_visibility, _target_contrast = resolve_scattering_coefficient(
-            target_cfg,
-            rng,
-            self.contrast_threshold_default,
+        target_beta, _target_visibility, _target_contrast = (
+            resolve_scattering_coefficient(
+                target_cfg,
+                rng,
+                self.contrast_threshold_default,
+            )
         )
         beta = max(0.0, float(base_beta + (target_beta - base_beta) * weight))
         cfg.pop("visibility_m", None)
@@ -1090,8 +1088,7 @@ class FogTransform(Transform):
             return self._progressive_neutral_number(key, float(target))
         if _is_numeric_sequence(target):
             return [
-                self._progressive_neutral_number(key, float(item))
-                for item in target
+                self._progressive_neutral_number(key, float(item)) for item in target
             ]
         if isinstance(target, dict):
             return {
@@ -1135,9 +1132,7 @@ class FogTransform(Transform):
             rng,
             scenario=scenario,
             sample_scenario=False,
-            freeze_sampled_parameters=(
-                self.gpu_condition_parameter_scope == "batch"
-            ),
+            freeze_sampled_parameters=(self.gpu_condition_parameter_scope == "batch"),
         )
 
     def _source_extension(self, sample: dict, backend: Any | None = None) -> str:
@@ -1158,7 +1153,9 @@ class FogTransform(Transform):
         return raw if isinstance(raw, str) and raw else None
 
     def _augmentation_hierarchy_separator(self, backend: Any) -> str:
-        separator = getattr(getattr(backend, "dataset_writer", None), "_separator", None)
+        separator = getattr(
+            getattr(backend, "dataset_writer", None), "_separator", None
+        )
         if isinstance(separator, str) and separator and separator != "+":
             return separator
         return ":"
@@ -1646,6 +1643,13 @@ class FogTransform(Transform):
             estimated_airlight_t=estimated_airlight_t,
             device=self.torch_device,
         )
+        render_depth_t = apply_sky_fog_path_torch(
+            depth_t,
+            sky_mask,
+            intrinsics,
+            model_cfg,
+            rng,
+        )
         height = int(depth_t.shape[0])
         width = int(depth_t.shape[1])
 
@@ -1694,7 +1698,7 @@ class FogTransform(Transform):
             )
             ls_field = apply_ls_gradient_torch(
                 ls_field,
-                depth_t,
+                render_depth_t,
                 k_field,
                 model_cfg,
                 ls_cfg,
@@ -1706,7 +1710,7 @@ class FogTransform(Transform):
 
         foggy, k_map, ls_map = render_fog_fields_torch(
             rgb_t,
-            depth_t,
+            render_depth_t,
             k_field,
             ls_field,
             model_cfg,
@@ -1817,7 +1821,9 @@ class FogTransform(Transform):
                             "rgb": rgb,
                             "depth": depth,
                             "intrinsics": intrinsics,
-                            "sky_mask": normalize_sky_mask(sample["semantic_segmentation"]),
+                            "sky_mask": normalize_sky_mask(
+                                sample["semantic_segmentation"]
+                            ),
                             "rng": rng,
                             "model_name": plan.model_name,
                             "model_cfg": plan.model_cfg,
@@ -1903,7 +1909,16 @@ class FogTransform(Transform):
                         rendered = [
                             render_fog_fields_torch(
                                 rgb_batch[idx],
-                                depth_tensors[idx],
+                                apply_sky_fog_path_torch(
+                                    depth_tensors[idx],
+                                    torch.from_numpy(item["sky_mask"]).to(
+                                        device=device,
+                                        dtype=torch.bool,
+                                    ),
+                                    item.get("intrinsics"),
+                                    item["model_cfg"],
+                                    item["rng"],
+                                ),
                                 k_means[idx],
                                 ls_base[idx].view(1, 1, 3),
                                 item["model_cfg"],
@@ -1943,9 +1958,7 @@ class FogTransform(Transform):
                         )
 
                         for idx, item in enumerate(uniform_items):
-                            foggy_img = (
-                                torch.clamp(foggy[idx], 0.0, 1.0).cpu().numpy()
-                            )
+                            foggy_img = torch.clamp(foggy[idx], 0.0, 1.0).cpu().numpy()
                             airlight_np = ls_base[idx].detach().cpu().numpy()
                             sample_ref = {
                                 "id": item["sample_id"],
@@ -1997,7 +2010,8 @@ class FogTransform(Transform):
                         K_np = item.get("intrinsics")
                         if K_np is not None:
                             K_t = torch.from_numpy(K_np).to(
-                                device=device, dtype=torch.float32,
+                                device=device,
+                                dtype=torch.float32,
                             )
                             depth_t = planar_to_radial_depth_torch(depth_t, K_t)
                         sky_mask_t = (
@@ -2405,18 +2419,16 @@ class FogTransform(Transform):
                 variant.file_id_hierarchy_name,
             )
             output_basename = f"{variant.id}{backend.output_extension or '.npy'}"
-            attributes = (
-                self._output_variant_attributes(
-                    sample,
-                    variant,
-                    model_name=model_name,
-                    beta=float(beta) if beta is not None else float(np.mean(value)),
-                    airlight=(
-                        airlight
-                        if airlight is not None
-                        else np.asarray([np.nan, np.nan, np.nan], dtype=np.float32)
-                    ),
-                )
+            attributes = self._output_variant_attributes(
+                sample,
+                variant,
+                model_name=model_name,
+                beta=float(beta) if beta is not None else float(np.mean(value)),
+                airlight=(
+                    airlight
+                    if airlight is not None
+                    else np.asarray([np.nan, np.nan, np.nan], dtype=np.float32)
+                ),
             )
             backend.write(
                 sample,

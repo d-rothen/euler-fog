@@ -75,6 +75,7 @@ class FogProcessingPipeline:
         rng: np.random.Generator,
         sample_id: str | None,
         airlight_method: str | None = None,
+        intrinsics: np.ndarray | None = None,
     ) -> FogPipelineResult:
         render_input_space = self.render_input_space_for(model_cfg)
         rgb_for_render = srgb_to_linear(rgb) if render_input_space == "srgb" else rgb
@@ -93,6 +94,7 @@ class FogProcessingPipeline:
             self.contrast_threshold_default,
             estimated_airlight,
             sky_mask=sky_mask,
+            intrinsics=intrinsics,
         )
         if render_input_space == "srgb":
             foggy = linear_to_srgb(foggy)
@@ -193,6 +195,7 @@ class FogProcessingPipeline:
                 rng=rng,
                 sample_id=sample_id,
                 airlight_method=airlight_method,
+                intrinsics=intrinsics,
             )
         return self.apply_capture_np(
             result,
