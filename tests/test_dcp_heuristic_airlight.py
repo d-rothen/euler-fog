@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 
 from euler_preprocess.fog.dcp_heuristic_airlight import DCPHeuristicAirlight
-from euler_preprocess.fog.foggify import Foggify
+from euler_preprocess.fog.transform import FogTransform
 from euler_preprocess.fog.models import apply_model
 
 try:
@@ -105,7 +105,7 @@ class TestDCPHeuristicAirlight:
             atol=1e-6,
         )
 
-    def test_foggify_reads_dcp_heuristic_bias_config(self, tmp_path):
+    def test_fog_transform_reads_dcp_heuristic_bias_config(self, tmp_path):
         cfg = {
             "airlight": "dcp_heuristic",
             "device": "cpu",
@@ -126,12 +126,12 @@ class TestDCPHeuristicAirlight:
         cfg_path = tmp_path / "fog_config.json"
         cfg_path.write_text(json.dumps(cfg))
 
-        foggify = Foggify(config_path=str(cfg_path), out_path=str(tmp_path / "out"))
+        transform = FogTransform(config_path=str(cfg_path), out_path=str(tmp_path / "out"))
 
-        assert foggify.airlight_estimator.white_bias == pytest.approx(0.2)
-        assert foggify.airlight_estimator.cool_bias == pytest.approx(0.3)
+        assert transform.atmospheric_light.estimator.white_bias == pytest.approx(0.2)
+        assert transform.atmospheric_light.estimator.cool_bias == pytest.approx(0.3)
         np.testing.assert_allclose(
-            foggify.airlight_estimator.cool_target,
+            transform.atmospheric_light.estimator.cool_target,
             [0.9, 0.96, 1.0],
             atol=1e-6,
         )
@@ -235,13 +235,13 @@ class TestDCPHeuristicAirlightTorch:
         }
         cfg_path = tmp_path / "fog_config.json"
         cfg_path.write_text(json.dumps(cfg))
-        foggify = Foggify(config_path=str(cfg_path), out_path=str(tmp_path / "out"))
+        transform = FogTransform(config_path=str(cfg_path), out_path=str(tmp_path / "out"))
 
         rgb_t = torch.full((2, 2, 3), 0.4, dtype=torch.float32)
         depth_t = torch.ones((2, 2), dtype=torch.float32)
         estimated_airlight = torch.tensor([0.4, 0.5, 0.6], dtype=torch.float32)
 
-        _, _, airlight, _, _ = foggify._apply_model_torch(
+        _, _, airlight, _, _ = transform._apply_model_torch(
             rgb_t,
             depth_t,
             "uniform",

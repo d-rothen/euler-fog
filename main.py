@@ -1,7 +1,7 @@
-"""Thin wrapper so ``python main.py`` keeps working.
+"""Thin wrapper so ``python main.py`` works without installing the package.
 
-The actual logic lives in :mod:`src.cli` (which is also the installed
-``euler-preprocess`` console-script entry point).
+The logic lives in :mod:`euler_preprocess.cli`, which is also the installed
+``euler-preprocess`` console-script entry point.
 """
 
 import sys

@@ -1,5 +1,5 @@
 {
-  "transform_config_path": "../euler_preprocess/fog/example_config.json",
+  "transform_config_path": "fog_config.json",
   "output_path": "/path/to/output",
   "modalities": {
     "rgb": {"path": "/path/to/vkitti_2.0.3_rgb", "split": "train"},

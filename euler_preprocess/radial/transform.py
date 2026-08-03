@@ -4,8 +4,6 @@ from collections.abc import Iterable
 from pathlib import Path
 from typing import Any, ClassVar
 
-import numpy as np
-
 from euler_preprocess.common.intrinsics import extract_intrinsics, planar_to_radial_depth
 from euler_preprocess.common.io import load_json
 from euler_preprocess.common.logging import get_logger, progress_bar

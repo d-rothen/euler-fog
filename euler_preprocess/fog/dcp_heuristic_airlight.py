@@ -51,8 +51,6 @@ class DCPHeuristicAirlight:
             _DEFAULT_COOL_TARGET if cool_target is None else cool_target
         )
 
-    # -- public interface (matches AirlightFromSky / DCPAirlight) -----------
-
     def __call__(self, rgb: np.ndarray) -> np.ndarray:
         return self.compute(rgb)
 
@@ -77,8 +75,6 @@ class DCPHeuristicAirlight:
             return self._apply_color_bias(airlight, reference_color=airlight)
         merged = self._merge_with_sky_prior(airlight, sky_prior)
         return self._apply_color_bias(merged, reference_color=sky_prior)
-
-    # -- internals ----------------------------------------------------------
 
     def _brightest_pixels_count(self, num_pixels: int) -> int:
         count = int(math.floor(self.top_percent * num_pixels))

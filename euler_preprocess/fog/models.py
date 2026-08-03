@@ -14,7 +14,7 @@ try:
 except ImportError:
     torch = None
 
-_logger = logging.getLogger("foggify")
+_logger = logging.getLogger("euler-preprocess.fog")
 
 AIRLIGHT_METHODS = ("from_sky", "dcp", "dcp_heuristic")
 

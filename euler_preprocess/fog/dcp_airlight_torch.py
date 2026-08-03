@@ -51,8 +51,6 @@ class DCPAirlightTorch:
     def __call__(self, rgb: torch.Tensor) -> torch.Tensor:
         return self.compute(rgb)
 
-    # ------------------------------------------------------------------
-
     @staticmethod
     def _prepare_rgb(rgb: torch.Tensor) -> torch.Tensor:
         image = rgb

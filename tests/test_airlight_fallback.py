@@ -2,28 +2,22 @@
 
 import json
 import logging
-from pathlib import Path
 
 import numpy as np
 import pytest
 
+from euler_preprocess.common.sampling import format_value
 from euler_preprocess.fog.airlight_from_sky import AirlightFromSky, DEFAULT_AIRLIGHT_FALLBACK
-from euler_preprocess.fog.foggify import (
-    Foggify,
-    normalize_atmospheric_light,
-    format_value,
-)
+from euler_preprocess.fog.models import normalize_atmospheric_light
+from euler_preprocess.fog.transform import FogTransform
 
 try:
     import torch
-    from euler_preprocess.fog.foggify import estimate_airlight_torch
+    from euler_preprocess.fog.models import estimate_airlight_torch
 except ImportError:
     torch = None
 
-
-# ---------------------------------------------------------------------------
-# AirlightFromSky.estimate_airlight
-# ---------------------------------------------------------------------------
+FOG_LOGGER = "euler-preprocess.fog"
 
 
 class TestAirlightFromSkyFallback:
@@ -45,7 +39,7 @@ class TestAirlightFromSkyFallback:
         image = np.random.rand(32, 32, 3).astype(np.float32)
         sky_mask = np.zeros((32, 32), dtype=bool)
 
-        with caplog.at_level(logging.WARNING, logger="foggify"):
+        with caplog.at_level(logging.WARNING, logger=FOG_LOGGER):
             estimator.estimate_airlight(image, sky_mask, sample_id="test_001")
 
         assert any("No sky pixels" in msg for msg in caplog.messages)
@@ -56,7 +50,7 @@ class TestAirlightFromSkyFallback:
         image = np.random.rand(32, 32, 3).astype(np.float32)
         sky_mask = np.zeros((32, 32), dtype=bool)
 
-        with caplog.at_level(logging.WARNING, logger="foggify"):
+        with caplog.at_level(logging.WARNING, logger=FOG_LOGGER):
             estimator.estimate_airlight(image, sky_mask)
 
         assert any("No sky pixels" in msg for msg in caplog.messages)
@@ -84,11 +78,6 @@ class TestAirlightFromSkyFallback:
         assert np.all(np.isfinite(result))
 
 
-# ---------------------------------------------------------------------------
-# estimate_airlight_torch
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.skipif(torch is None, reason="torch not installed")
 class TestEstimateAirlightTorchFallback:
     def test_empty_sky_mask_returns_fallback(self):
@@ -105,7 +94,7 @@ class TestEstimateAirlightTorchFallback:
         image = torch.rand(32, 32, 3)
         sky_mask = torch.zeros(32, 32, dtype=torch.bool)
 
-        with caplog.at_level(logging.WARNING, logger="foggify"):
+        with caplog.at_level(logging.WARNING, logger=FOG_LOGGER):
             estimate_airlight_torch(image, sky_mask, sample_id="torch_001")
 
         assert any("No sky pixels" in msg for msg in caplog.messages)
@@ -122,11 +111,6 @@ class TestEstimateAirlightTorchFallback:
         torch.testing.assert_close(result, torch.tensor([0.3, 0.4, 0.5]), atol=1e-6, rtol=0)
 
 
-# ---------------------------------------------------------------------------
-# normalize_atmospheric_light – NaN input guard
-# ---------------------------------------------------------------------------
-
-
 class TestNormalizeAtmosphericLightNaN:
     def test_nan_input_clipped_to_bounds(self):
         """NaN fed to normalize_atmospheric_light should be caught upstream,
@@ -136,11 +120,6 @@ class TestNormalizeAtmosphericLightNaN:
         # np.clip with NaN still returns NaN – this confirms the fix must
         # happen *before* normalize_atmospheric_light is called.
         assert np.isnan(result[0])
-
-
-# ---------------------------------------------------------------------------
-# format_value – NaN guard
-# ---------------------------------------------------------------------------
 
 
 class TestFormatValueNaN:
@@ -153,12 +132,7 @@ class TestFormatValueNaN:
         assert format_value(1.0) == "1"
 
 
-# ---------------------------------------------------------------------------
-# End-to-end: Foggify with empty sky masks produces valid output
-# ---------------------------------------------------------------------------
-
-
-class TestFoggifyEmptySkyMask:
+class TestFogTransformEmptySkyMask:
     @pytest.fixture
     def fog_config(self, tmp_path):
         cfg = {
@@ -179,7 +153,7 @@ class TestFoggifyEmptySkyMask:
 
     def test_no_sky_produces_valid_output(self, tmp_path, fog_config, caplog):
         out_dir = tmp_path / "output"
-        foggify = Foggify(config_path=str(fog_config), out_path=str(out_dir))
+        transform = FogTransform(config_path=str(fog_config), out_path=str(out_dir))
 
         image = np.random.rand(64, 64, 3).astype(np.float32)
         depth = np.random.rand(64, 64).astype(np.float32) * 100.0
@@ -187,31 +161,17 @@ class TestFoggifyEmptySkyMask:
 
         samples = [{"rgb": image, "depth": depth, "semantic_segmentation": sky_mask, "id": "nosky_001"}]
 
-        # The foggify logger has propagate=False, so temporarily enable it
-        fog_logger = logging.getLogger("foggify")
-        old_propagate = fog_logger.propagate
-        fog_logger.propagate = True
-        try:
-            with caplog.at_level(logging.WARNING, logger="foggify"):
-                paths = foggify.generate_fog(samples)
-        finally:
-            fog_logger.propagate = old_propagate
+        with caplog.at_level(logging.WARNING, logger=FOG_LOGGER):
+            paths = transform.run(samples)
 
         assert len(paths) == 1
         assert paths[0].exists()
-        # Filename should NOT contain nan
         assert "nan" not in paths[0].name.lower()
-        # Warning was logged
         assert any("No sky pixels" in msg for msg in caplog.messages)
         assert any("nosky_001" in msg for msg in caplog.messages)
 
 
-# ---------------------------------------------------------------------------
-# Output path hierarchy via full_id
-# ---------------------------------------------------------------------------
-
-
-class TestFoggifyOutputHierarchy:
+class TestFogTransformOutputHierarchy:
     @pytest.fixture
     def fog_config(self, tmp_path):
         cfg = {
@@ -245,12 +205,12 @@ class TestFoggifyOutputHierarchy:
 
     def test_full_id_creates_subdirectories(self, tmp_path, fog_config):
         out_dir = tmp_path / "output"
-        foggify = Foggify(config_path=str(fog_config), out_path=str(out_dir))
+        transform = FogTransform(config_path=str(fog_config), out_path=str(out_dir))
 
         samples = [
             self._make_sample("00042", full_id="/Scene02/30-deg-right/Camera_0/00042"),
         ]
-        paths = foggify.generate_fog(samples)
+        paths = transform.run(samples)
 
         assert len(paths) == 1
         # The output should be under model_name/Scene02/30-deg-right/Camera_0/
@@ -260,10 +220,10 @@ class TestFoggifyOutputHierarchy:
 
     def test_no_full_id_stays_flat(self, tmp_path, fog_config):
         out_dir = tmp_path / "output"
-        foggify = Foggify(config_path=str(fog_config), out_path=str(out_dir))
+        transform = FogTransform(config_path=str(fog_config), out_path=str(out_dir))
 
         samples = [self._make_sample("00001")]
-        paths = foggify.generate_fog(samples)
+        paths = transform.run(samples)
 
         assert len(paths) == 1
         # Should be directly under model_name/ with no extra subdirs
@@ -274,10 +234,10 @@ class TestFoggifyOutputHierarchy:
     def test_single_segment_full_id_stays_flat(self, tmp_path, fog_config):
         """full_id with only one segment (just the frame id) should not add subdirs."""
         out_dir = tmp_path / "output"
-        foggify = Foggify(config_path=str(fog_config), out_path=str(out_dir))
+        transform = FogTransform(config_path=str(fog_config), out_path=str(out_dir))
 
         samples = [self._make_sample("00005", full_id="/00005")]
-        paths = foggify.generate_fog(samples)
+        paths = transform.run(samples)
 
         assert len(paths) == 1
         rel = paths[0].relative_to(out_dir / "uniform")
@@ -286,13 +246,13 @@ class TestFoggifyOutputHierarchy:
 
     def test_multiple_samples_different_hierarchies(self, tmp_path, fog_config):
         out_dir = tmp_path / "output"
-        foggify = Foggify(config_path=str(fog_config), out_path=str(out_dir))
+        transform = FogTransform(config_path=str(fog_config), out_path=str(out_dir))
 
         samples = [
             self._make_sample("00001", full_id="/SceneA/clone/Camera_0/00001"),
             self._make_sample("00002", full_id="/SceneB/fog/Camera_1/00002"),
         ]
-        paths = foggify.generate_fog(samples)
+        paths = transform.run(samples)
 
         assert len(paths) == 2
         rel_a = paths[0].relative_to(out_dir / "uniform")

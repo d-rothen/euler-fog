@@ -81,8 +81,6 @@ class DCPHeuristicAirlightTorch:
         merged = self._merge_with_sky_prior(airlight, sky_prior)
         return self._apply_color_bias(merged, reference_color=sky_prior)
 
-    # ------------------------------------------------------------------
-
     def _brightest_pixels_count(self, num_pixels: int) -> int:
         count = int(math.floor(self.top_percent * num_pixels))
         # Force odd so the median corresponds to an actual pixel

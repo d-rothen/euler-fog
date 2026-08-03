@@ -2,14 +2,13 @@
 
 import numpy as np
 import pytest
-from PIL import Image
 
 
 @pytest.fixture
-def synthetic_samples(tmp_path):
-    """Create a list of synthetic sample dicts for Foggify testing.
+def synthetic_samples():
+    """Three synthetic transform samples.
 
-    Returns a list of 3 sample dicts matching the expected format:
+    Each is a dict of the expected shape:
         {"rgb": ndarray, "depth": ndarray, "semantic_segmentation": ndarray, "id": str}
     """
     rng = np.random.default_rng(42)
@@ -19,7 +18,7 @@ def synthetic_samples(tmp_path):
         rgb = rng.integers(0, 255, (h, w, 3), dtype=np.uint8)
         depth = rng.uniform(1.0, 50.0, (h, w)).astype(np.float32)
         sky_mask = np.zeros((h, w), dtype=bool)
-        sky_mask[:30, :] = True  # top 30 rows are sky
+        sky_mask[:30, :] = True
         samples.append(
             {
                 "rgb": rgb,

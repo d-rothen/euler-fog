@@ -411,10 +411,6 @@ class FogTransform(Transform):
             dcp_heuristic_config=self.config.get("dcp_heuristic", {}),
             logger=self.logger,
         )
-        self.airlight_method = self.atmospheric_light.method
-        self.dcp_heuristic_kwargs = self.atmospheric_light.dcp_heuristic_kwargs
-        self.airlight_estimator = self.atmospheric_light.estimator
-        self.airlight_estimator_torch = self.atmospheric_light.estimator_torch
         self.pipeline = FogProcessingPipeline.from_config(
             self.config,
             atmospheric_light=self.atmospheric_light,
@@ -422,18 +418,11 @@ class FogTransform(Transform):
         )
 
     def run(self, samples: Iterable[dict]) -> list[Path]:
-        """Run the fog transform. Alias for :meth:`generate_fog`."""
-        return self.generate_fog(samples)
-
-    def generate_fog(self, samples: Iterable[dict]) -> list[Path]:
-        """Generate fog on the given samples.
+        """Render fog for every sample and return the written output paths.
 
         Args:
             samples: Iterable of dicts, each containing "rgb", "depth",
                      "semantic_segmentation", and "id" keys.
-
-        Returns:
-            List of output file paths.
         """
         if self.use_gpu:
             return self._generate_fog_gpu(samples)
@@ -479,27 +468,6 @@ class FogTransform(Transform):
             )
         return self.base_rng
 
-    def _get_airlight_estimator(self, method: str):
-        return self.atmospheric_light.get_estimator(method)
-
-    def _get_airlight_estimator_torch(self, method: str):
-        return self.atmospheric_light.get_estimator_torch(method)
-
-    def _estimate_airlight_np(
-        self,
-        rgb: np.ndarray,
-        sky_mask: np.ndarray,
-        *,
-        sample_id: str | None,
-        method: str | None = None,
-    ) -> np.ndarray:
-        return self.atmospheric_light.estimate_np(
-            rgb,
-            sky_mask,
-            sample_id=sample_id,
-            method=method,
-        )
-
     def _estimate_airlight_torch(
         self,
         rgb_t: "torch.Tensor",
@@ -513,15 +481,6 @@ class FogTransform(Transform):
             sky_mask_t,
             sample_id=sample_id,
             method=method,
-        )
-
-    def _resolve_augmented_model(
-        self,
-        augmentation: FogAugmentationSpec,
-    ) -> tuple[str, dict]:
-        base_cfg = resolve_model_config(augmentation.model_name, self.models_cfg)
-        return augmentation.model_name, deep_merge(
-            base_cfg, augmentation.model_overrides
         )
 
     def _parse_scenario_profiles(
@@ -2455,7 +2414,3 @@ class FogTransform(Transform):
     def _finalize_backends(self) -> None:
         for backend in self.output_backends.values():
             backend.finalize()
-
-
-# Backward compatibility alias
-Foggify = FogTransform

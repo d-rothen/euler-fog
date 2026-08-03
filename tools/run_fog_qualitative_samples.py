@@ -20,7 +20,6 @@ from euler_preprocess.common.io import load_json
 from euler_preprocess.fog.transform import FogTransform
 
 
-DEFAULT_INPUT_ROOT = Path("/Volumes/Volume/Datasets/tmp/test_samples")
 DEFAULT_CONFIG = Path("configs/dense_gloomy_daylight_fog_camera.json")
 DEFAULT_OUTPUT_DIR = Path(".qualitative_fog_outputs/dense_gloomy_daylight")
 DEFAULT_SKY_CLASS = (29, 0, 0)
@@ -277,7 +276,15 @@ def _parse_args() -> argparse.Namespace:
             "run FogTransform, and write images for qualitative review."
         )
     )
-    parser.add_argument("--input-root", type=Path, default=DEFAULT_INPUT_ROOT)
+    parser.add_argument(
+        "--input-root",
+        type=Path,
+        required=True,
+        help=(
+            "Folder with rgb/, depth/, semantic_segmentation/ subtrees and a "
+            "calibration.json."
+        ),
+    )
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--camera", default="CS_FRONT")

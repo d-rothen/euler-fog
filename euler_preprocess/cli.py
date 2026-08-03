@@ -17,10 +17,6 @@ from euler_preprocess.common.logging import get_logger, log_dataset_info
 from euler_preprocess.common.output import prepare_output_backends
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
 def _resolve(path_str: str, config_dir: Path) -> Path:
     """Resolve a path relative to the config file's directory."""
     p = Path(path_str)
@@ -233,10 +229,6 @@ def _run_transform(args: argparse.Namespace, transform_class: type) -> int:
     return 0
 
 
-# ---------------------------------------------------------------------------
-# Subcommand handlers
-# ---------------------------------------------------------------------------
-
 def _cmd_fog(args: argparse.Namespace) -> int:
     from euler_preprocess.fog.transform import FogTransform
     return _run_transform(args, FogTransform)
@@ -251,10 +243,6 @@ def _cmd_radial(args: argparse.Namespace) -> int:
     from euler_preprocess.radial.transform import RadialTransform
     return _run_transform(args, RadialTransform)
 
-
-# ---------------------------------------------------------------------------
-# Argument parsing
-# ---------------------------------------------------------------------------
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -299,10 +287,6 @@ def parse_args() -> argparse.Namespace:
         return parser.parse_args(["--help"])
     return args
 
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
 
 def main() -> int:
     args = parse_args()

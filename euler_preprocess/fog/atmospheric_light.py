@@ -80,12 +80,6 @@ class AtmosphericLightResolver:
         estimator = self._get_estimator(resolved_method)
         return estimator.estimate_airlight(rgb, sky_mask, sample_id=sample_id)
 
-    def get_estimator(self, method: str):
-        return self._get_estimator(method)
-
-    def get_estimator_torch(self, method: str):
-        return self._get_estimator_torch(method)
-
     def estimate_torch(
         self,
         rgb_t: "torch.Tensor",

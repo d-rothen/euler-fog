@@ -1,9 +1,11 @@
 .venv
 __pycache__
+*.egg-info
+build/
+dist/
+.pytest_cache
+.vscode
+uv.lock
 .tmp
 .out
 .qualitative_fog_outputs
-UniDepth
-.vscode
-uv.lock
-.tests

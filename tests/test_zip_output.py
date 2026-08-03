@@ -5,7 +5,6 @@ import json
 import zipfile
 
 import numpy as np
-import pytest
 from PIL import Image
 
 from euler_preprocess.common.io import OutputWriter

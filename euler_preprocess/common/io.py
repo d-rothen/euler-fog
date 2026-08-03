@@ -26,11 +26,6 @@ def save_depth_npy(path: Path, depth: np.ndarray) -> None:
     np.save(path, depth.astype(np.float32))
 
 
-# ---------------------------------------------------------------------------
-# OutputWriter — disk or zip
-# ---------------------------------------------------------------------------
-
-
 class OutputWriter:
     """Writes output files to disk or into a zip archive.
 
@@ -62,8 +57,6 @@ class OutputWriter:
         else:
             self.root = self.base_path
 
-    # -- context manager ----------------------------------------------------
-
     def __enter__(self) -> OutputWriter:
         return self
 
@@ -79,8 +72,6 @@ class OutputWriter:
         if self._zf is not None:
             self._zf.close()
             self._zf = None
-
-    # -- public API ---------------------------------------------------------
 
     def mkdir(self, path: Path) -> None:
         """Create directories on disk (no-op in zip mode)."""
@@ -114,8 +105,6 @@ class OutputWriter:
             path.parent.mkdir(parents=True, exist_ok=True)
             with open(path, "w", encoding="utf-8") as fh:
                 fh.write(text)
-
-    # -- internal -----------------------------------------------------------
 
     def _arcname(self, path: Path) -> str:
         """Convert an absolute path to an archive-relative name."""
