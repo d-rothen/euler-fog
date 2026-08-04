@@ -1,8 +1,24 @@
-# euler-preprocess
+<!-- euler header — shared across the euler packages.
+     Per package, change only: the <h1>, the tagline, and the badge URLs. -->
+<p align="center">
+  <img src="https://files.chronodle.com/icons/euler.svg" alt="euler" width="96" height="96">
+</p>
 
-Physics-based preprocessing transforms for multi-modal RGB+depth datasets — synthetic
-fog, sky-depth normalisation, and planar-to-radial depth conversion. Built on
-[euler-loading](https://github.com/d-rothen/euler-loading) and
+<h1 align="center">euler-preprocess</h1>
+
+<p align="center">
+  <em>Physics-based preprocessing for multi-modal RGB+depth datasets — synthetic fog, sky-depth normalisation, and planar-to-radial depth conversion.</em>
+</p>
+
+<p align="center">
+  <a href="https://pypi.org/project/euler-preprocess/"><img alt="PyPI" src="https://img.shields.io/pypi/v/euler-preprocess.svg"></a>
+  <a href="https://pypi.org/project/euler-preprocess/"><img alt="Python 3.9+" src="https://img.shields.io/badge/python-3.9%2B-blue.svg"></a>
+  <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-blue.svg"></a>
+</p>
+
+---
+
+Built on [euler-loading](https://github.com/d-rothen/euler-loading) and
 [ds-crawler](https://github.com/d-rothen/ds-crawler).
 
 ![Source frame rendered at five meteorological visibility distances](docs/images/fog-visibility-ladder.jpg)
