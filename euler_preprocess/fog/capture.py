@@ -4960,6 +4960,48 @@ def _apply_bad_pixels_torch(
     return out
 
 
+# Radiance floor used when blending tone curves in log space, and the bounds
+# applied to the log-space result so extreme strengths cannot overflow ``exp``.
+_TONE_CURVE_FLOOR = 1e-8
+_TONE_CURVE_LOG_MIN = -80.0
+_TONE_CURVE_LOG_MAX = 20.0
+
+
+def _blend_tone_curve_np(
+    image: np.ndarray,
+    mapped: np.ndarray,
+    strength: float,
+) -> np.ndarray:
+    """Apply a tone curve with ``strength`` acting as an exponent on its response.
+
+    The blend is geometric rather than linear: ``strength`` exponentiates the
+    per-pixel response ratio ``mapped / image``, so ``0`` returns the input
+    unchanged, ``1`` reproduces the curve exactly, and values above ``1`` apply
+    the curve more strongly. A linear blend extrapolates through zero once
+    ``strength`` exceeds ``1 / (1 - toe_slope)``, which drives every shadow
+    pixel negative and clips whole frames to black; the geometric form stays
+    strictly non-negative for any strength.
+    """
+    if strength == 1.0:
+        return np.asarray(mapped, dtype=np.float32)
+    if strength == 0.0:
+        return np.asarray(image, dtype=np.float32)
+
+    image = np.asarray(image, dtype=np.float32)
+    mapped = np.asarray(mapped, dtype=np.float32)
+    log_image = np.log(np.maximum(image, _TONE_CURVE_FLOOR))
+    log_mapped = np.log(np.maximum(mapped, _TONE_CURVE_FLOOR))
+    log_blend = np.clip(
+        log_image + strength * (log_mapped - log_image),
+        _TONE_CURVE_LOG_MIN,
+        _TONE_CURVE_LOG_MAX,
+    )
+    return np.where(image > 0.0, np.exp(log_blend), 0.0).astype(
+        np.float32,
+        copy=False,
+    )
+
+
 def _apply_tone_map_np(
     image: np.ndarray,
     mode: str,
@@ -4977,16 +5019,31 @@ def _apply_tone_map_np(
         d = 0.59
         e = 0.14
         mapped = (img * (a * img + b)) / (img * (c * img + d) + e)
-        return img * (1.0 - strength) + mapped * strength
+        return _blend_tone_curve_np(img, mapped, strength)
     if mode == "clip":
         return _clip01(img)
     if mode == "lut":
         mapped = _apply_tone_map_lut_np(img, config or {})
-        return (img * (1.0 - strength) + mapped * strength).astype(
-            np.float32,
-            copy=False,
-        )
+        return _blend_tone_curve_np(img, mapped, strength)
     raise ValueError(f"Unsupported tone_map: {mode}")
+
+
+def _blend_tone_curve_torch(image, mapped, strength: float):
+    """Torch counterpart of :func:`_blend_tone_curve_np`."""
+    if strength == 1.0:
+        return mapped
+    if strength == 0.0:
+        return image
+
+    log_image = torch.log(torch.clamp(image, min=_TONE_CURVE_FLOOR))
+    log_mapped = torch.log(torch.clamp(mapped, min=_TONE_CURVE_FLOOR))
+    log_blend = torch.clamp(
+        log_image + strength * (log_mapped - log_image),
+        min=_TONE_CURVE_LOG_MIN,
+        max=_TONE_CURVE_LOG_MAX,
+    )
+    blended = torch.exp(log_blend)
+    return torch.where(image > 0.0, blended, torch.zeros_like(blended))
 
 
 def _apply_tone_map_torch(
@@ -5006,12 +5063,12 @@ def _apply_tone_map_torch(
         d = 0.59
         e = 0.14
         mapped = (img * (a * img + b)) / (img * (c * img + d) + e)
-        return img * (1.0 - strength) + mapped * strength
+        return _blend_tone_curve_torch(img, mapped, strength)
     if mode == "clip":
         return _clip01_torch(img)
     if mode == "lut":
         mapped = _apply_tone_map_lut_torch(img, config or {})
-        return img * (1.0 - strength) + mapped * strength
+        return _blend_tone_curve_torch(img, mapped, strength)
     raise ValueError(f"Unsupported tone_map: {mode}")
 
 

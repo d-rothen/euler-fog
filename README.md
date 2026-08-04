@@ -11,12 +11,13 @@ fog, sky-depth normalisation, and planar-to-radial depth conversion. Built on
 (`configs/fog_stepped_config.json`). Fog density follows the depth map, so the
 attenuation is scene-consistent rather than a flat overlay.*
 
-![Four correlated scene and camera condition profiles](docs/images/camera-scenarios.jpg)
+![Six correlated scene and camera condition profiles](docs/images/camera-scenarios.jpg)
 
-*The same frame through four `scenario_profiles` from
+*The same frame through all six `scenario_profiles` in
 `configs/dense_gloomy_daylight_fog_camera.json`. Each profile samples fog density,
 airlight, exposure, sensor noise and compression together, so weather and camera
-response stay correlated.*
+response stay correlated. The last two are deliberately extreme low-light stress
+cases — their auto-exposure targets a mean luminance of ~0.1.*
 
 Both sets were rendered with `tools/run_fog_qualitative_samples.py`, which runs a
 folder of RGB/depth/segmentation samples through the transform and writes images for
@@ -456,8 +457,14 @@ and dark/fog modulation should move together:
 
 **Tone mapping.** `isp.tone_map` supports `"reinhard"`, `"aces"`, `"clip"`, and
 `"lut"`. The LUT mode interpolates a cheap 1D camera-response curve given by
-`tone_map_lut`, scaled by `tone_map_strength` and interpreted in
-`tone_map_lut_domain`.
+`tone_map_lut` and interpreted in `tone_map_lut_domain`.
+
+For `"lut"` and `"aces"`, `tone_map_strength` is an **exponent on the curve's
+response**, not a linear blend: `0` leaves the image unchanged, `1` applies the
+curve exactly, and values above `1` apply it more strongly. Because the blend is
+geometric, output radiance stays strictly non-negative at any strength. For
+`"reinhard"` the strength is a curve parameter (`x / (1 + strength * x)`) as
+before.
 
 ### Scenario Profiles
 
@@ -639,3 +646,9 @@ The transform config takes no parameters (`{}`); intrinsics are read from the
 CLI runs write a source-backed depth dataset mirroring the input depth modality's layout
 and writer metadata, with `meta.radial_depth` set to `true` in the emitted `index.json`.
 Standalone `RadialTransform(...)` usage keeps the legacy `.npy` output behaviour.
+
+---
+
+## License
+
+[MIT](LICENSE) © Daniel Rothenpieler
