@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "euler-preprocess"
-version = "3.11.0"
+version = "3.12.0"
 description = "Physics-based preprocessing (fog, etc.) for RGB+depth datasets"
 readme = "README.md"
 requires-python = ">=3.9"
